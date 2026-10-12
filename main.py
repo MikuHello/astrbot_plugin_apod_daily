@@ -301,6 +301,7 @@ class APOD(Star):
         show_explanation = include_hidden or self.explanation.get("is_show")
 
         title = (title_zh or apod_data.get("title") or "").strip()
+        title_raw = str(apod_data.get("title") or "").strip()
         date_cn = self._format_date_cn(str(apod_data.get("date") or "").strip())
         credit = str(apod_data.get("credit") or "").strip()
         explanation = (explanation_zh or apod_data.get("explanation") or "").strip()
@@ -308,7 +309,11 @@ class APOD(Star):
         newline = chr(10)
         lines = [PLUGIN_DISPLAY_NAME]
         if show_title and title:
-            lines.append(f"标题：{title}")
+            # 有译文且与原文不同时，展示“译文（原文）”；否则只展示其一
+            if title_zh and title_raw and title_zh.strip() != title_raw:
+                lines.append(f"标题：{title_zh.strip()}（{title_raw}）")
+            else:
+                lines.append(f"标题：{title}")
         if show_date and date_cn:
             lines.append(f"日期：{date_cn}")
         if credit:
