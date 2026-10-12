@@ -1,7 +1,7 @@
 name: astrbot_plugin_apod_daily # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
 display_name: APOD 每日天文图 # 用于展示的名字，可以是方便人类阅读的名字
 desc: 基于 RSS 的 NASA 每日天文图插件，支持订阅推送、定时分发与 LLM 翻译。 # 插件简短描述
-version: v1.0.0 # 插件版本号。格式：v1.1.1 或者 v1.1
+version: v1.0.1 # 插件版本号。格式：v1.1.1 或者 v1.1
 author: MikuHello # 作者
 repo: https://github.com/MikuHello/astrbot_plugin_apod_daily # 插件的仓库地址
 support_platforms:
