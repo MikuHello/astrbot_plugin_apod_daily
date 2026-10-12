@@ -61,6 +61,11 @@ CREDIT_STOP_MARKERS = (
 )
 PLUGIN_DISPLAY_NAME = "APOD 每日天文图"
 CREDIT_LABEL = "图片来源与版权"
+MANAGE_SUBCOMMANDS = (
+    "subscribe", "sub", "订阅",
+    "unsubscribe", "unsub", "退订",
+    "subs", "订阅列表", "推送列表",
+)
 
 
 @register("apod", "Cysheper", "NASA APOD plugin", "0.0.1")
@@ -111,6 +116,7 @@ class APOD(Star):
         self.push_interval_minutes = max(5, int(push_cfg.get("interval_minutes", 30)))
         self.push_translate = bool(push_cfg.get("translate", True))
         self.push_send_image = bool(push_cfg.get("send_image", True))
+        self.push_admin_manage = bool(push_cfg.get("admin_manage", True))
         self._push_task: Optional[asyncio.Task] = None
 
         # 把配置里的静态订阅名单作为 KV 订阅表的种子（仅当 KV 里还没有名单时）。
@@ -140,6 +146,14 @@ class APOD(Star):
         if tokens and tokens[0].lower() == "apod":
             tokens = tokens[1:]
         sub = tokens[0].lower() if tokens else ""
+        # 订阅名单包含各会话 UMO，管理动作默认仅限管理员
+        if (
+            sub in MANAGE_SUBCOMMANDS
+            and self.push_admin_manage
+            and not self._can_manage(event)
+        ):
+            yield event.plain_result("订阅管理仅限管理员操作喵～")
+            return
         if sub in ("subscribe", "sub", "订阅"):
             sessions = await self._get_push_sessions()
             umo = event.unified_msg_origin
@@ -615,6 +629,22 @@ class APOD(Star):
         return datetime.now(self._et_timezone()).strftime("%Y-%m-%d")
 
     # ---------- 订阅与推送 ----------
+
+    @staticmethod
+    def _can_manage(event: AstrMessageEvent) -> bool:
+        """AstrBot 管理员，或群聊中的群主/群管理员（平台提供信息时）。"""
+        if event.is_admin():
+            return True
+        try:
+            sender = str(event.get_sender_id())
+            group = getattr(event.message_obj, "group", None)
+            if sender in (getattr(group, "group_admins", None) or []):
+                return True
+            if sender and sender == str(getattr(group, "group_owner", None) or ""):
+                return True
+        except Exception:
+            pass
+        return False
 
     async def _get_push_sessions(self) -> list:
         sessions = await self.get_cache("push_sessions")

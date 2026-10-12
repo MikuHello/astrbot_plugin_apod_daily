@@ -100,6 +100,12 @@
                 "type": "list",
                 "default": []
             },
+            "admin_manage": {
+                "description": "订阅管理仅限管理员",
+                "hint": "开启后订阅/退订/查看名单仅限 AstrBot 管理员或群管理员操作",
+                "type": "bool",
+                "default": true
+            },
             "translate": {
                 "description": "推送前翻译",
                 "type": "bool",
