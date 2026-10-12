@@ -64,7 +64,7 @@ PLUGIN_DISPLAY_NAME = "APOD 每日天文图"
 CREDIT_LABEL = "图片来源与版权"
 
 
-@register("apod", "Cysheper", "NASA APOD plugin", "0.0.1")
+@register("apod", "Cysheper", "APOD 每日天文图插件：RSS 数据源 + 订阅推送 + LLM 翻译。", "1.0.2")
 class APOD(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         self.config = config
