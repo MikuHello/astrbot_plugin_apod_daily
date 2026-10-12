@@ -61,11 +61,6 @@ CREDIT_STOP_MARKERS = (
 )
 PLUGIN_DISPLAY_NAME = "APOD 每日天文图"
 CREDIT_LABEL = "图片来源与版权"
-MANAGE_SUBCOMMANDS = (
-    "subscribe", "sub", "订阅",
-    "unsubscribe", "unsub", "退订",
-    "subs", "订阅列表", "推送列表",
-)
 
 
 @register("apod", "Cysheper", "NASA APOD plugin", "0.0.1")
@@ -138,54 +133,8 @@ class APOD(Star):
 
     @filter.command("apod")
     async def apod(self, event: AstrMessageEvent):
-        """获取 NASA 每日天文图；子命令：订阅 / 退订 / 订阅列表"""
+        """获取 NASA 每日天文图（订阅管理请使用 /apod管理）"""
         logger.info("正在获取 NASA 每日天文图片...")
-
-        # 订阅管理子命令：/apod 订阅 | /apod 退订 | /apod 订阅列表
-        tokens = (event.message_str or "").strip().split()
-        if tokens and tokens[0].lower() == "apod":
-            tokens = tokens[1:]
-        sub = tokens[0].lower() if tokens else ""
-        # 订阅名单包含各会话 UMO，管理动作默认仅限管理员
-        if (
-            sub in MANAGE_SUBCOMMANDS
-            and self.push_admin_manage
-            and not self._can_manage(event)
-        ):
-            yield event.plain_result("订阅管理仅限管理员操作喵～")
-            return
-        if sub in ("subscribe", "sub", "订阅"):
-            sessions = await self._get_push_sessions()
-            umo = event.unified_msg_origin
-            if umo in sessions:
-                yield event.plain_result("本会话已经订阅过 APOD 推送啦～")
-            else:
-                sessions.append(umo)
-                await self.put_cache("push_sessions", sessions)
-                yield event.plain_result(
-                    "订阅成功！APOD 发布新一期时会自动推送到本会话喵～"
-                )
-            return
-        if sub in ("unsubscribe", "unsub", "退订"):
-            sessions = await self._get_push_sessions()
-            umo = event.unified_msg_origin
-            if umo in sessions:
-                sessions.remove(umo)
-                await self.put_cache("push_sessions", sessions)
-                yield event.plain_result("已退订 APOD 推送～")
-            else:
-                yield event.plain_result("本会话还没有订阅 APOD 推送喵。")
-            return
-        if sub in ("subs", "订阅列表", "推送列表"):
-            sessions = await self._get_push_sessions()
-            if sessions:
-                header = "当前订阅 APOD 推送的会话："
-                yield event.plain_result(header + chr(10) + chr(10).join(sessions))
-            else:
-                yield event.plain_result(
-                    "还没有会话订阅推送，发送 /apod 订阅 即可订阅喵～"
-                )
-            return
 
         # 如果今天的 APOD 缓存仍然有效，就优先复用缓存数据。
         apod_data = await self.get_cache_apod()
@@ -234,6 +183,78 @@ class APOD(Star):
             return
 
         yield event.chain_result(chain)
+
+    @filter.command("apod管理")
+    async def apod_manage(self, event: AstrMessageEvent):
+        """APOD 推送订阅管理：订阅 / 退订 / 列表"""
+        tokens = (event.message_str or "").strip().split()
+        if tokens and tokens[0] in ("apod管理", "APOD管理"):
+            tokens = tokens[1:]
+        sub = tokens[0].lower() if tokens else ""
+
+        if sub in ("subscribe", "sub", "订阅"):
+            if self.push_admin_manage and not self._can_manage(event):
+                yield event.plain_result("订阅操作仅限管理员喵～")
+                return
+            sessions = await self._get_push_sessions()
+            umo = event.unified_msg_origin
+            if umo in sessions:
+                yield event.plain_result("本会话已经订阅过 APOD 推送啦～")
+            else:
+                sessions.append(umo)
+                await self.put_cache("push_sessions", sessions)
+                yield event.plain_result(
+                    "订阅成功！APOD 发布新一期时会自动推送到本会话喵～"
+                )
+            return
+
+        if sub in ("unsubscribe", "unsub", "退订"):
+            if self.push_admin_manage and not self._can_manage(event):
+                yield event.plain_result("退订操作仅限管理员喵～")
+                return
+            sessions = await self._get_push_sessions()
+            umo = event.unified_msg_origin
+            if umo in sessions:
+                sessions.remove(umo)
+                await self.put_cache("push_sessions", sessions)
+                yield event.plain_result("已退订 APOD 推送～")
+            else:
+                yield event.plain_result("本会话还没有订阅 APOD 推送喵。")
+            return
+
+        if sub in ("list", "列表", "名单"):
+            if self.push_admin_manage and not self._can_manage(event):
+                yield event.plain_result("查看订阅名单仅限管理员喵～")
+                return
+            sessions = await self._get_push_sessions()
+            if sessions:
+                yield event.plain_result(
+                    "当前订阅 APOD 推送的会话："
+                    + chr(10)
+                    + chr(10).join(sessions)
+                )
+            else:
+                yield event.plain_result("还没有会话订阅推送喵～")
+            return
+
+        # 裸指令：输出支持的子命令与填写方式。
+        can_manage = (not self.push_admin_manage) or self._can_manage(event)
+        perm_note = (
+            "当前身份具备管理权限喵～" if can_manage else "管理操作仅限管理员喵～"
+        )
+        usage = (
+            "APOD 订阅管理指令："
+            + chr(10)
+            + "/apod管理 订阅 —— 订阅本会话的每日推送"
+            + chr(10)
+            + "/apod管理 退订 —— 退订本会话的每日推送"
+            + chr(10)
+            + "/apod管理 列表 —— 查看订阅名单"
+            + chr(10)
+            + "APOD 每天约北京时间 12:05 发布新一期；"
+            + perm_note
+        )
+        yield event.plain_result(usage)
 
     # 插件自带的 KV 存储足够保存 APOD 数据和翻译结果。
     async def put_cache(self, key: str, value: Any):

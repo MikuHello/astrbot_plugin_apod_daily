@@ -96,7 +96,7 @@
             },
             "sessions": {
                 "description": "推送/订阅名单 (UMO)",
-                "hint": "格式 platform:message_type:session_id；可在会话中发送 /apod 订阅 或 /apod 退订 管理",
+                "hint": "格式 platform:message_type:session_id；可在会话中发送 /apod管理 订阅 或 /apod管理 退订 管理",
                 "type": "list",
                 "default": []
             },
