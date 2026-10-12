@@ -1,5 +1,3 @@
-# astrbot_plugin_apod_daily
-
 NASA 每日天文图（APOD）AstrBot 插件：基于官方 RSS 的可靠数据源，支持订阅推送、定时分发与 LLM 翻译。
 
 > 本项目修改自 [Cysheper/astrbot_plugin_Astronomy_Picture_of_the_Day-APOD](https://github.com/Cysheper/astrbot_plugin_Astronomy_Picture_of_the_Day-APOD)，遵循 AGPL-3.0 许可证发布，感谢原作者 Cysheper。
