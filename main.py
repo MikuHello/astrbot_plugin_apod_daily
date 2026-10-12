@@ -348,17 +348,25 @@ class APOD(Star):
         return text
 
     def _resolve_chat_provider_id(self) -> Optional[str]:
-        """优先插件配置的 provider，否则回落到 AstrBot 默认对话模型。"""
+        """优先插件配置的 provider，否则回落到 AstrBot 当前对话模型。"""
         if self.provider:
             return self.provider
         try:
             prov = self.context.provider_manager.get_using_provider(
                 ProviderType.CHAT_COMPLETION
             )
-            return getattr(prov, "id", None)
+            pid = None
+            if prov is not None:
+                # Provider 实例没有 .id 属性，id 存在 provider_config 里
+                pid = getattr(prov, "id", None)
+                if not pid:
+                    pid = (getattr(prov, "provider_config", None) or {}).get("id")
+            if pid:
+                return pid
+            logger.warning("未能从提供商实例解析到 id。")
         except Exception as exc:
-            logger.warning(f"获取 AstrBot 默认对话模型失败：{exc}")
-            return None
+            logger.warning(f"获取 AstrBot 当前对话模型失败：{exc}")
+        return None
 
     async def translate_explanation(
         self, explanation: str, provider_id: Optional[str] = None
