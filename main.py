@@ -52,6 +52,15 @@ EXPLANATION_STOP_MARKERS = (
     "appeared first on",
     "Random APOD Generator",
 )
+CREDIT_STOP_MARKERS = (
+    "Authors & editors",
+    "A service of",
+    "Random APOD Generator",
+    "Yesterday's Image",
+    "The post ",
+)
+PLUGIN_DISPLAY_NAME = "APOD 每日天文图"
+CREDIT_LABEL = "图片来源与版权"
 
 
 @register("apod", "Cysheper", "NASA APOD plugin", "0.0.1")
@@ -177,10 +186,7 @@ class APOD(Star):
             yield event.plain_result("今天的 APOD 不是图片类型，请稍后再试。")
             return
 
-        explanation = apod_data.get("explanation")
-        title = apod_data.get("title")
         url = apod_data.get("hdurl") or apod_data.get("url")
-        date = apod_data.get("date")
 
         # 图片模式还要求 NASA 返回可用的图片链接。
         if not url and self.image:
@@ -188,42 +194,27 @@ class APOD(Star):
             return
 
         title_zh, explanation_zh = await self._translate_fields(apod_data)
+        display_text = self._build_display_text(apod_data, title_zh, explanation_zh)
 
-        display_title = (title_zh or title or "").strip()
-        display_date = str(date).strip() if date else ""
-        display_explanation = (explanation_zh or explanation or "").strip()
-
-        # 如果配置为分开发送，就把内容拆成多条消息返回。
         if self.is_divided:
+            # 图片一条、文本一条。
             has_output = False
-
             if self.image and url:
                 has_output = True
                 yield event.image_result(url)
-            if self.title.get("is_show") and display_title:
+            if display_text:
                 has_output = True
-                yield event.plain_result(f"标题：{display_title}")
-            if self.date.get("is_show") and display_date:
-                has_output = True
-                yield event.plain_result(f"日期：{display_date}")
-            if self.explanation.get("is_show") and display_explanation:
-                has_output = True
-                yield event.plain_result(display_explanation)
+                yield event.plain_result(display_text)
             if not has_output:
                 yield event.plain_result("当前配置未启用任何可返回的内容。")
             return
 
-        # 否则把所有内容拼成一条消息链返回。
+        # 图 + 文聚合为一条消息链。
         chain = []
         if self.image and url:
             chain.append(Comp.Image.fromURL(url))
-        if self.title.get("is_show") and display_title:
-            chain.append(Comp.Plain(f"标题：{display_title}\n"))
-        if self.date.get("is_show") and display_date:
-            chain.append(Comp.Plain(f"日期：{display_date}\n"))
-        if self.explanation.get("is_show") and display_explanation:
-            chain.append(Comp.Plain(display_explanation))
-
+        if display_text:
+            chain.append(Comp.Plain(display_text))
         if not chain:
             yield event.plain_result("当前配置未启用任何可返回的内容。")
             return
@@ -287,6 +278,49 @@ class APOD(Star):
         except Exception as exc:
             logger.error(f"翻译 APOD 内容失败：{exc}")
         return title_zh, explanation_zh
+
+    @staticmethod
+    def _format_date_cn(date_str: str) -> str:
+        """把 YYYY-MM-DD 格式化成 YYYY年M月D日；无法解析时原样返回。"""
+        matched = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", date_str.strip())
+        if not matched:
+            return date_str
+        year, month, day = matched.groups()
+        return f"{year}年{int(month)}月{int(day)}日"
+
+    def _build_display_text(
+        self,
+        apod_data: Dict[str, Any],
+        title_zh: Optional[str],
+        explanation_zh: Optional[str],
+        include_hidden: bool = False,
+    ) -> str:
+        """生成“品牌头 + 标题/日期/版权 + 空行 + 说明”的正文。"""
+        show_title = include_hidden or self.title.get("is_show")
+        show_date = include_hidden or self.date.get("is_show")
+        show_explanation = include_hidden or self.explanation.get("is_show")
+
+        title = (title_zh or apod_data.get("title") or "").strip()
+        date_cn = self._format_date_cn(str(apod_data.get("date") or "").strip())
+        credit = str(apod_data.get("credit") or "").strip()
+        explanation = (explanation_zh or apod_data.get("explanation") or "").strip()
+
+        newline = chr(10)
+        lines = [PLUGIN_DISPLAY_NAME]
+        if show_title and title:
+            lines.append(f"标题：{title}")
+        if show_date and date_cn:
+            lines.append(f"日期：{date_cn}")
+        if credit:
+            lines.append(f"{CREDIT_LABEL}：{credit}")
+        text = newline.join(lines)
+        if show_explanation and explanation:
+            text = (
+                f"{text}{newline}{newline}说明：{explanation}"
+                if text
+                else f"说明：{explanation}"
+            )
+        return text
 
     def _resolve_chat_provider_id(self) -> Optional[str]:
         """优先插件配置的 provider，否则回落到 AstrBot 默认对话模型。"""
@@ -508,6 +542,20 @@ class APOD(Star):
         if not explanation:
             explanation = plain_text
 
+        credit = ""
+        for credit_marker in ("Credit & Copyright:", "Image Credit:", "Credit:"):
+            marker_index = normalized_text.find(credit_marker)
+            if marker_index < 0:
+                continue
+            start = marker_index + len(credit_marker)
+            stop_index = len(normalized_text)
+            for stop_marker in CREDIT_STOP_MARKERS:
+                found = normalized_text.find(stop_marker, start)
+                if found >= 0:
+                    stop_index = min(stop_index, found)
+            credit = plain_text[start:stop_index].strip()
+            break
+
         if not date_str or not explanation:
             logger.error(
                 f"NASA feed 条目信息不完整：date={date_str!r}，link={link!r}"
@@ -518,6 +566,7 @@ class APOD(Star):
             "date": date_str,
             "title": title,
             "explanation": explanation,
+            "credit": credit,
             "url": image_url,
             "hdurl": image_url,
             "media_type": "image" if image_url else "other",
@@ -662,18 +711,11 @@ class APOD(Star):
         url = apod_data.get("hdurl") or apod_data.get("url")
         if self.push_send_image and url:
             chain.append(Comp.Image.fromURL(url))
-        title = (title_zh or apod_data.get("title") or "").strip()
-        date = str(apod_data.get("date") or "").strip()
-        explanation = (explanation_zh or apod_data.get("explanation") or "").strip()
-        parts = []
-        if title:
-            parts.append(f"标题：{title}")
-        if date:
-            parts.append(f"日期：{date}")
-        if explanation:
-            parts.append(explanation)
-        if parts:
-            chain.append(Comp.Plain(chr(10).join(parts)))
+        text = self._build_display_text(
+            apod_data, title_zh, explanation_zh, include_hidden=True
+        )
+        if text:
+            chain.append(Comp.Plain(text))
         return MessageChain(chain=chain)
 
     async def terminate(self):
