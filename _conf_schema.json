@@ -40,7 +40,7 @@
         }
     },
     "provider": {
-        "hint": "如果启用了翻译功能但未配置提供商，将无法进行翻译并可能导致错误日志",
+        "hint": "留空时使用当前对话模型进行翻译",
         "description": "翻译所使用的LLM提供商",
         "_special": "select_provider",
         "type": "string"
@@ -98,7 +98,6 @@
             },
             "translate": {
                 "description": "推送前翻译",
-                "hint": "翻译标题与解说，使用插件配置的 provider 或 AstrBot 默认对话模型",
                 "type": "bool",
                 "default": true
             },

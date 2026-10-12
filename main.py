@@ -123,6 +123,7 @@ class APOD(Star):
 
     @filter.command("apod")
     async def apod(self, event: AstrMessageEvent):
+        """获取 NASA 每日天文图；子命令：订阅 / 退订 / 订阅列表"""
         logger.info("正在获取 NASA 每日天文图片...")
 
         # 订阅管理子命令：/apod 订阅 | /apod 退订 | /apod 订阅列表
