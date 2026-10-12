@@ -1,27 +1,9 @@
 {
     "image": {
-        "description": "是否发送图片",
-        "hint": "NASA每日一图的标志性内容，建议开启",
+        "description": "发送图片",
+        "hint": "每日天文图的主体内容，建议开启",
         "type": "bool",
         "default": true
-    },
-    "explanation": {
-        "description": "图片说明",
-        "type": "object",
-        "items": {
-            "is_show": {
-                "hint": "官方说明通常比较长，包含丰富的科学信息",
-                "description": "是否发送NASA官方的图片说明",
-                "type": "bool",
-                "default": true
-            },
-            "is_translate": {
-                "hint": "原文一般是英文",
-                "description": "是否翻译说明为简体中文",
-                "type": "bool",
-                "default": true
-            }
-        }
     },
     "title": {
         "description": "标题配置",
@@ -29,21 +11,35 @@
         "items": {
             "is_show": {
                 "description": "是否发送标题",
+                "hint": "展示当期天文图的标题",
                 "type": "bool",
                 "default": true
             },
             "is_translate": {
                 "description": "是否翻译标题",
+                "hint": "翻译为简体中文",
                 "type": "bool",
                 "default": true
             }
         }
     },
-    "provider": {
-        "hint": "留空时使用当前对话模型进行翻译",
-        "description": "翻译所使用的LLM提供商",
-        "_special": "select_provider",
-        "type": "string"
+    "explanation": {
+        "description": "图片说明",
+        "type": "object",
+        "items": {
+            "is_show": {
+                "description": "是否发送官方说明",
+                "hint": "官方说明通常比较长，包含丰富的科学信息",
+                "type": "bool",
+                "default": true
+            },
+            "is_translate": {
+                "description": "是否翻译说明",
+                "hint": "翻译为简体中文",
+                "type": "bool",
+                "default": true
+            }
+        }
     },
     "date": {
         "description": "日期配置",
@@ -51,13 +47,21 @@
         "items": {
             "is_show": {
                 "description": "是否发送日期",
+                "hint": "展示当期日期（NASA 按美东时间发布）",
                 "type": "bool",
                 "default": true
             }
         }
     },
+    "provider": {
+        "description": "翻译所使用的LLM提供商",
+        "hint": "留空时使用当前对话模型进行翻译",
+        "_special": "select_provider",
+        "type": "string"
+    },
     "is_divided": {
-        "description": "是否分开发送图片和文本内容",
+        "description": "分开发送图片和文本",
+        "hint": "关闭后图片与文本合并为一条消息发送",
         "type": "bool",
         "default": true
     },
