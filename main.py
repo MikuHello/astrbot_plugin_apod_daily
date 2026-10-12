@@ -13,6 +13,7 @@ import aiohttp
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.event.filter import PermissionType
 from astrbot.api.provider import ProviderType
 from astrbot.api.star import Context, Star, register
 
@@ -111,7 +112,6 @@ class APOD(Star):
         self.push_interval_minutes = max(5, int(push_cfg.get("interval_minutes", 30)))
         self.push_translate = bool(push_cfg.get("translate", True))
         self.push_send_image = bool(push_cfg.get("send_image", True))
-        self.push_admin_manage = bool(push_cfg.get("admin_manage", True))
         self._push_task: Optional[asyncio.Task] = None
 
         # 把配置里的静态订阅名单作为 KV 订阅表的种子（仅当 KV 里还没有名单时）。
@@ -185,6 +185,7 @@ class APOD(Star):
         yield event.chain_result(chain)
 
     @filter.command("apod管理")
+    @filter.permission_type(PermissionType.GROUP_ADMIN)
     async def apod_manage(self, event: AstrMessageEvent):
         """APOD 推送订阅管理：订阅 / 退订 / 列表"""
         tokens = (event.message_str or "").strip().split()
@@ -193,9 +194,6 @@ class APOD(Star):
         sub = tokens[0].lower() if tokens else ""
 
         if sub in ("subscribe", "sub", "订阅"):
-            if self.push_admin_manage and not self._can_manage(event):
-                yield event.plain_result("订阅操作仅限管理员喵～")
-                return
             sessions = await self._get_push_sessions()
             umo = event.unified_msg_origin
             if umo in sessions:
@@ -209,9 +207,6 @@ class APOD(Star):
             return
 
         if sub in ("unsubscribe", "unsub", "退订"):
-            if self.push_admin_manage and not self._can_manage(event):
-                yield event.plain_result("退订操作仅限管理员喵～")
-                return
             sessions = await self._get_push_sessions()
             umo = event.unified_msg_origin
             if umo in sessions:
@@ -223,9 +218,6 @@ class APOD(Star):
             return
 
         if sub in ("list", "列表", "名单"):
-            if self.push_admin_manage and not self._can_manage(event):
-                yield event.plain_result("查看订阅名单仅限管理员喵～")
-                return
             sessions = await self._get_push_sessions()
             if sessions:
                 yield event.plain_result(
@@ -238,10 +230,6 @@ class APOD(Star):
             return
 
         # 裸指令：输出支持的子命令与填写方式。
-        can_manage = (not self.push_admin_manage) or self._can_manage(event)
-        perm_note = (
-            "当前身份具备管理权限喵～" if can_manage else "管理操作仅限管理员喵～"
-        )
         usage = (
             "APOD 订阅管理指令："
             + chr(10)
@@ -250,9 +238,6 @@ class APOD(Star):
             + "/apod管理 退订 —— 退订本会话的每日推送"
             + chr(10)
             + "/apod管理 列表 —— 查看订阅名单"
-            + chr(10)
-            + "APOD 每天约北京时间 12:05 发布新一期；"
-            + perm_note
         )
         yield event.plain_result(usage)
 
@@ -650,22 +635,6 @@ class APOD(Star):
         return datetime.now(self._et_timezone()).strftime("%Y-%m-%d")
 
     # ---------- 订阅与推送 ----------
-
-    @staticmethod
-    def _can_manage(event: AstrMessageEvent) -> bool:
-        """AstrBot 管理员，或群聊中的群主/群管理员（平台提供信息时）。"""
-        if event.is_admin():
-            return True
-        try:
-            sender = str(event.get_sender_id())
-            group = getattr(event.message_obj, "group", None)
-            if sender in (getattr(group, "group_admins", None) or []):
-                return True
-            if sender and sender == str(getattr(group, "group_owner", None) or ""):
-                return True
-        except Exception:
-            pass
-        return False
 
     async def _get_push_sessions(self) -> list:
         sessions = await self.get_cache("push_sessions")
