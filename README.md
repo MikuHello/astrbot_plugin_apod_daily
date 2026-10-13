@@ -1,4 +1,4 @@
-NASA 每日天文图（APOD）AstrBot 插件：基于官方 RSS 的可靠数据源，支持订阅推送、定时分发与 LLM 翻译。
+NASA 每日天文图（APOD）AstrBot 插件：基于官方 RSS 的可靠数据源，支持订阅推送、定时分发、随机天文图与 LLM 翻译/函数工具。
 
 > 本项目修改自 [Cysheper/astrbot_plugin_Astronomy_Picture_of_the_Day-APOD](https://github.com/Cysheper/astrbot_plugin_Astronomy_Picture_of_the_Day-APOD)，遵循 AGPL-3.0 许可证发布，感谢原作者 Cysheper。
 
@@ -6,6 +6,7 @@ NASA 每日天文图（APOD）AstrBot 插件：基于官方 RSS 的可靠数据�
 
 - 数据源切换为 science.nasa.gov 官方 RSS（上游 api.nasa.gov 在迁移期不稳定）
 - 新增订阅推送：定时推送（默认每天 01:00）/ 上游更新即推 两种模式
+- 新增随机天文图：复用官网 Random APOD 同款 embed 接口，一次请求取全量内容
 - 翻译未配置 provider 时自动使用 AstrBot 默认对话模型
 - 修复缓存时区问题；移除已失效的 NASA API 依赖
 
@@ -13,13 +14,15 @@ NASA 每日天文图（APOD）AstrBot 插件：基于官方 RSS 的可靠数据�
 
 | 指令 | 说明 |
 | --- | --- |
-| /apod | 获取最新一期 |
+| /apod | 输出帮助（子指令一览） |
+| /apod 今日 | 获取最新一期天文每日一图 |
+| /apod 随机 | 随机欣赏一期历史天文每日一图 |
 | /apod管理 | 查看订阅管理用法 |
-| /apod管理 订阅 | 订阅本会话的每日推送 |
+| /apod管理 订阅 | 订阅本会话的每日推送（名单即时同步到插件配置页） |
 | /apod管理 退订 | 退订本会话的每日推送 |
-| /apod管理 列表 | 查看订阅名单 |
 
-> `/apod管理` 默认仅群聊限管理员可用，可在 AstrBot WebUI「指令管理」中调整权限。
+> `/apod管理` 默认仅群聊限管理员可用，可在 AstrBot WebUI「指令管理」中调整权限；订阅名单统一在插件配置页「推送/订阅名单 (UMO)」维护。
+> 已注册 `send_apod_today` / `send_apod_random` LLM 函数工具，开启函数调用后模型可在对话中主动发送今日/随机天文图。
 
 ## 配置
 
