@@ -320,19 +320,26 @@ class APOD(Star):
 
     @filter.llm_tool(name="send_apod_today")
     async def send_apod_today(self, event: AstrMessageEvent):
-        """获取今日 NASA 天文每日一图（APOD）并发送到当前会话，包含图片与中文说明。当用户想看今日或最新的天文每日一图时调用。"""
-        return await self._deliver_apod(event, await self._get_latest_apod(), "今日")
+        """获取今日天文每日一图（APOD）并发送到当前会话，含图片与中文说明。"""
+        return await self._deliver_apod(event, await self._get_latest_apod(), "今日APOD")
 
     @filter.llm_tool(name="send_apod_random")
     async def send_apod_random(self, event: AstrMessageEvent):
-        """随机获取一期 NASA 天文每日一图（APOD）并发送到当前会话，包含图片与中文说明。当用户想看随机的天文每日一图时调用。"""
-        return await self._deliver_apod(event, await self._fetch_random_apod(), "随机")
+        """随机获取一期历史天文每日一图（APOD）并发送到当前会话，含图片与中文说明。"""
+        return await self._deliver_apod(
+            event, await self._fetch_random_apod(), "随机APOD"
+        )
+
+    @filter.llm_tool(name="send_nasa_today")
+    async def send_nasa_today(self, event: AstrMessageEvent):
+        """获取今日 NASA 每日一图（Image of the Day）并发送到当前会话，含图片与中文说明。"""
+        return await self._deliver_apod(event, await self._fetch_iotd(), "NASA每日一图")
 
     async def _deliver_apod(
         self, event: AstrMessageEvent, apod_data: Optional[dict], label: str
     ) -> str:
         if apod_data is None:
-            return self.last_apod_error or f"获取{label} APOD 失败，请稍后重试。"
+            return self.last_apod_error or f"获取{label}失败，请稍后重试。"
         if not (apod_data.get("hdurl") or apod_data.get("url")):
             return "这一期 APOD 不是图片类型，无法展示。"
         title_zh, explanation_zh = await self._translate_fields(
@@ -353,10 +360,10 @@ class APOD(Star):
             logger.error(f"APOD 函数工具发送失败：{exc}")
             delivered = False
         if not delivered:
-            return f"{label} APOD 发送失败，请提示用户稍后重试。"
+            return f"{label}发送失败，请提示用户稍后重试。"
         title = (title_zh or apod_data.get("title") or "").strip()
         return (
-            f"已向当前会话发送{label} APOD："
+            f"已向当前会话发送{label}："
             f"{apod_data.get('date', '')}《{title}》，可向用户做简要介绍。"
         )
 
