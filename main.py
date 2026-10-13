@@ -405,6 +405,24 @@ class APOD(Star):
         except Exception as exc:
             logger.error(f"删除缓存失败，键：{key}，错误：{exc}")
 
+    async def _load_push_checkpoint(self) -> dict:
+        """读取投递检查点；存储故障向上抛出，与“无记录”严格区分。"""
+        try:
+            checkpoint = await self.get_kv_data("pushed_by_session", {})
+        except Exception as exc:
+            raise RuntimeError(f"读取推送检查点失败：{exc}") from exc
+        return (
+            {k: v for k, v in checkpoint.items() if isinstance(k, str)}
+            if isinstance(checkpoint, dict)
+            else {}
+        )
+
+    async def _save_push_checkpoint(self, pushed: dict) -> None:
+        try:
+            await self.put_kv_data("pushed_by_session", pushed)
+        except Exception as exc:
+            raise RuntimeError(f"写入推送检查点失败：{exc}") from exc
+
     async def _cache_translation(self, key: str, value: str) -> None:
         """写入翻译缓存并按配置上限淘汰最旧条目（FIFO 索引，真删除）。"""
         if not value:
@@ -1106,12 +1124,12 @@ class APOD(Star):
             return True
 
         # 按会话记录已成功推送的链接：部分失败时仅补发失败会话，不重复打扰已收到者。
-        checkpoint = await self.get_cache("pushed_by_session")
-        pushed = (
-            {k: v for k, v in checkpoint.items() if isinstance(k, str)}
-            if isinstance(checkpoint, dict)
-            else {}
-        )
+        # 投递检查点用严格读写：存储故障与“无记录”必须区分，否则会重复群发。
+        try:
+            pushed = await self._load_push_checkpoint()
+        except RuntimeError as exc:
+            logger.error(f"{exc}：为避免重复群发，本轮跳过推送检查。")
+            return False
         pending = [umo for umo in sessions if pushed.get(umo) != link]
 
         last = await self.get_cache("last_pushed_apod")
@@ -1149,8 +1167,13 @@ class APOD(Star):
                 logger.error(f"APOD 推送到 {umo} 失败：未匹配到消息平台。")
                 continue
             pushed[umo] = link
+            try:
+                await self._save_push_checkpoint(pushed)
+            except RuntimeError as exc:
+                # 进度落盘失败立即中止本轮：未确认会话留待下轮补发，避免盲目重发。
+                logger.error(f"{exc}：本轮推送中止。")
+                return False
             delivered += 1
-        await self.put_cache("pushed_by_session", pushed)
         await self.put_cache("last_pushed_apod", {"date": date, "link": link})
         missed = len(pending) - delivered
         logger.info(
