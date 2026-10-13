@@ -355,7 +355,7 @@ class APOD(Star):
         title_zh, explanation_zh = await self._translate_fields(
             apod_data, include_hidden=True
         )
-        chain = self._build_message_chain(
+        message = self._build_message_chain(
             apod_data,
             title_zh,
             explanation_zh,
@@ -363,12 +363,13 @@ class APOD(Star):
             with_image=self.image,
         )
         try:
-            await self.context.send_message(
-                event.unified_msg_origin, MessageChain(chain=chain)
-            )
+            sent = await self.context.send_message(event.unified_msg_origin, message)
         except Exception as exc:
             logger.error(f"发送{label}消息链失败：{exc}")
             return f"{label}发送失败，请提示用户稍后重试。"
+        if sent is False:
+            logger.warning(f"发送{label}：未匹配到消息平台。")
+            return f"{label}发送失败：未找到可用的消息平台。"
         title = (title_zh or apod_data.get("title") or "").strip()
         return (
             f"已向当前会话发送{label}："
