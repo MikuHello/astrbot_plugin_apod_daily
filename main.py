@@ -794,6 +794,9 @@ class APOD(Star):
                     if response.status != 200:
                         logger.error(f"获取{label}失败：状态码={response.status}")
                         self.last_apod_error = f"{label}暂时不可用，请稍后重试。"
+                        if 400 <= response.status < 500 and response.status not in (408, 429):
+                            # 客户端错误重试无意义，直接结束本次获取。
+                            break
                     else:
                         return await response.text()
             except asyncio.TimeoutError:
@@ -1136,7 +1139,9 @@ class APOD(Star):
         delivered = 0
         for umo in pending:
             try:
-                sent = await self.context.send_message(umo, chain)
+                sent = await asyncio.wait_for(
+                    self.context.send_message(umo, chain), timeout=60
+                )
             except Exception as exc:
                 logger.error(f"APOD 推送到 {umo} 失败：{exc}")
                 continue
@@ -1180,6 +1185,11 @@ class APOD(Star):
 
     async def terminate(self):
         logger.info("正在终止 NASA APOD 插件...")
-        if getattr(self, "_push_task", None):
-            self._push_task.cancel()
+        task = getattr(self, "_push_task", None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
             self._push_task = None
