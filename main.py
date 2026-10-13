@@ -719,10 +719,9 @@ class APOD(Star):
                 continue
             if lowered.startswith(("learn more", "image article")):
                 continue
-            if len(text) > len(explanation):
-                explanation = text
-        if len(explanation) < 150:
-            explanation = ""
+            if len(text) < 60 or len(explanation) >= 800:
+                continue
+            explanation = f"{explanation} {text}".strip()
         date_match = re.search(
             r'<meta[^>]+name="parsely-pub-date"[^>]+content="(\d{4}-\d{2}-\d{2})',
             page_html,
