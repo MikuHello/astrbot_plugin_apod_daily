@@ -61,8 +61,8 @@ CREDIT_PREFIX_PATTERN = re.compile(
 )
 # NASA 每日一图（IOTD）：无 feed/REST/日期元数据，只能抓两级页面；
 # og:image 即主图，展示日期按美东抓取日（与官网“当日”语义一致）。
-IOTD_PAGE_URL = "https://www.nasa.gov/image-of-the-day/"
-IOTD_POST_LINK_PATTERN = re.compile(
+NASA_PAGE_URL = "https://www.nasa.gov/image-of-the-day/"
+NASA_POST_LINK_PATTERN = re.compile(
     r"https://www\.nasa\.gov/image-article/[^\s\"'<>]+"
 )
 PLACEHOLDER_MARKS = ("nasa-logo", "/themes/")
@@ -92,7 +92,7 @@ CREDIT_STOP_MARKERS = (
     "Yesterday's Image",
     "The post ",
 )
-PLUGIN_DISPLAY_NAME = "APOD 每日天文图"
+PLUGIN_DISPLAY_NAME = "天文每日一图"
 NASA_DISPLAY_NAME = "NASA 每日一图"
 CREDIT_LABEL = "图片来源与版权"
 APOD_HELP = chr(10).join(
@@ -105,7 +105,7 @@ APOD_HELP = chr(10).join(
 )
 
 
-@register("apod", "Cysheper", "APOD 每日天文图插件：RSS 数据源 + 订阅推送 + 随机天文图 + LLM 翻译与函数工具。", "1.0.4")
+@register("apod", "Cysheper", "天文每日一图插件：APOD + NASA 每日一图，订阅推送、随机、LLM 翻译与函数工具。", "1.0.4")
 class APOD(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         self.config = config
@@ -306,7 +306,7 @@ class APOD(Star):
     async def nasa(self, event: AstrMessageEvent):
         """获取 NASA 每日一图（Image of the Day，全员可用）"""
         logger.info("正在获取 NASA 每日一图 ...")
-        nasa_data = await self._fetch_iotd()
+        nasa_data = await self._fetch_nasa()
         if nasa_data is None:
             yield event.plain_result(
                 self.last_apod_error or "获取 NASA 每日一图失败，请稍后重试。"
@@ -334,7 +334,7 @@ class APOD(Star):
     @filter.llm_tool(name="send_nasa_today")
     async def send_nasa_today(self, event: AstrMessageEvent):
         """获取今日 NASA 每日一图（Image of the Day）并发送到当前会话，含图片与中文说明。"""
-        return await self._deliver_apod(event, await self._fetch_iotd(), "NASA每日一图")
+        return await self._deliver_apod(event, await self._fetch_nasa(), "NASA每日一图")
 
     async def _deliver_apod(
         self, event: AstrMessageEvent, apod_data: Optional[dict], label: str
@@ -647,16 +647,16 @@ class APOD(Star):
         title = self._strip_html(title_match.group(1)) if title_match else ""
         return self._build_apod_data(title, link, content_html)
 
-    async def _fetch_iotd(self) -> Optional[dict]:
+    async def _fetch_nasa(self) -> Optional[dict]:
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             page_html = await self._fetch_text(
-                session, IOTD_PAGE_URL, "NASA 每日一图页面"
+                session, NASA_PAGE_URL, "NASA 每日一图页面"
             )
             if page_html is None:
                 return None
             h1_index = page_html.find("<h1")
-            match = IOTD_POST_LINK_PATTERN.search(
+            match = NASA_POST_LINK_PATTERN.search(
                 page_html, h1_index + 1 if h1_index >= 0 else 0
             )
             if match is None:
@@ -666,9 +666,9 @@ class APOD(Star):
             post_html = await self._fetch_text(session, link, "NASA 每日一图文章")
             if post_html is None:
                 return None
-            return self._build_iotd_data(post_html, link)
+            return self._build_nasa_data(post_html, link)
 
-    def _build_iotd_data(self, page_html: str, link: str) -> Optional[dict]:
+    def _build_nasa_data(self, page_html: str, link: str) -> Optional[dict]:
         """IOTD 文章页无 meta 表格与日期元数据：og:image 取主图，说明取主内容区最长段落。"""
         title_match = re.search(r"<h1[^>]*>(.*?)</h1>", page_html, re.S)
         title = self._strip_html(title_match.group(1)) if title_match else ""
