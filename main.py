@@ -786,18 +786,25 @@ class APOD(Star):
             if len(text) < 60 or len(explanation) >= 800:
                 continue
             explanation = f"{explanation} {text}".strip()
-        date_match = re.search(
-            r'<meta[^>]+name="parsely-pub-date"[^>]+content="(\d{4}-\d{2}-\d{2})',
-            page_html,
-        ) or re.search(
-            r'<meta[^>]+property="og:updated_time"[^>]+content="(\d{4}-\d{2}-\d{2})',
-            page_html,
-        )
+        # 结构化解析 meta 标签（属性顺序无关）；只认发布时间，不拿更新时间冒充。
+        published_raw = ""
+        for tag in re.findall(r"<meta\b[^>]*>", page_html):
+            name_match = re.search(r'(?:name|property)\s*=\s*"([^"]+)"', tag)
+            content_match = re.search(r'content\s*=\s*"([^"]*)"', tag)
+            if (
+                name_match
+                and content_match
+                and name_match.group(1).lower()
+                in ("parsely-pub-date", "article:published_time")
+            ):
+                published_raw = html_lib.unescape(content_match.group(1))
+                break
+        date_match = re.match(r"(\d{4}-\d{2}-\d{2})", published_raw)
         return self._build_apod_data(
             title,
             link,
             page_html,
-            date_str=date_match.group(1) if date_match else self._expected_latest_date(),
+            date_str=date_match.group(1) if date_match else "",
             explanation=explanation,
             credit=credit or None,
             image_url=image_url,
@@ -1012,8 +1019,9 @@ class APOD(Star):
             content_html
         ) or self._credit_from_markers(normalized_text, plain_text)
 
-        if not date_str or not explanation:
-            logger.error(f"APOD 内容信息不完整：date={date_str!r}，link={link!r}")
+        # 日期允许未知（如 NASA 页面缺失发布时间）：展示层自动省略日期行。
+        if not explanation:
+            logger.error(f"内容信息不完整：link={link!r}")
             return None
 
         return {
