@@ -189,7 +189,7 @@ class APOD(Star):
     @filter.command("apod管理")
     @filter.permission_type(PermissionType.GROUP_ADMIN)
     async def apod_manage(self, event: AstrMessageEvent):
-        """APOD 推送订阅管理：订阅 / 退订 / 列表"""
+        """APOD 推送订阅管理：订阅 / 退订（名单在插件配置页维护）"""
         tokens = (event.message_str or "").strip().split()
         if tokens and tokens[0] in ("apod管理", "APOD管理"):
             tokens = tokens[1:]
@@ -219,18 +219,6 @@ class APOD(Star):
                 yield event.plain_result("本会话还没有订阅 APOD 推送喵。")
             return
 
-        if sub in ("list", "列表", "名单"):
-            sessions = await self._get_push_sessions()
-            if sessions:
-                yield event.plain_result(
-                    "当前订阅 APOD 推送的会话："
-                    + chr(10)
-                    + chr(10).join(sessions)
-                )
-            else:
-                yield event.plain_result("还没有会话订阅推送喵～")
-            return
-
         # 裸指令：输出支持的子命令与填写方式。
         usage = (
             "APOD 订阅管理指令："
@@ -239,7 +227,7 @@ class APOD(Star):
             + chr(10)
             + "/apod管理 退订 —— 退订本会话的每日推送"
             + chr(10)
-            + "/apod管理 列表 —— 查看订阅名单"
+            + "订阅名单可在插件配置页「推送/订阅名单 (UMO)」中维护"
         )
         yield event.plain_result(usage)
 
