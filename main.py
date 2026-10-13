@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, Optional
 from xml.etree import ElementTree
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
@@ -996,23 +997,8 @@ class APOD(Star):
 
     @staticmethod
     def _et_timezone():
-        try:
-            from zoneinfo import ZoneInfo
-
-            return ZoneInfo("America/New_York")
-        except Exception:
-            # Windows 未安装 tzdata 包时的降级方案：按美国夏令时规则估算偏移。
-            now_utc = datetime.now(timezone.utc)
-
-            def nth_weekday(year: int, month: int, weekday: int, n: int) -> datetime:
-                first_day = datetime(year, month, 1, tzinfo=timezone.utc)
-                shift = (weekday - first_day.weekday()) % 7
-                return first_day + timedelta(days=shift + 7 * (n - 1))
-
-            dst_start = nth_weekday(now_utc.year, 3, 6, 2)  # 3 月第二个周日
-            dst_end = nth_weekday(now_utc.year, 11, 6, 1)  # 11 月第一个周日
-            offset_hours = -4 if dst_start <= now_utc < dst_end else -5
-            return timezone(timedelta(hours=offset_hours))
+        # APOD/IOTD 均以美东时间发布；IANA 数据缺失时由插件依赖 tzdata 提供。
+        return ZoneInfo("America/New_York")
 
     def _expected_latest_date(self) -> str:
         # APOD 约在美东 00:05 发布当日条目，因此“美东今天”就是期望的最新日期。
