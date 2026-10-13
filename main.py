@@ -115,6 +115,7 @@ class APOD(Star):
         self.context = context
         self.last_apod_error: Optional[str] = None
         self._stale_apod: Optional[dict] = None
+        self._stale_nasa: Optional[dict] = None
 
     @staticmethod
     def _ensure_dict(value: Any) -> Dict[str, Any]:
@@ -312,7 +313,7 @@ class APOD(Star):
     async def nasa(self, event: AstrMessageEvent):
         """获取 NASA 每日一图（Image of the Day，全员可用）"""
         logger.info("正在获取 NASA 每日一图 ...")
-        nasa_data = await self._fetch_nasa()
+        nasa_data = await self._get_nasa()
         if nasa_data is None:
             yield event.plain_result(
                 self.last_apod_error or "获取 NASA 每日一图失败，请稍后重试。"
@@ -340,7 +341,7 @@ class APOD(Star):
     @filter.llm_tool(name="send_nasa_today")
     async def send_nasa_today(self, event: AstrMessageEvent):
         """获取今日 NASA 每日一图（Image of the Day）并发送到当前会话，含图片与中文说明。"""
-        return await self._deliver_apod(event, await self._fetch_nasa(), "NASA每日一图")
+        return await self._deliver_apod(event, await self._get_nasa(), "NASA每日一图")
 
     async def _deliver_apod(
         self, event: AstrMessageEvent, apod_data: Optional[dict], label: str
@@ -533,51 +534,53 @@ class APOD(Star):
         )
         return llm_resp.completion_text
 
-    # 把“拉取并写入缓存”的逻辑集中到这里，保证所有刷新路径行为一致。
-    async def _fetch_and_cache_apod(self) -> Optional[dict]:
-        logger.info("正在获取最新 APOD 数据...")
-        apod_data = await self._fetch_latest_apod()
+    # “拉取并写入缓存”集中到这里，apod / nasa 最新内容共用同一套缓存语义。
+    async def _refresh_cached_data(
+        self, cache_key: str, fetch, stale_attr: str
+    ) -> Optional[dict]:
+        apod_data = await fetch()
         if apod_data is None:
             return None
 
         if not self._is_valid_apod_data(apod_data):
-            logger.error(f"获取到的 APOD 数据无效：{apod_data}")
+            logger.error(f"获取到的数据无效：{apod_data}")
             return None
 
         apod_data["retrieved_at"] = datetime.now().isoformat()
-        self._stale_apod = apod_data
-        await self.put_cache("apod_cache", apod_data)
+        setattr(self, stale_attr, apod_data)
+        await self.put_cache(cache_key, apod_data)
         return apod_data
 
-    # 只有在缓存结构有效且时间未过期时，才真正使用缓存。
-    async def _get_latest_apod(self) -> Optional[dict]:
-        apod_data = await self.get_cache("apod_cache")
+    async def _get_cached_data(
+        self, cache_key: str, fetch, stale_attr: str
+    ) -> Optional[dict]:
+        """当日内容缓存：12h 硬 TTL；超 1h 且日期落后美东今天时提前刷新；
+        刷新失败回退 KV 旧值或内存 stale，避免直接对用户报错。"""
+
+        async def refresh() -> Optional[dict]:
+            return await self._refresh_cached_data(cache_key, fetch, stale_attr)
+
+        apod_data = await self.get_cache(cache_key)
         if apod_data is None:
-            fresh = await self._fetch_and_cache_apod()
-            if fresh is not None:
-                return fresh
-            # 没有任何缓存且全部数据源失败时，尝试用内存中的旧数据兜底。
-            return self._stale_apod
+            return await refresh() or getattr(self, stale_attr, None)
 
         if not self._is_valid_apod_data(apod_data):
-            logger.warning("缓存中的 APOD 数据无效，正在刷新缓存。")
-            return await self._fetch_and_cache_apod()
+            logger.warning("缓存中的数据无效，正在刷新缓存。")
+            return await refresh() or getattr(self, stale_attr, None)
 
         retrieved_at_raw = apod_data.get("retrieved_at")
         if not retrieved_at_raw:
-            logger.info("缓存中的 APOD 数据缺少 retrieved_at，正在刷新缓存。")
-            return await self._fetch_and_cache_apod()
+            logger.info("缓存中的数据缺少 retrieved_at，正在刷新缓存。")
+            return await refresh() or getattr(self, stale_attr, None)
 
         try:
             retrieved_at = datetime.fromisoformat(retrieved_at_raw)
         except (TypeError, ValueError):
-            logger.warning("缓存中的 APOD 时间格式无效，正在刷新缓存。")
-            return await self._fetch_and_cache_apod()
+            logger.warning("缓存中的时间格式无效，正在刷新缓存。")
+            return await refresh() or getattr(self, stale_attr, None)
 
-        now = datetime.now()
-        age = (now - retrieved_at).total_seconds()
-        # 新鲜度判断以“美东今天”为基准（APOD 约在美东 00:05 发布当日条目），
-        # 与服务器本地时区无关：
+        age = (datetime.now() - retrieved_at).total_seconds()
+        # 新鲜度判断以“美东今天”为基准（两个内容源都约在美东每日更新）：
         #   - 12 小时硬 TTL；
         #   - 缓存超过 1 小时且日期落后于最新一期时提前刷新，
         #     避免新一期发布后最长要等满 12 小时才能刷出来。
@@ -588,13 +591,22 @@ class APOD(Star):
                 logger.info("缓存日期落后于最新一期，正在刷新缓存。")
                 expired = True
         if expired:
-            logger.info("缓存中的 APOD 数据已过期，正在刷新缓存。")
-            fresh = await self._fetch_and_cache_apod()
+            logger.info("缓存中的数据已过期，正在刷新缓存。")
+            fresh = await refresh()
             if fresh is not None:
                 return fresh
-            # 刷新失败时回退到过期缓存，避免直接对用户报错。
-            logger.warning("刷新失败，回退使用过期的 APOD 缓存。")
+            logger.warning("刷新失败，回退使用过期的缓存。")
         return apod_data
+
+    async def _get_latest_apod(self) -> Optional[dict]:
+        return await self._get_cached_data(
+            "apod_cache", self._fetch_latest_apod, "_stale_apod"
+        )
+
+    async def _get_nasa(self) -> Optional[dict]:
+        return await self._get_cached_data(
+            "nasa_cache", self._fetch_nasa, "_stale_nasa"
+        )
 
     # ---------- 数据获取主入口 ----------
     # 最新一期走站点 RSS（无需 token、无速率限制），失败时由缓存层兜底
