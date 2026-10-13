@@ -562,7 +562,7 @@ class APOD(Star):
             logger.error(f"获取到的数据无效：{apod_data}")
             return None
 
-        apod_data["retrieved_at"] = datetime.now().isoformat()
+        apod_data["retrieved_at"] = datetime.now(timezone.utc).isoformat()
         setattr(self, stale_attr, apod_data)
         await self.put_cache(cache_key, apod_data)
         return apod_data
@@ -584,18 +584,26 @@ class APOD(Star):
             logger.warning("缓存中的数据无效，正在刷新缓存。")
             return await refresh() or getattr(self, stale_attr, None)
 
+        # 时间元数据损坏只应触发刷新：刷新失败仍可使用手里的旧内容，
+        # 不因新鲜度信息缺失而把可用正文判定为失败。
+        retrieved_at = None
         retrieved_at_raw = apod_data.get("retrieved_at")
-        if not retrieved_at_raw:
-            logger.info("缓存中的数据缺少 retrieved_at，正在刷新缓存。")
-            return await refresh() or getattr(self, stale_attr, None)
+        if retrieved_at_raw:
+            try:
+                retrieved_at = datetime.fromisoformat(retrieved_at_raw)
+                if retrieved_at.tzinfo is None:
+                    # 历史 naive 值为服务器本地时间，按本地时区补齐。
+                    retrieved_at = retrieved_at.astimezone()
+            except (TypeError, ValueError):
+                logger.warning("缓存中的时间格式无效，将刷新缓存。")
+                retrieved_at = None
+        if retrieved_at is None:
+            logger.info("缓存缺少有效 retrieved_at，正在刷新缓存。")
+            return await refresh() or apod_data
 
-        try:
-            retrieved_at = datetime.fromisoformat(retrieved_at_raw)
-        except (TypeError, ValueError):
-            logger.warning("缓存中的时间格式无效，正在刷新缓存。")
-            return await refresh() or getattr(self, stale_attr, None)
-
-        age = (datetime.now() - retrieved_at).total_seconds()
+        age = (
+            datetime.now(timezone.utc) - retrieved_at.astimezone(timezone.utc)
+        ).total_seconds()
         # 新鲜度判断以“美东今天”为基准（两个内容源都约在美东每日更新）：
         #   - 12 小时硬 TTL；
         #   - 缓存超过 1 小时且日期落后于最新一期时提前刷新，
@@ -612,6 +620,7 @@ class APOD(Star):
             if fresh is not None:
                 return fresh
             logger.warning("刷新失败，回退使用过期的缓存。")
+        setattr(self, stale_attr, apod_data)
         return apod_data
 
     async def _get_latest_apod(self) -> Optional[dict]:
