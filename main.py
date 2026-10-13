@@ -673,6 +673,20 @@ class APOD(Star):
             r"\s+", " ", html_lib.unescape(re.sub(r"<[^>]+>", " ", fragment or ""))
         ).strip()
 
+    def _fallback_explanation(self, content_html: str) -> str:
+        """无 Explanation 标记时的兜底：拼接正文 <p> 段落，避免整页纯文本混入导航与表格。"""
+        paragraphs = []
+        total = 0
+        for p in re.findall(r"<p[^>]*>(.*?)</p>", content_html or "", re.S):
+            text = self._strip_html(p)
+            if len(text) < 80:
+                continue
+            paragraphs.append(text)
+            total += len(text)
+            if total >= 800:
+                break
+        return " ".join(paragraphs) if paragraphs else self._strip_html(content_html)
+
     @classmethod
     def _parse_meta_rows(cls, content_html: str) -> list:
         rows = []
@@ -771,7 +785,7 @@ class APOD(Star):
                 if stop_index > 0:
                     explanation = explanation[:stop_index].strip()
         if not explanation:
-            explanation = plain_text
+            explanation = self._fallback_explanation(content_html)
 
         image_url = ""
         for src in re.findall(r'<img[^>]+src="([^"]+)"', content_html or ""):
