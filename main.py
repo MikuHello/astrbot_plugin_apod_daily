@@ -765,16 +765,30 @@ class APOD(Star):
                 return None
             return self._build_nasa_data(post_html, link)
 
+    @staticmethod
+    def _extract_article_region(page_html: str) -> str:
+        """截取主内容 <article> 容器：页眉导航与页脚在容器之外。"""
+        start = (page_html or "").find("<article")
+        if start < 0:
+            return page_html or ""
+        end = page_html.find("</article>", start)
+        return (
+            page_html[start : end + len("</article>")]
+            if end >= 0
+            else page_html[start:]
+        )
+
     def _build_nasa_data(self, page_html: str, link: str) -> Optional[dict]:
-        """og:image 取主图；日期取文章发布时间元数据，缺失时回退美东今天。"""
-        title_match = re.search(r"<h1[^>]*>(.*?)</h1>", page_html, re.S)
+        """og:image 取主图；日期取文章发布时间元数据，缺失时保留未知。"""
+        region = self._extract_article_region(page_html)
+        title_match = re.search(r"<h1[^>]*>(.*?)</h1>", region, re.S)
         title = self._strip_html(title_match.group(1)) if title_match else ""
         og_match = re.search(r'property="og:image" content="([^"]+)"', page_html)
         image_url = html_lib.unescape(og_match.group(1)) if og_match else ""
-        # 说明与版权只在 <h1> 之后的主内容区里找，避免站点导航/页眉混入。
-        h1_index = page_html.find("<h1")
-        region = page_html[h1_index:] if h1_index >= 0 else page_html
-        explanation, credit = "", ""
+        # 说明与版权只在文章主内容容器里找，按原文顺序保留全部段落；
+        # 页眉导航与页脚在容器之外，不参与拼接，也不做长度过滤。
+        explanation_parts = []
+        credit = ""
         for p in re.findall(r"<p[^>]*>(.*?)</p>", region, re.S):
             text = self._strip_html(p)
             lowered = text.lower()
@@ -783,9 +797,8 @@ class APOD(Star):
                 continue
             if lowered.startswith(("learn more", "image article")):
                 continue
-            if len(text) < 60 or len(explanation) >= 800:
-                continue
-            explanation = f"{explanation} {text}".strip()
+            explanation_parts.append(text)
+        explanation = " ".join(part for part in explanation_parts if part)
         # 结构化解析 meta 标签（属性顺序无关）；只认发布时间，不拿更新时间冒充。
         published_raw = ""
         for tag in re.findall(r"<meta\b[^>]*>", page_html):
