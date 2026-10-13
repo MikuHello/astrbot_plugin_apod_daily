@@ -119,6 +119,7 @@ class APOD(Star):
         self._stale_nasa: Optional[dict] = None
         self._content_locks: Dict[str, asyncio.Lock] = {}
         self._translation_flights: Dict[str, asyncio.Future] = {}
+        self._refresh_cooldowns: Dict[str, datetime] = {}
         self._translate_index_lock = asyncio.Lock()
 
     @staticmethod
@@ -677,11 +678,23 @@ class APOD(Star):
                     logger.info("缓存日期落后于最新一期，正在刷新缓存。")
                     expired = True
             if expired:
+                cooldown_until = self._refresh_cooldowns.get(cache_key)
+                if (
+                    cooldown_until is not None
+                    and datetime.now(timezone.utc) < cooldown_until
+                ):
+                    logger.info("刷新处于失败冷却期，复用过期缓存。")
+                    setattr(self, stale_attr, apod_data)
+                    return apod_data
                 logger.info("缓存中的数据已过期，正在刷新缓存。")
                 fresh = await refresh()
                 if fresh is not None:
+                    self._refresh_cooldowns.pop(cache_key, None)
                     return fresh
-                logger.warning("刷新失败，回退使用过期的缓存。")
+                self._refresh_cooldowns[cache_key] = datetime.now(
+                    timezone.utc
+                ) + timedelta(minutes=5)
+                logger.warning("刷新失败，进入冷却期并回退使用过期的缓存。")
             setattr(self, stale_attr, apod_data)
             return apod_data
 
