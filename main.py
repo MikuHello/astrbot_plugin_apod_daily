@@ -90,6 +90,14 @@ CREDIT_STOP_MARKERS = (
 )
 PLUGIN_DISPLAY_NAME = "APOD 每日天文图"
 CREDIT_LABEL = "图片来源与版权"
+APOD_HELP = chr(10).join((
+    [
+        "APOD 指令：",
+        "/apod 今日 —— 获取最新一期天文每日一图",
+        "/apod 随机 —— 随机欣赏一期历史天文图",
+        "订阅每日推送：管理员使用 /apod管理 订阅",
+    ]
+))
 
 
 @register("apod", "Cysheper", "APOD 每日天文图插件：RSS 数据源 + 订阅推送 + LLM 翻译。", "1.0.4")
@@ -163,25 +171,51 @@ class APOD(Star):
 
     @filter.command("apod")
     async def apod(self, event: AstrMessageEvent):
-        """获取 NASA 每日天文图（订阅管理请使用 /apod管理）"""
-        logger.info("正在获取 NASA 每日天文图片...")
+        """NASA 天文每日一图：apod 今日 | apod 随机"""
+        tokens = (event.message_str or "").strip().split()
+        if tokens and tokens[0].lower() == "apod":
+            tokens = tokens[1:]
+        sub = tokens[0].lower() if tokens else ""
 
-        # 如果今天的 APOD 缓存仍然有效，就优先复用缓存数据。
+        if sub in ("今日", "today", "latest", "最新"):
+            async for result in self._reply_latest_apod(event):
+                yield result
+        elif sub in ("随机", "random"):
+            async for result in self._reply_random_apod(event):
+                yield result
+        else:
+            yield event.plain_result(APOD_HELP)
+
+    async def _reply_latest_apod(self, event: AstrMessageEvent):
+        logger.info("正在获取最新 APOD ...")
         apod_data = await self.get_cache_apod()
-        if not apod_data:
+        if apod_data is None:
             yield event.plain_result(
                 self.last_apod_error or "获取 APOD 数据失败，请稍后重试。"
             )
             return
+        async for result in self._reply_apod(event, apod_data):
+            yield result
 
-        # 当要求返回图片时，如果当天 APOD 不是图片类型，就直接视为失败。
+    async def _reply_random_apod(self, event: AstrMessageEvent):
+        logger.info("正在获取随机 APOD ...")
+        apod_data = await self.get_random_apod()
+        if apod_data is None:
+            yield event.plain_result(
+                self.last_apod_error or "获取随机 APOD 失败，请稍后重试。"
+            )
+            return
+        async for result in self._reply_apod(event, apod_data):
+            yield result
+
+    async def _reply_apod(self, event: AstrMessageEvent, apod_data: dict):
+        """按展示配置渲染并发送某一期 APOD（今日/随机共用）。"""
+        # 当要求返回图片时，如果该期 APOD 不是图片类型，就直接视为失败。
         if apod_data.get("media_type") != "image" and self.image:
-            yield event.plain_result("今天的 APOD 不是图片类型，请稍后再试。")
+            yield event.plain_result("这一期 APOD 不是图片类型，请稍后再试。")
             return
 
         url = apod_data.get("hdurl") or apod_data.get("url")
-
-        # 图片模式还要求 NASA 返回可用的图片链接。
         if not url and self.image:
             yield event.plain_result("获取 APOD 图片链接失败，请稍后重试。")
             return
