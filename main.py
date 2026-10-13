@@ -17,17 +17,13 @@ from astrbot.api.event.filter import PermissionType
 from astrbot.api.provider import ProviderType
 from astrbot.api.star import Context, Star, register
 
-# NASA APOD 主站已从 apod.nasa.gov 迁移到 science.nasa.gov（WordPress 站点），
-# 迁移期内 api.nasa.gov 频繁出现 500、超时和占位数据（标题/图片变成
-# "NASA Science" logo）。因此本插件的数据层改为：
-#   最新一期：science.nasa.gov 站点 RSS feed —— 无需 API Key、无速率限制，
-#     每天约 UTC 04:05 发布标题形如 "APOD: 2026 October 11 – ..." 的条目，
-#     content:encoded 内含当日图片与解说。
-#   随机一期：官网 Random APOD 同款 embed 接口（wp-json/smd/v1/embed-post），
-#     单次 POST 即返回随机一期的完整内容 HTML（与 feed 的 content 同构）。
-#   容错策略：feed 拉取失败时回退缓存（KV + 内存），随机接口不做缓存。
-#   解析参数：两类内容共用同一套解析，来源差异只体现为 URL 与模式常量，
-#     接入其他 NASA 内容源（如 Image of the Day）仅需替换这批常量。
+# 数据层说明：
+#   最新一期：science.nasa.gov 站点 RSS feed（无需 API Key、无速率限制，
+#     每天约 UTC 04:05 发布标题形如 "APOD: 2026 October 11 – ..." 的条目），
+#     拉取失败时回退缓存（KV + 内存）。
+#   随机一期：官网 Random APOD 同款 embed 接口，单次 POST 返回与 feed
+#     content 同构的完整 HTML，不做缓存。
+#   解析：两类内容共用同一套解析器，来源差异只体现为 URL 与模式常量。
 # 已知坑：feed 的 XML 头畸形（两个 xmlns 声明之间缺空格），解析前需修复。
 FEED_URL = "https://science.nasa.gov/feed/"
 FEED_XML_FIX_PATTERN = re.compile(r'"(?=xmlns:)')
@@ -90,14 +86,14 @@ CREDIT_STOP_MARKERS = (
 )
 PLUGIN_DISPLAY_NAME = "APOD 每日天文图"
 CREDIT_LABEL = "图片来源与版权"
-APOD_HELP = chr(10).join((
+APOD_HELP = chr(10).join(
     [
         "APOD 指令：",
         "/apod 今日 —— 获取最新一期天文每日一图",
         "/apod 随机 —— 随机欣赏一期历史天文图",
         "订阅每日推送：管理员使用 /apod管理 订阅",
     ]
-))
+)
 
 
 @register("apod", "Cysheper", "APOD 每日天文图插件：RSS 数据源 + 订阅推送 + 随机天文图 + LLM 翻译与函数工具。", "1.0.4")
@@ -132,13 +128,13 @@ class APOD(Star):
         self.image = self.config.get("image", True)
         self.explanation = self._ensure_dict(self.config.get("explanation", {}))
         self.title = self._ensure_dict(self.config.get("title", {}))
+        # 翻译模型：优先用插件配置的 provider，未配置时回落到 AstrBot 默认对话模型。
         self.provider = self.config.get("provider", "")
         self.date = self._ensure_dict(self.config.get("date", {}))
         self.is_divided = self.config.get("is_divided", True)
         self.timeout = max(1, int(self.config.get("timeout", 120)))
         self.retry_count = max(0, int(self.config.get("retry_count", 2)))
 
-        # 翻译模型：优先用插件配置的 provider，未配置时回落到 AstrBot 默认对话模型。
         push_cfg = self._ensure_dict(self.config.get("push", {}))
         self.push_enabled = bool(push_cfg.get("enabled", False))
         self.push_mode = str(push_cfg.get("mode", "scheduled")).strip().lower()
@@ -188,7 +184,7 @@ class APOD(Star):
 
     async def _reply_latest_apod(self, event: AstrMessageEvent):
         logger.info("正在获取最新 APOD ...")
-        apod_data = await self.get_cache_apod()
+        apod_data = await self._get_latest_apod()
         if apod_data is None:
             yield event.plain_result(
                 self.last_apod_error or "获取 APOD 数据失败，请稍后重试。"
@@ -199,7 +195,7 @@ class APOD(Star):
 
     async def _reply_random_apod(self, event: AstrMessageEvent):
         logger.info("正在获取随机 APOD ...")
-        apod_data = await self.get_random_apod()
+        apod_data = await self._fetch_random_apod()
         if apod_data is None:
             yield event.plain_result(
                 self.last_apod_error or "获取随机 APOD 失败，请稍后重试。"
@@ -298,12 +294,12 @@ class APOD(Star):
     @filter.llm_tool(name="send_apod_today")
     async def send_apod_today(self, event: AstrMessageEvent):
         """获取今日 NASA 天文每日一图（APOD）并发送到当前会话，包含图片与中文说明。当用户想看今日或最新的天文每日一图时调用。"""
-        return await self._deliver_apod(event, await self.get_cache_apod(), "今日")
+        return await self._deliver_apod(event, await self._get_latest_apod(), "今日")
 
     @filter.llm_tool(name="send_apod_random")
     async def send_apod_random(self, event: AstrMessageEvent):
         """随机获取一期 NASA 天文每日一图（APOD）并发送到当前会话，包含图片与中文说明。当用户想看随机的天文每日一图时调用。"""
-        return await self._deliver_apod(event, await self.get_random_apod(), "随机")
+        return await self._deliver_apod(event, await self._fetch_random_apod(), "随机")
 
     async def _deliver_apod(
         self, event: AstrMessageEvent, apod_data: Optional[dict], label: str
@@ -486,7 +482,7 @@ class APOD(Star):
     # 把“拉取并写入缓存”的逻辑集中到这里，保证所有刷新路径行为一致。
     async def _fetch_and_cache_apod(self) -> Optional[dict]:
         logger.info("正在获取最新 APOD 数据...")
-        apod_data = await self.get_apod()
+        apod_data = await self._fetch_latest_apod()
         if apod_data is None:
             return None
 
@@ -500,7 +496,7 @@ class APOD(Star):
         return apod_data
 
     # 只有在缓存结构有效且时间未过期时，才真正使用缓存。
-    async def get_cache_apod(self) -> Optional[dict]:
+    async def _get_latest_apod(self) -> Optional[dict]:
         apod_data = await self.get_cache("apod_cache")
         if apod_data is None:
             fresh = await self._fetch_and_cache_apod()
@@ -550,7 +546,7 @@ class APOD(Star):
     # 最新一期走站点 RSS（无需 token、无速率限制），失败时由缓存层兜底
     # （KV / 内存 stale）；随机一期走官网同款 embed 接口，不做缓存。
 
-    async def get_apod(self) -> Optional[dict]:
+    async def _fetch_latest_apod(self) -> Optional[dict]:
         self.last_apod_error = None
         timeout = aiohttp.ClientTimeout(total=self.timeout)
 
@@ -564,7 +560,7 @@ class APOD(Star):
         )
         return None
 
-    async def get_random_apod(self) -> Optional[dict]:
+    async def _fetch_random_apod(self) -> Optional[dict]:
         self.last_apod_error = None
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -615,12 +611,12 @@ class APOD(Star):
         title = self._strip_html(title_match.group(1)) if title_match else ""
         return self._build_apod_data(title, link, content_html)
 
-    # ---------- 内容解析（feed 条目与随机内容共用） ----------
-
-    async def _fetch_from_feed(self, session: aiohttp.ClientSession) -> Optional[dict]:
+    async def _fetch_from_feed(
+        self, session: aiohttp.ClientSession, feed_url: str = FEED_URL
+    ) -> Optional[dict]:
         for attempt in range(self.retry_count + 1):
             try:
-                async with session.get(FEED_URL) as response:
+                async with session.get(feed_url) as response:
                     if response.status != 200:
                         error_text = await response.text()
                         logger.error(
@@ -668,6 +664,8 @@ class APOD(Star):
             return self._build_apod_data(title_raw, link, content_html, pub_date_raw)
         logger.warning("NASA feed 中未找到 APOD 条目。")
         return None
+
+    # ---------- 内容解析（feed 条目与随机内容共用） ----------
 
     @staticmethod
     def _strip_html(fragment: str) -> str:
@@ -908,7 +906,7 @@ class APOD(Star):
         sessions = self._get_push_sessions()
         if not sessions:
             return True
-        apod_data = await self.get_apod()
+        apod_data = await self._fetch_latest_apod()
         if apod_data is None:
             return False
         link = str(apod_data.get("link") or "")
