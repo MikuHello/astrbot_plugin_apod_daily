@@ -114,11 +114,13 @@ class APOD(Star):
         self.push_send_image = bool(push_cfg.get("send_image", True))
         self._push_task: Optional[asyncio.Task] = None
 
-        # 把配置里的静态订阅名单作为 KV 订阅表的种子（仅当 KV 里还没有名单时）。
-        seed_sessions = [str(s) for s in (push_cfg.get("sessions") or [])]
-        existing_sessions = await self.get_cache("push_sessions")
-        if existing_sessions is None and seed_sessions:
-            await self.put_cache("push_sessions", seed_sessions)
+        # 历史版本把订阅名单存在 KV；现以插件配置为唯一数据源，启动时做一次性迁移。
+        kv_sessions = await self.get_cache("push_sessions")
+        if isinstance(kv_sessions, list) and kv_sessions:
+            merged = list(dict.fromkeys(self._get_push_sessions() + [str(s) for s in kv_sessions]))
+            await self._save_push_sessions(merged)
+            await self.put_cache("push_sessions", [])
+            logger.info(f"APOD 订阅名单已从 KV 迁移到插件配置（共 {len(merged)} 个会话）。")
 
         if self.push_enabled:
             self._push_task = asyncio.create_task(self._push_loop())
@@ -194,24 +196,24 @@ class APOD(Star):
         sub = tokens[0].lower() if tokens else ""
 
         if sub in ("subscribe", "sub", "订阅"):
-            sessions = await self._get_push_sessions()
+            sessions = self._get_push_sessions()
             umo = event.unified_msg_origin
             if umo in sessions:
                 yield event.plain_result("本会话已经订阅过 APOD 推送啦～")
             else:
                 sessions.append(umo)
-                await self.put_cache("push_sessions", sessions)
+                await self._save_push_sessions(sessions)
                 yield event.plain_result(
                     "订阅成功！APOD 发布新一期时会自动推送到本会话喵～"
                 )
             return
 
         if sub in ("unsubscribe", "unsub", "退订"):
-            sessions = await self._get_push_sessions()
+            sessions = self._get_push_sessions()
             umo = event.unified_msg_origin
             if umo in sessions:
                 sessions.remove(umo)
-                await self.put_cache("push_sessions", sessions)
+                await self._save_push_sessions(sessions)
                 yield event.plain_result("已退订 APOD 推送～")
             else:
                 yield event.plain_result("本会话还没有订阅 APOD 推送喵。")
@@ -644,9 +646,17 @@ class APOD(Star):
 
     # ---------- 订阅与推送 ----------
 
-    async def _get_push_sessions(self) -> list:
-        sessions = await self.get_cache("push_sessions")
-        return list(sessions) if isinstance(sessions, list) else []
+    # 订阅名单以插件配置页为唯一数据源：指令订阅/退订即时回写配置，
+    # 配置页手改保存并重载插件后同样生效。
+    def _get_push_sessions(self) -> list:
+        push_cfg = self._ensure_dict(self.config.get("push", {}))
+        return [str(s) for s in (push_cfg.get("sessions") or []) if str(s).strip()]
+
+    async def _save_push_sessions(self, sessions: list) -> None:
+        self._ensure_dict(self.config.setdefault("push", {}))["sessions"] = list(
+            dict.fromkeys(sessions)
+        )
+        await self.config.save_config_async()
 
     async def _push_loop(self) -> None:
         try:
@@ -695,7 +705,7 @@ class APOD(Star):
         return (run_at - now).total_seconds()
 
     async def _push_check(self) -> bool:
-        sessions = await self._get_push_sessions()
+        sessions = self._get_push_sessions()
         if not sessions:
             return True
         apod_data = await self.get_apod()
