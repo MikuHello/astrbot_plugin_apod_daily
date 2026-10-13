@@ -868,7 +868,7 @@ class APOD(Star):
         credit: Optional[str] = None,
         image_url: Optional[str] = None,
     ) -> Optional[dict]:
-        plain_text = self._strip_html(content_html)
+        plain_text = self._strip_html(META_ROW_PATTERN.sub(" ", content_html or ""))
         # 原文的撇号是 U+2019（’），标记匹配前统一映射为 ASCII 撇号；
         # 替换是等长的，可直接用同一索引回切原文，不影响展示内容。
         normalized_text = plain_text.replace("\u2019", "'")
