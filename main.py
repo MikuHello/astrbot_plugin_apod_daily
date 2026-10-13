@@ -59,10 +59,17 @@ RANDOM_POST_LINK_PATTERN = re.compile(
 CREDIT_PREFIX_PATTERN = re.compile(
     r"^(?:Image\s+)?Credit(?:\s*&\s*Copyright)?\s*:\s*", re.IGNORECASE
 )
+# NASA 每日一图（IOTD）：无 feed/REST/日期元数据，只能抓两级页面；
+# og:image 即主图，展示日期按美东抓取日（与官网“当日”语义一致）。
+IOTD_PAGE_URL = "https://www.nasa.gov/image-of-the-day/"
+IOTD_POST_LINK_PATTERN = re.compile(
+    r"https://www\.nasa\.gov/image-article/[^\s\"'<>]+"
+)
 PLACEHOLDER_MARKS = ("nasa-logo", "/themes/")
 IMAGE_URL_SOURCES = (
     "assets.science.nasa.gov",
     "apod.nasa.gov/apod/image",
+    "images-assets.nasa.gov",
     "wp-content/uploads",
 )
 EXPLANATION_STOP_MARKERS = (
@@ -85,6 +92,7 @@ CREDIT_STOP_MARKERS = (
     "The post ",
 )
 PLUGIN_DISPLAY_NAME = "APOD 每日天文图"
+NASA_DISPLAY_NAME = "NASA 每日一图"
 CREDIT_LABEL = "图片来源与版权"
 APOD_HELP = chr(10).join(
     [
@@ -611,6 +619,49 @@ class APOD(Star):
         title = self._strip_html(title_match.group(1)) if title_match else ""
         return self._build_apod_data(title, link, content_html)
 
+    async def _fetch_iotd(self) -> Optional[dict]:
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            page_html = await self._fetch_text(
+                session, IOTD_PAGE_URL, "NASA 每日一图页面"
+            )
+            if page_html is None:
+                return None
+            h1_index = page_html.find("<h1")
+            match = IOTD_POST_LINK_PATTERN.search(
+                page_html, h1_index + 1 if h1_index >= 0 else 0
+            )
+            if match is None:
+                self.last_apod_error = "NASA 每日一图页面未找到今日条目，请稍后重试。"
+                return None
+            link = html_lib.unescape(match.group(0))
+            post_html = await self._fetch_text(session, link, "NASA 每日一图文章")
+            if post_html is None:
+                return None
+            return self._build_iotd_data(post_html, link)
+
+    def _build_iotd_data(self, page_html: str, link: str) -> Optional[dict]:
+        title_match = re.search(r"<h1[^>]*>(.*?)</h1>", page_html, re.S)
+        title = self._strip_html(title_match.group(1)) if title_match else ""
+        og_match = re.search(r'property="og:image" content="([^"]+)"', page_html)
+        image_url = html_lib.unescape(og_match.group(1)) if og_match else ""
+        explanation, credit = "", ""
+        for p in re.findall(r"<p[^>]*>(.*?)</p>", page_html, re.S):
+            text = self._strip_html(p)
+            if not explanation and len(text) >= 200:
+                explanation = text
+            if not credit and text.lower().startswith("image credit:"):
+                credit = text[len("Image credit:") :].strip()
+        return self._build_apod_data(
+            title,
+            link,
+            page_html,
+            date_str=self._expected_latest_date(),
+            explanation=explanation or None,
+            credit=credit or None,
+            image_url=image_url,
+        )
+
     async def _fetch_text(
         self, session: aiohttp.ClientSession, url: str, label: str
     ) -> Optional[str]:
@@ -773,30 +824,36 @@ class APOD(Star):
         link: str,
         content_html: str,
         pub_date_raw: str = "",
+        *,
+        date_str: Optional[str] = None,
+        explanation: Optional[str] = None,
+        credit: Optional[str] = None,
+        image_url: Optional[str] = None,
     ) -> Optional[dict]:
         plain_text = self._strip_html(content_html)
         # 原文的撇号是 U+2019（’），标记匹配前统一映射为 ASCII 撇号；
         # 替换是等长的，可直接用同一索引回切原文，不影响展示内容。
         normalized_text = plain_text.replace("\u2019", "'")
 
-        explanation = ""
-        marker_index = normalized_text.find("Explanation:")
-        if marker_index >= 0:
-            explanation = plain_text[marker_index + len("Explanation:") :].strip()
-            normalized_tail = explanation.replace("\u2019", "'")
-            for stop_marker in EXPLANATION_STOP_MARKERS:
-                stop_index = normalized_tail.find(stop_marker)
-                if stop_index > 0:
-                    explanation = explanation[:stop_index].strip()
-        if not explanation:
-            explanation = self._fallback_explanation(content_html)
+        if explanation is None:
+            explanation = ""
+            marker_index = normalized_text.find("Explanation:")
+            if marker_index >= 0:
+                explanation = plain_text[marker_index + len("Explanation:") :].strip()
+                normalized_tail = explanation.replace("\u2019", "'")
+                for stop_marker in EXPLANATION_STOP_MARKERS:
+                    stop_index = normalized_tail.find(stop_marker)
+                    if stop_index > 0:
+                        explanation = explanation[:stop_index].strip()
+            if not explanation:
+                explanation = self._fallback_explanation(content_html)
 
-        image_url = ""
-        for src in re.findall(r'<img[^>]+src="([^"]+)"', content_html or ""):
-            candidate = html_lib.unescape(src).strip()
-            if self._is_usable_image(candidate):
-                image_url = candidate
-                break
+        if not image_url:
+            for src in re.findall(r'<img[^>]+src="([^"]+)"', content_html or ""):
+                candidate = html_lib.unescape(src).strip()
+                if self._is_usable_image(candidate):
+                    image_url = candidate
+                    break
 
         title_matched = FEED_TITLE_PREFIX_PATTERN.match(title_raw or "")
         title = (
@@ -804,10 +861,12 @@ class APOD(Star):
             if title_matched
             else (title_raw or "").strip()
         )
-        date_str = self._resolve_apod_date(title_raw, link, content_html, pub_date_raw)
-        credit = self._credit_from_meta_rows(content_html) or self._credit_from_markers(
-            normalized_text, plain_text
+        date_str = date_str or self._resolve_apod_date(
+            title_raw, link, content_html, pub_date_raw
         )
+        credit = credit or self._credit_from_meta_rows(
+            content_html
+        ) or self._credit_from_markers(normalized_text, plain_text)
 
         if not date_str or not explanation:
             logger.error(f"APOD 内容信息不完整：date={date_str!r}，link={link!r}")
