@@ -355,8 +355,8 @@ class APOD(Star):
     ) -> str:
         if apod_data is None:
             return self.last_apod_error or f"获取{label}失败，请稍后重试。"
-        if not (apod_data.get("hdurl") or apod_data.get("url")):
-            return "这一期 APOD 不是图片类型，无法展示。"
+        if self.image and not (apod_data.get("hdurl") or apod_data.get("url")):
+            return "这一期内容不是图片类型，无法展示。"
         title_zh, explanation_zh = await self._translate_fields(
             apod_data, include_hidden=True, umo=event.unified_msg_origin
         )
