@@ -802,8 +802,8 @@ class APOD(Star):
         # 结构化解析 meta 标签（属性顺序无关）；只认发布时间，不拿更新时间冒充。
         published_raw = ""
         for tag in re.findall(r"<meta\b[^>]*>", page_html):
-            name_match = re.search(r'(?:name|property)\s*=\s*"([^"]+)"', tag)
-            content_match = re.search(r'content\s*=\s*"([^"]*)"', tag)
+            name_match = re.search(r'(?:name|property)\s*=\s*["\']([^"\']+)["\']', tag)
+            content_match = re.search(r'content\s*=\s*["\']([^"\']*)["\']', tag)
             if (
                 name_match
                 and content_match
