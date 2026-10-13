@@ -611,39 +611,43 @@ class APOD(Star):
         title = self._strip_html(title_match.group(1)) if title_match else ""
         return self._build_apod_data(title, link, content_html)
 
-    async def _fetch_from_feed(
-        self, session: aiohttp.ClientSession, feed_url: str = FEED_URL
-    ) -> Optional[dict]:
+    async def _fetch_text(
+        self, session: aiohttp.ClientSession, url: str, label: str
+    ) -> Optional[str]:
         for attempt in range(self.retry_count + 1):
             try:
-                async with session.get(feed_url) as response:
+                async with session.get(url) as response:
                     if response.status != 200:
-                        error_text = await response.text()
-                        logger.error(
-                            f"获取 NASA feed 失败：状态码={response.status}，"
-                            f"响应内容={error_text[:300]}"
-                        )
-                        self.last_apod_error = "NASA feed 暂时不可用，请稍后重试。"
+                        logger.error(f"获取{label}失败：状态码={response.status}")
+                        self.last_apod_error = f"{label}暂时不可用，请稍后重试。"
                     else:
-                        apod_data = self._parse_feed(await response.text())
-                        if apod_data is not None:
-                            return apod_data
-                        self.last_apod_error = (
-                            "NASA feed 中未找到有效的 APOD 条目，请稍后重试。"
-                        )
+                        return await response.text()
             except asyncio.TimeoutError:
-                logger.error(f"获取 NASA feed 超时：请求在 {self.timeout} 秒后超时。")
-                self.last_apod_error = "请求 NASA feed 超时，请稍后重试。"
+                logger.error(f"获取{label}超时：请求在 {self.timeout} 秒后超时。")
+                self.last_apod_error = f"请求{label}超时，请稍后重试。"
             except aiohttp.ClientError as exc:
-                logger.error(f"获取 NASA feed 时发生网络错误：{exc}")
-                self.last_apod_error = "连接 NASA feed 时发生网络错误，请稍后重试。"
-            except ElementTree.ParseError as exc:
-                logger.error(f"解析 NASA feed XML 失败：{exc}")
-                self.last_apod_error = "NASA feed 数据格式异常，请稍后重试。"
+                logger.error(f"获取{label}时发生网络错误：{exc}")
+                self.last_apod_error = f"连接{label}失败，请稍后重试。"
 
             if attempt < self.retry_count:
                 await asyncio.sleep(min(2**attempt, 4))
         return None
+
+    async def _fetch_from_feed(
+        self, session: aiohttp.ClientSession, feed_url: str = FEED_URL
+    ) -> Optional[dict]:
+        raw_text = await self._fetch_text(session, feed_url, "NASA feed")
+        if raw_text is None:
+            return None
+        try:
+            apod_data = self._parse_feed(raw_text)
+        except ElementTree.ParseError as exc:
+            logger.error(f"解析 NASA feed XML 失败：{exc}")
+            self.last_apod_error = "NASA feed 数据格式异常，请稍后重试。"
+            return None
+        if apod_data is None:
+            self.last_apod_error = "NASA feed 中未找到有效的 APOD 条目，请稍后重试。"
+        return apod_data
 
     def _parse_feed(self, raw_text: str) -> Optional[dict]:
         repaired = FEED_XML_FIX_PATTERN.sub('" ', raw_text)
