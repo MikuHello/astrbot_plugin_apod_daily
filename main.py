@@ -111,11 +111,13 @@ APOD_HELP = chr(10).join(
 @register("apod", "Cysheper", "天文每日一图插件：APOD + NASA 每日一图，订阅推送、随机、LLM 翻译与函数工具。", "1.0.4")
 class APOD(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
+        super().__init__(context, config)
         self.config = config
         self.context = context
         self.last_apod_error: Optional[str] = None
         self._stale_apod: Optional[dict] = None
         self._stale_nasa: Optional[dict] = None
+        self._translate_index_lock = asyncio.Lock()
 
     @staticmethod
     def _ensure_dict(value: Any) -> Dict[str, Any]:
