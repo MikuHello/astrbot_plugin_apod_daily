@@ -5,6 +5,7 @@ import html as html_lib
 import re
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
 from typing import Any, Dict, Optional
 from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
@@ -66,6 +67,24 @@ NASA_POST_LINK_PATTERN = re.compile(
     r"https://www\.nasa\.gov/image-article/[^\s\"'<>]+"
 )
 PLACEHOLDER_MARKS = ("nasa-logo", "/themes/")
+
+
+class _HTMLAttrParser(HTMLParser):
+    """收集 og:image 的 meta 与 <img> src：属性顺序、引号风格与大小写无关。"""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.og_image = ""
+        self.img_srcs = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs_map = {name.lower(): value or "" for name, value in attrs}
+        if tag == "meta":
+            key = attrs_map.get("property") or attrs_map.get("name")
+            if key and key.lower() == "og:image" and not self.og_image:
+                self.og_image = attrs_map.get("content", "")
+        elif tag == "img" and attrs_map.get("src"):
+            self.img_srcs.append(attrs_map["src"])
 IMAGE_URL_SOURCES = (
     "assets.science.nasa.gov",
     "apod.nasa.gov/apod/image",
@@ -816,8 +835,19 @@ class APOD(Star):
         region = self._extract_article_region(page_html)
         title_match = re.search(r"<h1[^>]*>(.*?)</h1>", region, re.S)
         title = self._strip_html(title_match.group(1)) if title_match else ""
-        og_match = re.search(r'property="og:image" content="([^"]+)"', page_html)
-        image_url = html_lib.unescape(og_match.group(1)) if og_match else ""
+        page_parser = _HTMLAttrParser()
+        page_parser.feed(page_html)
+        image_url = html_lib.unescape(page_parser.og_image).strip()
+        if image_url and not self._is_usable_image(image_url):
+            image_url = ""
+        if not image_url:
+            region_parser = _HTMLAttrParser()
+            region_parser.feed(region)
+            for src in region_parser.img_srcs:
+                candidate = html_lib.unescape(src).strip()
+                if self._is_usable_image(candidate):
+                    image_url = candidate
+                    break
         # 说明与版权只在文章主内容容器里找，按原文顺序保留全部段落；
         # 页眉导航与页脚在容器之外，不参与拼接，也不做长度过滤。
         explanation_parts = []
@@ -1046,7 +1076,9 @@ class APOD(Star):
                 explanation = self._fallback_explanation(content_html)
 
         if not image_url:
-            for src in re.findall(r'<img[^>]+src="([^"]+)"', content_html or ""):
+            content_parser = _HTMLAttrParser()
+            content_parser.feed(content_html or "")
+            for src in content_parser.img_srcs:
                 candidate = html_lib.unescape(src).strip()
                 if self._is_usable_image(candidate):
                     image_url = candidate
