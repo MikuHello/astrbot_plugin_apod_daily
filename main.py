@@ -1062,15 +1062,26 @@ class APOD(Star):
         if not link:
             logger.warning("feed 条目缺少 link，跳过本次推送检查。")
             return True
+
+        # 按会话记录已成功推送的链接：部分失败时仅补发失败会话，不重复打扰已收到者。
+        checkpoint = await self.get_cache("pushed_by_session")
+        pushed = (
+            {k: v for k, v in checkpoint.items() if isinstance(k, str)}
+            if isinstance(checkpoint, dict)
+            else {}
+        )
+        pending = [umo for umo in sessions if pushed.get(umo) != link]
+
         last = await self.get_cache("last_pushed_apod")
         last_link = str(last.get("link") or "") if isinstance(last, dict) else ""
-        if link == last_link:
-            return True
-        if not last_link:
-            # 首次建立基准，不把启动时的旧一期当作“新刊”群发。
+        if not last_link and self.push_mode == "upstream":
+            # 上游更新模式：首次检查只建立监测基准，不把启动时的旧一期当作“新刊”群发。
             await self.put_cache("last_pushed_apod", {"date": date, "link": link})
             logger.info(f"APOD 推送基准已建立：{date}")
             return True
+        if not pending:
+            return True
+
         title_zh, explanation_zh = (None, None)
         if self.push_translate:
             title_zh, explanation_zh = await self._translate_fields(
@@ -1084,17 +1095,25 @@ class APOD(Star):
             with_image=self.push_send_image,
         )
         delivered = 0
-        for umo in sessions:
+        for umo in pending:
             try:
-                if await self.context.send_message(umo, chain):
-                    delivered += 1
+                sent = await self.context.send_message(umo, chain)
             except Exception as exc:
                 logger.error(f"APOD 推送到 {umo} 失败：{exc}")
-        logger.info(
-            f"APOD 新一期已推送：{date}，送达 {delivered}/{len(sessions)} 个会话。"
-        )
+                continue
+            if sent is False:
+                logger.error(f"APOD 推送到 {umo} 失败：未匹配到消息平台。")
+                continue
+            pushed[umo] = link
+            delivered += 1
+        await self.put_cache("pushed_by_session", pushed)
         await self.put_cache("last_pushed_apod", {"date": date, "link": link})
-        return True
+        missed = len(pending) - delivered
+        logger.info(
+            f"APOD 新一期已推送：{date}，本次送达 {delivered}/{len(pending)} 个会话"
+            + (f"，{missed} 个待补发。" if missed else "。")
+        )
+        return missed == 0
 
     def _build_message_chain(
         self,
