@@ -702,7 +702,7 @@ class APOD(Star):
             return self._build_nasa_data(post_html, link)
 
     def _build_nasa_data(self, page_html: str, link: str) -> Optional[dict]:
-        """IOTD 文章页无 meta 表格与日期元数据：og:image 取主图，说明取主内容区最长段落。"""
+        """og:image 取主图；日期取文章发布时间元数据，缺失时回退美东今天。"""
         title_match = re.search(r"<h1[^>]*>(.*?)</h1>", page_html, re.S)
         title = self._strip_html(title_match.group(1)) if title_match else ""
         og_match = re.search(r'property="og:image" content="([^"]+)"', page_html)
@@ -723,11 +723,18 @@ class APOD(Star):
                 explanation = text
         if len(explanation) < 150:
             explanation = ""
+        date_match = re.search(
+            r'<meta[^>]+name="parsely-pub-date"[^>]+content="(\d{4}-\d{2}-\d{2})',
+            page_html,
+        ) or re.search(
+            r'<meta[^>]+property="og:updated_time"[^>]+content="(\d{4}-\d{2}-\d{2})',
+            page_html,
+        )
         return self._build_apod_data(
             title,
             link,
             page_html,
-            date_str=self._expected_latest_date(),
+            date_str=date_match.group(1) if date_match else self._expected_latest_date(),
             explanation=explanation,
             credit=credit or None,
             image_url=image_url,
