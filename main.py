@@ -390,19 +390,32 @@ class APOD(Star):
             logger.error(f"读取缓存失败，键：{key}，错误：{exc}")
             return None
 
+    async def delete_cache(self, key: str) -> None:
+        try:
+            await self.delete_kv_data(key)
+        except Exception as exc:
+            logger.error(f"删除缓存失败，键：{key}，错误：{exc}")
+
     async def _cache_translation(self, key: str, value: str) -> None:
-        """写入翻译缓存并按配置上限淘汰最旧条目（FIFO 索引）。"""
-        await self.put_cache(key, value)
-        limit = self.translate_cache_limit
-        if limit <= 0:
+        """写入翻译缓存并按配置上限淘汰最旧条目（FIFO 索引，真删除）。"""
+        if not value:
             return
-        index = await self.get_cache("translate_cache_index")
-        keys = [k for k in index if isinstance(k, str)] if isinstance(index, list) else []
-        if key not in keys:
-            keys.append(key)
-        while len(keys) > limit:
-            await self.put_cache(keys.pop(0), None)
-        await self.put_cache("translate_cache_index", keys)
+        async with self._translate_index_lock:
+            await self.put_cache(key, value)
+            limit = self.translate_cache_limit
+            if limit <= 0:
+                return
+            index = await self.get_cache("translate_cache_index")
+            keys = (
+                [k for k in index if isinstance(k, str)]
+                if isinstance(index, list)
+                else []
+            )
+            if key not in keys:
+                keys.append(key)
+            while len(keys) > limit:
+                await self.delete_cache(keys.pop(0))
+            await self.put_cache("translate_cache_index", keys)
 
     async def _translate_fields(
         self, apod_data: Dict[str, Any], include_hidden: bool = False
