@@ -20,10 +20,14 @@ from astrbot.api.star import Context, Star, register
 # NASA APOD 主站已从 apod.nasa.gov 迁移到 science.nasa.gov（WordPress 站点），
 # 迁移期内 api.nasa.gov 频繁出现 500、超时和占位数据（标题/图片变成
 # "NASA Science" logo）。因此本插件的数据层改为：
-#   唯一数据源：science.nasa.gov 站点 RSS feed —— 无需 API Key、无速率限制，
+#   最新一期：science.nasa.gov 站点 RSS feed —— 无需 API Key、无速率限制，
 #     每天约 UTC 04:05 发布标题形如 "APOD: 2026 October 11 – ..." 的条目，
 #     content:encoded 内含当日图片与解说。
-#   容错策略：feed 拉取失败时回退缓存（KV + 内存），不做第二数据源。
+#   随机一期：官网 Random APOD 同款 embed 接口（wp-json/smd/v1/embed-post），
+#     单次 POST 即返回随机一期的完整内容 HTML（与 feed 的 content 同构）。
+#   容错策略：feed 拉取失败时回退缓存（KV + 内存），随机接口不做缓存。
+#   解析参数：两类内容共用同一套解析，来源差异只体现为 URL 与模式常量，
+#     接入其他 NASA 内容源（如 Image of the Day）仅需替换这批常量。
 # 已知坑：feed 的 XML 头畸形（两个 xmlns 声明之间缺空格），解析前需修复。
 FEED_URL = "https://science.nasa.gov/feed/"
 FEED_XML_FIX_PATTERN = re.compile(r'"(?=xmlns:)')
@@ -35,6 +39,30 @@ MONTH_NAMES = {
     "January": 1, "February": 2, "March": 3, "April": 4, "May": 5, "June": 6,
     "July": 7, "August": 8, "September": 9, "October": 10, "November": 11, "December": 12,
 }
+# 官网 Random APOD 的随机即由该接口在后端完成（randomizePost=True）。
+RANDOM_EMBED_URL = "https://science.nasa.gov/wp-json/smd/v1/embed-post"
+RANDOM_EMBED_ATTRIBUTES = {
+    "selectedPostTypes": ["image-article"],
+    "selectedCategory": "22766",
+    "selectedInternalTerm": "0",
+    "selectedOrg": "22768",
+    "displayFeaturedImageAndTitleOnly": False,
+    "randomizePost": True,
+}
+# 内容正文里的结构化 meta 表格：<th>标签</th><td>值</td>（Date/Credit 等）。
+META_ROW_PATTERN = re.compile(r"<th[^>]*>(.*?)</th>\s*<td[^>]*>(.*?)</td>", re.S)
+META_DATE_PATTERN = re.compile(r"([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})")
+APOD_SLUG_DATE_PATTERN = re.compile(
+    r"apod-(\d{4})-(january|february|march|april|may|june|july|august|september|october|november|december)-(\d{1,2})",
+    re.IGNORECASE,
+)
+# 随机内容中文档顺序的第一个 image-article 链接即主帖（实测确认）。
+RANDOM_POST_LINK_PATTERN = re.compile(
+    r"https://science\.nasa\.gov/image-article/[^\s\"'<>]+"
+)
+CREDIT_PREFIX_PATTERN = re.compile(
+    r"^(?:Image\s+)?Credit(?:\s*&\s*Copyright)?\s*:\s*", re.IGNORECASE
+)
 PLACEHOLDER_MARKS = ("nasa-logo", "/themes/")
 IMAGE_URL_SOURCES = (
     "assets.science.nasa.gov",
@@ -441,8 +469,8 @@ class APOD(Star):
         return apod_data
 
     # ---------- 数据获取主入口 ----------
-    # 唯一数据源：science.nasa.gov 站点 RSS（无需 token、无速率限制）。
-    # 拉取失败时由缓存层兜底（KV / 内存 stale），不做第二数据源。
+    # 最新一期走站点 RSS（无需 token、无速率限制），失败时由缓存层兜底
+    # （KV / 内存 stale）；随机一期走官网同款 embed 接口，不做缓存。
 
     async def get_apod(self) -> Optional[dict]:
         self.last_apod_error = None
@@ -458,7 +486,58 @@ class APOD(Star):
         )
         return None
 
-    # ---------- RSS feed 拉取与解析 ----------
+    async def get_random_apod(self) -> Optional[dict]:
+        self.last_apod_error = None
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for attempt in range(self.retry_count + 1):
+                try:
+                    async with session.post(
+                        RANDOM_EMBED_URL,
+                        json={"attributes": RANDOM_EMBED_ATTRIBUTES, "currentPostId": 0},
+                    ) as response:
+                        if response.status != 200:
+                            logger.error(f"获取随机 APOD 失败：状态码={response.status}")
+                            self.last_apod_error = "NASA 随机接口暂时不可用，请稍后重试。"
+                        else:
+                            payload = await response.json(content_type=None)
+                            content_html = (
+                                payload.get("html", "")
+                                if isinstance(payload, dict)
+                                else ""
+                            )
+                            apod_data = self._build_random_apod(content_html)
+                            if apod_data is not None:
+                                return apod_data
+                            self.last_apod_error = (
+                                "NASA 随机接口未返回有效条目，请稍后重试。"
+                            )
+                except asyncio.TimeoutError:
+                    logger.error(f"获取随机 APOD 超时：请求在 {self.timeout} 秒后超时。")
+                    self.last_apod_error = "请求 NASA 随机接口超时，请稍后重试。"
+                except (aiohttp.ClientError, ValueError) as exc:
+                    logger.error(f"获取随机 APOD 时发生网络或解析错误：{exc}")
+                    self.last_apod_error = "连接 NASA 随机接口失败，请稍后重试。"
+
+                if attempt < self.retry_count:
+                    await asyncio.sleep(min(2**attempt, 4))
+        self.last_apod_error = self.last_apod_error or (
+            "获取随机 APOD 失败，请稍后重试。"
+        )
+        return None
+
+    def _build_random_apod(self, content_html: str) -> Optional[dict]:
+        match = RANDOM_POST_LINK_PATTERN.search(content_html or "")
+        if not match:
+            return None
+        link = html_lib.unescape(match.group(0))
+        if "apod-" not in link.lower():
+            return None
+        title_match = re.search(r"<h1[^>]*>(.*?)</h1>", content_html, re.S)
+        title = self._strip_html(title_match.group(1)) if title_match else ""
+        return self._build_apod_data(title, link, content_html)
+
+    # ---------- 内容解析（feed 条目与随机内容共用） ----------
 
     async def _fetch_from_feed(self, session: aiohttp.ClientSession) -> Optional[dict]:
         for attempt in range(self.retry_count + 1):
@@ -508,51 +587,104 @@ class APOD(Star):
                     content_html = child.text or ""
                 elif tag == "pubDate":
                     pub_date_raw = (child.text or "").strip()
-            return self._build_apod_from_feed_item(
-                title_raw, link, pub_date_raw, content_html
-            )
+            return self._build_apod_data(title_raw, link, content_html, pub_date_raw)
         logger.warning("NASA feed 中未找到 APOD 条目。")
         return None
 
-    def _build_apod_from_feed_item(
-        self,
-        title_raw: str,
-        link: str,
-        pub_date_raw: str,
-        content_html: str,
-    ) -> Optional[dict]:
-        date_matched = FEED_TITLE_DATE_PATTERN.search(title_raw)
-        if date_matched:
-            year, month_name, day = date_matched.groups()
-            date_str = f"{int(year):04d}-{MONTH_NAMES[month_name]:02d}-{int(day):02d}"
-        elif pub_date_raw:
+    @staticmethod
+    def _strip_html(fragment: str) -> str:
+        return re.sub(
+            r"\s+", " ", html_lib.unescape(re.sub(r"<[^>]+>", " ", fragment or ""))
+        ).strip()
+
+    @classmethod
+    def _parse_meta_rows(cls, content_html: str) -> list:
+        rows = []
+        for th_html, td_html in META_ROW_PATTERN.findall(content_html or ""):
+            rows.append((cls._strip_html(th_html), cls._strip_html(td_html)))
+        return rows
+
+    @staticmethod
+    def _month_number(month_name: str) -> Optional[int]:
+        return MONTH_NAMES.get(month_name.capitalize())
+
+    def _resolve_apod_date(
+        self, title_raw: str, link: str, content_html: str, pub_date_raw: str
+    ) -> str:
+        """日期解析优先级：标题 → meta 表格 → 链接 slug → pubDate。"""
+        matched = FEED_TITLE_DATE_PATTERN.search(title_raw or "")
+        if matched:
+            year, month_name, day = matched.groups()
+            return f"{int(year):04d}-{MONTH_NAMES[month_name]:02d}-{int(day):02d}"
+
+        for label, value in self._parse_meta_rows(content_html or ""):
+            if label.lower() != "date":
+                continue
+            matched = META_DATE_PATTERN.search(value)
+            month_number = self._month_number(matched.group(1)) if matched else None
+            if matched and month_number:
+                return (
+                    f"{int(matched.group(3)):04d}-{month_number:02d}"
+                    f"-{int(matched.group(2)):02d}"
+                )
+            break
+
+        matched = APOD_SLUG_DATE_PATTERN.search(link or "")
+        if matched:
+            month_number = self._month_number(matched.group(2))
+            if month_number:
+                return (
+                    f"{int(matched.group(1)):04d}-{month_number:02d}"
+                    f"-{int(matched.group(3)):02d}"
+                )
+
+        if pub_date_raw:
             try:
-                date_str = (
+                return (
                     parsedate_to_datetime(pub_date_raw)
                     .astimezone(self._et_timezone())
                     .strftime("%Y-%m-%d")
                 )
             except (TypeError, ValueError):
-                date_str = ""
-        else:
-            date_str = ""
+                pass
+        return ""
 
-        title_matched = FEED_TITLE_PREFIX_PATTERN.match(title_raw)
-        title = title_matched.group(1).strip() if title_matched else title_raw
+    @classmethod
+    def _credit_from_meta_rows(cls, content_html: str) -> str:
+        for label, value in cls._parse_meta_rows(content_html or ""):
+            if label.lower().startswith("credit"):
+                return CREDIT_PREFIX_PATTERN.sub("", value).strip()
+        return ""
 
-        image_url = ""
-        for src in re.findall(r'<img[^>]+src="([^"]+)"', content_html):
-            candidate = html_lib.unescape(src).strip()
-            if self._is_usable_image(candidate):
-                image_url = candidate
-                break
+    @staticmethod
+    def _credit_from_markers(normalized_text: str, plain_text: str) -> str:
+        for credit_marker in ("Credit & Copyright:", "Image Credit:", "Credit:"):
+            marker_index = normalized_text.find(credit_marker)
+            if marker_index < 0:
+                continue
+            start = marker_index + len(credit_marker)
+            stop_index = len(normalized_text)
+            for stop_marker in CREDIT_STOP_MARKERS:
+                found = normalized_text.find(stop_marker, start)
+                if found >= 0:
+                    stop_index = min(stop_index, found)
+            return plain_text[start:stop_index].strip()
+        return ""
 
-        plain_text = re.sub(
-            r"\s+", " ", html_lib.unescape(re.sub(r"<[^>]+>", " ", content_html))
-        ).strip()
+    # 图片、说明、版权与日期全部从 content HTML 提取；feed 条目与随机
+    # 内容的差异只体现在标题与日期的取值入口上。
+    def _build_apod_data(
+        self,
+        title_raw: str,
+        link: str,
+        content_html: str,
+        pub_date_raw: str = "",
+    ) -> Optional[dict]:
+        plain_text = self._strip_html(content_html)
         # 原文的撇号是 U+2019（’），标记匹配前统一映射为 ASCII 撇号；
         # 替换是等长的，可直接用同一索引回切原文，不影响展示内容。
         normalized_text = plain_text.replace("\u2019", "'")
+
         explanation = ""
         marker_index = normalized_text.find("Explanation:")
         if marker_index >= 0:
@@ -565,24 +697,26 @@ class APOD(Star):
         if not explanation:
             explanation = plain_text
 
-        credit = ""
-        for credit_marker in ("Credit & Copyright:", "Image Credit:", "Credit:"):
-            marker_index = normalized_text.find(credit_marker)
-            if marker_index < 0:
-                continue
-            start = marker_index + len(credit_marker)
-            stop_index = len(normalized_text)
-            for stop_marker in CREDIT_STOP_MARKERS:
-                found = normalized_text.find(stop_marker, start)
-                if found >= 0:
-                    stop_index = min(stop_index, found)
-            credit = plain_text[start:stop_index].strip()
-            break
+        image_url = ""
+        for src in re.findall(r'<img[^>]+src="([^"]+)"', content_html or ""):
+            candidate = html_lib.unescape(src).strip()
+            if self._is_usable_image(candidate):
+                image_url = candidate
+                break
+
+        title_matched = FEED_TITLE_PREFIX_PATTERN.match(title_raw or "")
+        title = (
+            title_matched.group(1).strip()
+            if title_matched
+            else (title_raw or "").strip()
+        )
+        date_str = self._resolve_apod_date(title_raw, link, content_html, pub_date_raw)
+        credit = self._credit_from_meta_rows(content_html) or self._credit_from_markers(
+            normalized_text, plain_text
+        )
 
         if not date_str or not explanation:
-            logger.error(
-                f"NASA feed 条目信息不完整：date={date_str!r}，link={link!r}"
-            )
+            logger.error(f"APOD 内容信息不完整：date={date_str!r}，link={link!r}")
             return None
 
         return {
@@ -593,7 +727,7 @@ class APOD(Star):
             "url": image_url,
             "hdurl": image_url,
             "media_type": "image" if image_url else "other",
-            "service_version": "rss-science.nasa.gov",
+            "service_version": "science.nasa.gov",
             "link": link,
         }
 
