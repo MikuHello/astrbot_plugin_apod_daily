@@ -360,13 +360,11 @@ class APOD(Star):
             with_image=self.image,
         )
         try:
-            delivered = await self.context.send_message(
+            await self.context.send_message(
                 event.unified_msg_origin, MessageChain(chain=chain)
             )
         except Exception as exc:
-            logger.error(f"APOD 函数工具发送失败：{exc}")
-            delivered = False
-        if not delivered:
+            logger.error(f"发送{label}消息链失败：{exc}")
             return f"{label}发送失败，请提示用户稍后重试。"
         title = (title_zh or apod_data.get("title") or "").strip()
         return (
