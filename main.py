@@ -1169,8 +1169,9 @@ class APOD(Star):
             logger.info(f"APOD 推送基准已建立：{date}")
             return True
 
-        if link == last_link and not last_delivered:
-            # 基准尚未作为“新刊”分发过：上游未变化前保持静默。
+        if self.push_mode == "upstream" and link == last_link and not last_delivered:
+            # 上游观察基准尚未作为“新刊”分发：链接未变化前保持静默。
+            # 定时模式不受上游观察基准影响，避免模式切换后当期漏发。
             return True
 
         if not pending:
