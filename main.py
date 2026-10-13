@@ -212,8 +212,10 @@ class APOD(Star):
         async for result in self._reply_apod(event, apod_data):
             yield result
 
-    async def _reply_apod(self, event: AstrMessageEvent, apod_data: dict):
-        """按展示配置渲染并发送某一期 APOD（今日/随机共用）。"""
+    async def _reply_apod(
+        self, event: AstrMessageEvent, apod_data: dict, display_name: str = PLUGIN_DISPLAY_NAME
+    ):
+        """按展示配置渲染并发送某一期内容（apod 今日/随机、nasa 共用）。"""
         # 当要求返回图片时，如果该期 APOD 不是图片类型，就直接视为失败。
         if apod_data.get("media_type") != "image" and self.image:
             yield event.plain_result("这一期 APOD 不是图片类型，请稍后再试。")
@@ -225,7 +227,9 @@ class APOD(Star):
             return
 
         title_zh, explanation_zh = await self._translate_fields(apod_data)
-        display_text = self._build_display_text(apod_data, title_zh, explanation_zh)
+        display_text = self._build_display_text(
+            apod_data, title_zh, explanation_zh, display_name=display_name
+        )
 
         if self.is_divided:
             # 图片一条、文本一条。
@@ -296,6 +300,21 @@ class APOD(Star):
             + "订阅名单可在插件配置页「推送/订阅名单 (UMO)」中维护"
         )
         yield event.plain_result(usage)
+
+    @filter.command("nasa")
+    async def nasa(self, event: AstrMessageEvent):
+        """获取 NASA 每日一图（Image of the Day，全员可用）"""
+        logger.info("正在获取 NASA 每日一图 ...")
+        nasa_data = await self._fetch_iotd()
+        if nasa_data is None:
+            yield event.plain_result(
+                self.last_apod_error or "获取 NASA 每日一图失败，请稍后重试。"
+            )
+            return
+        async for result in self._reply_apod(
+            event, nasa_data, display_name=NASA_DISPLAY_NAME
+        ):
+            yield result
 
     # ---------- LLM 函数工具 ----------
 
@@ -414,6 +433,7 @@ class APOD(Star):
         title_zh: Optional[str],
         explanation_zh: Optional[str],
         include_hidden: bool = False,
+        display_name: str = PLUGIN_DISPLAY_NAME,
     ) -> str:
         """生成“品牌头 + 标题/日期/版权 + 空行 + 说明”的正文。"""
         show_title = include_hidden or self.title.get("is_show")
@@ -427,7 +447,7 @@ class APOD(Star):
         explanation = (explanation_zh or apod_data.get("explanation") or "").strip()
 
         newline = chr(10)
-        lines = [PLUGIN_DISPLAY_NAME]
+        lines = [display_name]
         if show_title and title:
             # 有译文且与原文不同时，展示“译文（原文）”；否则只展示其一
             if title_zh and title_raw and title_zh.strip() != title_raw:
@@ -641,23 +661,33 @@ class APOD(Star):
             return self._build_iotd_data(post_html, link)
 
     def _build_iotd_data(self, page_html: str, link: str) -> Optional[dict]:
+        """IOTD 文章页无 meta 表格与日期元数据：og:image 取主图，说明取主内容区最长段落。"""
         title_match = re.search(r"<h1[^>]*>(.*?)</h1>", page_html, re.S)
         title = self._strip_html(title_match.group(1)) if title_match else ""
         og_match = re.search(r'property="og:image" content="([^"]+)"', page_html)
         image_url = html_lib.unescape(og_match.group(1)) if og_match else ""
+        # 说明与版权只在 <h1> 之后的主内容区里找，避免站点导航/页眉混入。
+        h1_index = page_html.find("<h1")
+        region = page_html[h1_index:] if h1_index >= 0 else page_html
         explanation, credit = "", ""
-        for p in re.findall(r"<p[^>]*>(.*?)</p>", page_html, re.S):
+        for p in re.findall(r"<p[^>]*>(.*?)</p>", region, re.S):
             text = self._strip_html(p)
-            if not explanation and len(text) >= 200:
-                explanation = text
-            if not credit and text.lower().startswith("image credit:"):
+            lowered = text.lower()
+            if not credit and lowered.startswith("image credit:"):
                 credit = text[len("Image credit:") :].strip()
+                continue
+            if lowered.startswith(("learn more", "image article")):
+                continue
+            if len(text) > len(explanation):
+                explanation = text
+        if len(explanation) < 150:
+            explanation = ""
         return self._build_apod_data(
             title,
             link,
             page_html,
             date_str=self._expected_latest_date(),
-            explanation=explanation or None,
+            explanation=explanation,
             credit=credit or None,
             image_url=image_url,
         )
