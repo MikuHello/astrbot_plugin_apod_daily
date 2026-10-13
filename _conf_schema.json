@@ -112,6 +112,12 @@
             }
         }
     },
+    "translate_cache_limit": {
+        "description": "翻译缓存条数上限",
+        "hint": "超过上限时按写入顺序淘汰最旧的翻译缓存，0 表示不限制",
+        "type": "int",
+        "default": 1000
+    },
     "timeout": {
         "description": "请求超时时间（秒）",
         "type": "int",

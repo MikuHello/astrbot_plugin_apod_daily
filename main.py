@@ -143,6 +143,9 @@ class APOD(Star):
         self.is_divided = self.config.get("is_divided", True)
         self.timeout = max(1, int(self.config.get("timeout", 120)))
         self.retry_count = max(0, int(self.config.get("retry_count", 2)))
+        self.translate_cache_limit = max(
+            0, int(self.config.get("translate_cache_limit", 1000))
+        )
 
         push_cfg = self._ensure_dict(self.config.get("push", {}))
         self.push_enabled = bool(push_cfg.get("enabled", False))
@@ -382,6 +385,20 @@ class APOD(Star):
             logger.error(f"读取缓存失败，键：{key}，错误：{exc}")
             return None
 
+    async def _cache_translation(self, key: str, value: str) -> None:
+        """写入翻译缓存并按配置上限淘汰最旧条目（FIFO 索引）。"""
+        await self.put_cache(key, value)
+        limit = self.translate_cache_limit
+        if limit <= 0:
+            return
+        index = await self.get_cache("translate_cache_index")
+        keys = [k for k in index if isinstance(k, str)] if isinstance(index, list) else []
+        if key not in keys:
+            keys.append(key)
+        while len(keys) > limit:
+            await self.put_cache(keys.pop(0), None)
+        await self.put_cache("translate_cache_index", keys)
+
     async def _translate_fields(
         self, apod_data: Dict[str, Any], include_hidden: bool = False
     ) -> tuple[Optional[str], Optional[str]]:
@@ -406,7 +423,7 @@ class APOD(Star):
                     explanation_zh = await self.translate_explanation(
                         explanation.strip(), self.provider
                     )
-                    await self.put_cache(explanation_cache_key, explanation_zh)
+                    await self._cache_translation(explanation_cache_key, explanation_zh)
 
             if (
                 title
@@ -421,7 +438,7 @@ class APOD(Star):
                     title_zh = await self.translate_explanation(
                         title.strip(), self.provider
                     )
-                    await self.put_cache(title_cache_key, title_zh)
+                    await self._cache_translation(title_cache_key, title_zh)
         except Exception as exc:
             logger.error(f"翻译 APOD 内容失败：{exc}")
         return title_zh, explanation_zh
