@@ -77,6 +77,7 @@ EXPLANATION_STOP_MARKERS = (
     "Tomorrow's picture",
     "Yesterday's Image",
     "Tomorrow's Image",
+    "Credit &",
     "Credit:",
     "Authors & editors",
     "A service of",
