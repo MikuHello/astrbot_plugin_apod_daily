@@ -15,7 +15,6 @@ import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.event.filter import PermissionType
-from astrbot.api.provider import ProviderType
 from astrbot.api.star import Context, Star, register
 
 # 数据层说明：
@@ -134,8 +133,10 @@ class APOD(Star):
         )
 
     @staticmethod
-    def _build_translation_cache_key(text: str) -> str:
-        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    def _build_translation_cache_key(provider_id: Optional[str], text: str) -> str:
+        digest = hashlib.sha256(
+            f"{provider_id or ''}\x00{text}".encode("utf-8")
+        ).hexdigest()
         return f"translate_cache:{digest}"
 
     async def initialize(self):
@@ -238,7 +239,9 @@ class APOD(Star):
             yield event.plain_result("获取 APOD 图片链接失败，请稍后重试。")
             return
 
-        title_zh, explanation_zh = await self._translate_fields(apod_data)
+        title_zh, explanation_zh = await self._translate_fields(
+            apod_data, umo=event.unified_msg_origin
+        )
         display_text = self._build_display_text(
             apod_data, title_zh, explanation_zh, display_name=display_name
         )
@@ -355,7 +358,10 @@ class APOD(Star):
         if not (apod_data.get("hdurl") or apod_data.get("url")):
             return "这一期 APOD 不是图片类型，无法展示。"
         title_zh, explanation_zh = await self._translate_fields(
-            apod_data, include_hidden=True
+            apod_data, include_hidden=True, umo=event.unified_msg_origin
+        )
+        display_name = (
+            NASA_DISPLAY_NAME if label.startswith("NASA") else PLUGIN_DISPLAY_NAME
         )
         message = self._build_message_chain(
             apod_data,
@@ -363,6 +369,7 @@ class APOD(Star):
             explanation_zh,
             include_hidden=True,
             with_image=self.image,
+            display_name=display_name,
         )
         try:
             sent = await self.context.send_message(event.unified_msg_origin, message)
@@ -420,47 +427,56 @@ class APOD(Star):
             await self.put_cache("translate_cache_index", keys)
 
     async def _translate_fields(
-        self, apod_data: Dict[str, Any], include_hidden: bool = False
+        self,
+        apod_data: Dict[str, Any],
+        include_hidden: bool = False,
+        umo: Optional[str] = None,
     ) -> tuple[Optional[str], Optional[str]]:
-        """按配置翻译标题与解说，带哈希键缓存；命令与推送共用。
+        """按配置翻译标题与解说，带缓存；两条各自失败降级，互不影响。
 
-        include_hidden=True（推送场景）时忽略 is_show，总是翻译全部内容。
+        include_hidden=True（推送/函数工具场景）时忽略 is_show，总是翻译全部内容。
         """
+        provider_id = None
         title_zh, explanation_zh = None, None
-        try:
-            explanation = apod_data.get("explanation")
-            title = apod_data.get("title")
-            if (
-                explanation
-                and self.explanation.get("is_translate")
-                and (include_hidden or self.explanation.get("is_show"))
-            ):
-                explanation_cache_key = self._build_translation_cache_key(explanation)
+        explanation = (apod_data.get("explanation") or "").strip()
+        title = (apod_data.get("title") or "").strip()
+
+        if explanation and self.explanation.get("is_translate") and (
+            include_hidden or self.explanation.get("is_show")
+        ):
+            try:
+                if provider_id is None:
+                    provider_id = await self._resolve_chat_provider_id(umo)
+                explanation_cache_key = self._build_translation_cache_key(
+                    provider_id, explanation
+                )
                 cached_translation = await self.get_cache(explanation_cache_key)
                 if cached_translation is not None:
                     explanation_zh = cached_translation
                 else:
                     explanation_zh = await self.translate_explanation(
-                        explanation.strip(), self.provider
+                        explanation, provider_id
                     )
                     await self._cache_translation(explanation_cache_key, explanation_zh)
+            except Exception as exc:
+                logger.error(f"翻译说明失败：{exc}")
 
-            if (
-                title
-                and self.title.get("is_translate")
-                and (include_hidden or self.title.get("is_show"))
-            ):
-                title_cache_key = self._build_translation_cache_key(title)
+        if title and self.title.get("is_translate") and (
+            include_hidden or self.title.get("is_show")
+        ):
+            try:
+                if provider_id is None:
+                    provider_id = await self._resolve_chat_provider_id(umo)
+                title_cache_key = self._build_translation_cache_key(provider_id, title)
                 cached_translation = await self.get_cache(title_cache_key)
                 if cached_translation is not None:
                     title_zh = cached_translation
                 else:
-                    title_zh = await self.translate_explanation(
-                        title.strip(), self.provider
-                    )
+                    title_zh = await self.translate_explanation(title, provider_id)
                     await self._cache_translation(title_cache_key, title_zh)
-        except Exception as exc:
-            logger.error(f"翻译 APOD 内容失败：{exc}")
+            except Exception as exc:
+                logger.error(f"翻译标题失败：{exc}")
+
         return title_zh, explanation_zh
 
     @staticmethod
@@ -512,23 +528,17 @@ class APOD(Star):
             )
         return text
 
-    def _resolve_chat_provider_id(self) -> Optional[str]:
-        """优先插件配置的 provider，否则回落到 AstrBot 当前对话模型。"""
+    async def _resolve_chat_provider_id(
+        self, umo: Optional[str] = None
+    ) -> Optional[str]:
+        """优先插件配置的 provider；否则回落到当前会话/全局对话模型。"""
         if self.provider:
             return self.provider
         try:
-            prov = self.context.provider_manager.get_using_provider(
-                ProviderType.CHAT_COMPLETION
-            )
-            pid = None
-            if prov is not None:
-                # Provider 实例没有 .id 属性，id 存在 provider_config 里
-                pid = getattr(prov, "id", None)
-                if not pid:
-                    pid = (getattr(prov, "provider_config", None) or {}).get("id")
+            pid = await self.context.get_current_chat_provider_id(umo=umo)
             if pid:
                 return pid
-            logger.warning("未能从提供商实例解析到 id。")
+            logger.warning("未能解析当前对话模型。")
         except Exception as exc:
             logger.warning(f"获取 AstrBot 当前对话模型失败：{exc}")
         return None
@@ -536,7 +546,7 @@ class APOD(Star):
     async def translate_explanation(
         self, explanation: str, provider_id: Optional[str] = None
     ) -> str:
-        provider_id = provider_id or self._resolve_chat_provider_id()
+        provider_id = provider_id or await self._resolve_chat_provider_id()
         if not provider_id:
             raise RuntimeError(
                 "翻译不可用：插件未配置 provider，且 AstrBot 没有可用的默认对话模型。"
@@ -1151,13 +1161,18 @@ class APOD(Star):
         explanation_zh: Optional[str],
         include_hidden: bool = False,
         with_image: bool = True,
+        display_name: str = PLUGIN_DISPLAY_NAME,
     ) -> MessageChain:
         chain = []
         url = apod_data.get("hdurl") or apod_data.get("url")
         if with_image and url:
             chain.append(Comp.Image.fromURL(url))
         text = self._build_display_text(
-            apod_data, title_zh, explanation_zh, include_hidden=include_hidden
+            apod_data,
+            title_zh,
+            explanation_zh,
+            include_hidden=include_hidden,
+            display_name=display_name,
         )
         if text:
             chain.append(Comp.Plain(text))
