@@ -100,7 +100,7 @@ APOD_HELP = chr(10).join((
 ))
 
 
-@register("apod", "Cysheper", "APOD 每日天文图插件：RSS 数据源 + 订阅推送 + LLM 翻译。", "1.0.4")
+@register("apod", "Cysheper", "APOD 每日天文图插件：RSS 数据源 + 订阅推送 + 随机天文图 + LLM 翻译与函数工具。", "1.0.4")
 class APOD(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         self.config = config
@@ -292,6 +292,50 @@ class APOD(Star):
             + "订阅名单可在插件配置页「推送/订阅名单 (UMO)」中维护"
         )
         yield event.plain_result(usage)
+
+    # ---------- LLM 函数工具 ----------
+
+    @filter.llm_tool(name="send_apod_today")
+    async def send_apod_today(self, event: AstrMessageEvent):
+        """获取今日 NASA 天文每日一图（APOD）并发送到当前会话，包含图片与中文说明。当用户想看今日或最新的天文每日一图时调用。"""
+        return await self._deliver_apod(event, await self.get_cache_apod(), "今日")
+
+    @filter.llm_tool(name="send_apod_random")
+    async def send_apod_random(self, event: AstrMessageEvent):
+        """随机获取一期 NASA 天文每日一图（APOD）并发送到当前会话，包含图片与中文说明。当用户想看随机的天文每日一图时调用。"""
+        return await self._deliver_apod(event, await self.get_random_apod(), "随机")
+
+    async def _deliver_apod(
+        self, event: AstrMessageEvent, apod_data: Optional[dict], label: str
+    ) -> str:
+        if apod_data is None:
+            return self.last_apod_error or f"获取{label} APOD 失败，请稍后重试。"
+        if not (apod_data.get("hdurl") or apod_data.get("url")):
+            return "这一期 APOD 不是图片类型，无法展示。"
+        title_zh, explanation_zh = await self._translate_fields(
+            apod_data, include_hidden=True
+        )
+        chain = self._build_message_chain(
+            apod_data,
+            title_zh,
+            explanation_zh,
+            include_hidden=True,
+            with_image=self.image,
+        )
+        try:
+            delivered = await self.context.send_message(
+                event.unified_msg_origin, MessageChain(chain=chain)
+            )
+        except Exception as exc:
+            logger.error(f"APOD 函数工具发送失败：{exc}")
+            delivered = False
+        if not delivered:
+            return f"{label} APOD 发送失败，请提示用户稍后重试。"
+        title = (title_zh or apod_data.get("title") or "").strip()
+        return (
+            f"已向当前会话发送{label} APOD："
+            f"{apod_data.get('date', '')}《{title}》，可向用户做简要介绍。"
+        )
 
     # 插件自带的 KV 存储足够保存 APOD 数据和翻译结果。
     async def put_cache(self, key: str, value: Any):
@@ -886,7 +930,13 @@ class APOD(Star):
             title_zh, explanation_zh = await self._translate_fields(
                 apod_data, include_hidden=True
             )
-        chain = self._build_push_chain(apod_data, title_zh, explanation_zh)
+        chain = self._build_message_chain(
+            apod_data,
+            title_zh,
+            explanation_zh,
+            include_hidden=True,
+            with_image=self.push_send_image,
+        )
         delivered = 0
         for umo in sessions:
             try:
@@ -900,18 +950,20 @@ class APOD(Star):
         await self.put_cache("last_pushed_apod", {"date": date, "link": link})
         return True
 
-    def _build_push_chain(
+    def _build_message_chain(
         self,
         apod_data: Dict[str, Any],
         title_zh: Optional[str],
         explanation_zh: Optional[str],
+        include_hidden: bool = False,
+        with_image: bool = True,
     ) -> MessageChain:
         chain = []
         url = apod_data.get("hdurl") or apod_data.get("url")
-        if self.push_send_image and url:
+        if with_image and url:
             chain.append(Comp.Image.fromURL(url))
         text = self._build_display_text(
-            apod_data, title_zh, explanation_zh, include_hidden=True
+            apod_data, title_zh, explanation_zh, include_hidden=include_hidden
         )
         if text:
             chain.append(Comp.Plain(text))
