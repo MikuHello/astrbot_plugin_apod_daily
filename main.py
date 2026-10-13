@@ -118,6 +118,7 @@ class APOD(Star):
         self._stale_apod: Optional[dict] = None
         self._stale_nasa: Optional[dict] = None
         self._content_locks: Dict[str, asyncio.Lock] = {}
+        self._translation_flights: Dict[str, asyncio.Future] = {}
         self._translate_index_lock = asyncio.Lock()
 
     @staticmethod
@@ -424,14 +425,13 @@ class APOD(Star):
             raise RuntimeError(f"写入推送检查点失败：{exc}") from exc
 
     async def _cache_translation(self, key: str, value: str) -> None:
-        """写入翻译缓存并按配置上限淘汰最旧条目（FIFO 索引，真删除）。"""
+        """写入翻译缓存并按配置上限淘汰最旧条目（FIFO 索引，真删除）。
+
+        索引在任何配置下都维护：限量关闭期间的写入也要参与未来的淘汰。"""
         if not value:
             return
         async with self._translate_index_lock:
             await self.put_cache(key, value)
-            limit = self.translate_cache_limit
-            if limit <= 0:
-                return
             index = await self.get_cache("translate_cache_index")
             keys = (
                 [k for k in index if isinstance(k, str)]
@@ -440,7 +440,8 @@ class APOD(Star):
             )
             if key not in keys:
                 keys.append(key)
-            while len(keys) > limit:
+            limit = self.translate_cache_limit
+            while limit > 0 and len(keys) > limit:
                 await self.delete_cache(keys.pop(0))
             await self.put_cache("translate_cache_index", keys)
 
@@ -450,52 +451,71 @@ class APOD(Star):
         include_hidden: bool = False,
         umo: Optional[str] = None,
     ) -> tuple[Optional[str], Optional[str]]:
-        """按配置翻译标题与解说，带缓存；两条各自失败降级，互不影响。
-
-        include_hidden=True（推送/函数工具场景）时忽略 is_show，总是翻译全部内容。
-        """
+        """按配置翻译标题与解说；相同键并发翻译自动合并为单次模型调用。"""
         provider_id = None
-        title_zh, explanation_zh = None, None
         explanation = (apod_data.get("explanation") or "").strip()
         title = (apod_data.get("title") or "").strip()
+        title_zh = explanation_zh = None
 
         if explanation and self.explanation.get("is_translate") and (
             include_hidden or self.explanation.get("is_show")
         ):
-            try:
-                if provider_id is None:
-                    provider_id = await self._resolve_chat_provider_id(umo)
-                explanation_cache_key = self._build_translation_cache_key(
-                    provider_id, explanation
-                )
-                cached_translation = await self.get_cache(explanation_cache_key)
-                if cached_translation is not None:
-                    explanation_zh = cached_translation
-                else:
-                    explanation_zh = await self.translate_explanation(
-                        explanation, provider_id
-                    )
-                    await self._cache_translation(explanation_cache_key, explanation_zh)
-            except Exception as exc:
-                logger.error(f"翻译说明失败：{exc}")
+            provider_id = await self._resolve_chat_provider_id(umo)
+            explanation_zh = await self._translate_cached(explanation, provider_id)
 
         if title and self.title.get("is_translate") and (
             include_hidden or self.title.get("is_show")
         ):
-            try:
-                if provider_id is None:
-                    provider_id = await self._resolve_chat_provider_id(umo)
-                title_cache_key = self._build_translation_cache_key(provider_id, title)
-                cached_translation = await self.get_cache(title_cache_key)
-                if cached_translation is not None:
-                    title_zh = cached_translation
-                else:
-                    title_zh = await self.translate_explanation(title, provider_id)
-                    await self._cache_translation(title_cache_key, title_zh)
-            except Exception as exc:
-                logger.error(f"翻译标题失败：{exc}")
+            if provider_id is None:
+                provider_id = await self._resolve_chat_provider_id(umo)
+            title_zh = await self._translate_cached(title, provider_id)
 
         return title_zh, explanation_zh
+
+    async def _translate_cached(
+        self, text: str, provider_id: Optional[str]
+    ) -> Optional[str]:
+        """带缓存与 single-flight 的翻译：相同键并发只调用一次模型。
+
+        模型调用或写缓存失败时返回 None（本次降级为原文），不写缓存；
+        翻译整体受 timeout 预算约束，超时同样降级为原文。
+        """
+        if provider_id is None:
+            provider_id = await self._resolve_chat_provider_id()
+        cache_key = self._build_translation_cache_key(provider_id, text)
+        cached = await self.get_cache(cache_key)
+        if cached is not None:
+            return cached
+
+        flight = self._translation_flights.get(cache_key)
+        if flight is None:
+            flight = asyncio.get_running_loop().create_future()
+            self._translation_flights[cache_key] = flight
+
+            async def run_flight():
+                try:
+                    translation = await self.translate_explanation(text, provider_id)
+                    if not translation or not translation.strip():
+                        raise RuntimeError("翻译返回空结果")
+                    await self._cache_translation(cache_key, translation)
+                except Exception as exc:
+                    self._translation_flights.pop(cache_key, None)
+                    if not flight.done():
+                        flight.set_exception(exc)
+                    return
+                self._translation_flights.pop(cache_key, None)
+                if not flight.done():
+                    flight.set_result(translation)
+
+            asyncio.create_task(run_flight())
+
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(flight), timeout=self.timeout
+            )
+        except Exception as exc:
+            logger.warning(f"翻译未在预算内完成，本次降级使用原文：{exc}")
+            return None
 
     @staticmethod
     def _format_date_cn(date_str: str) -> str:
