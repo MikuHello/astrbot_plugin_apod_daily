@@ -118,6 +118,7 @@ class APOD(Star):
         self.last_apod_error: Optional[str] = None
         self._stale_apod: Optional[dict] = None
         self._stale_nasa: Optional[dict] = None
+        self._content_locks: Dict[str, asyncio.Lock] = {}
         self._translate_index_lock = asyncio.Lock()
 
     @staticmethod
@@ -568,61 +569,73 @@ class APOD(Star):
         await self.put_cache(cache_key, apod_data)
         return apod_data
 
+    def _content_lock(self, cache_key: str) -> asyncio.Lock:
+        lock = self._content_locks.get(cache_key)
+        if lock is None:
+            lock = self._content_locks[cache_key] = asyncio.Lock()
+        return lock
+
     async def _get_cached_data(
-        self, cache_key: str, fetch, stale_attr: str
+        self, cache_key: str, fetch, stale_attr: str, force_refresh: bool = False
     ) -> Optional[dict]:
         """当日内容缓存：12h 硬 TTL；超 1h 且日期落后美东今天时提前刷新；
-        刷新失败回退 KV 旧值或内存 stale，避免直接对用户报错。"""
+        刷新失败回退 KV 旧值或内存 stale，避免直接对用户报错。
+        按来源加锁双检：并发冷启动只触发一次抓取；force_refresh 供推送
+        强制刷新并同步写回共享缓存。"""
 
         async def refresh() -> Optional[dict]:
             return await self._refresh_cached_data(cache_key, fetch, stale_attr)
 
-        apod_data = await self.get_cache(cache_key)
-        if apod_data is None:
-            return await refresh() or getattr(self, stale_attr, None)
+        async with self._content_lock(cache_key):
+            if force_refresh:
+                return await refresh()
 
-        if not self._is_valid_apod_data(apod_data):
-            logger.warning("缓存中的数据无效，正在刷新缓存。")
-            return await refresh() or getattr(self, stale_attr, None)
+            apod_data = await self.get_cache(cache_key)
+            if apod_data is None:
+                return await refresh() or getattr(self, stale_attr, None)
 
-        # 时间元数据损坏只应触发刷新：刷新失败仍可使用手里的旧内容，
-        # 不因新鲜度信息缺失而把可用正文判定为失败。
-        retrieved_at = None
-        retrieved_at_raw = apod_data.get("retrieved_at")
-        if retrieved_at_raw:
-            try:
-                retrieved_at = datetime.fromisoformat(retrieved_at_raw)
-                if retrieved_at.tzinfo is None:
-                    # 历史 naive 值为服务器本地时间，按本地时区补齐。
-                    retrieved_at = retrieved_at.astimezone()
-            except (TypeError, ValueError):
-                logger.warning("缓存中的时间格式无效，将刷新缓存。")
-                retrieved_at = None
-        if retrieved_at is None:
-            logger.info("缓存缺少有效 retrieved_at，正在刷新缓存。")
-            return await refresh() or apod_data
+            if not self._is_valid_apod_data(apod_data):
+                logger.warning("缓存中的数据无效，正在刷新缓存。")
+                return await refresh() or getattr(self, stale_attr, None)
 
-        age = (
-            datetime.now(timezone.utc) - retrieved_at.astimezone(timezone.utc)
-        ).total_seconds()
-        # 新鲜度判断以“美东今天”为基准（两个内容源都约在美东每日更新）：
-        #   - 12 小时硬 TTL；
-        #   - 缓存超过 1 小时且日期落后于最新一期时提前刷新，
-        #     避免新一期发布后最长要等满 12 小时才能刷出来。
-        expired = age > 12 * 3600
-        if not expired and age > 3600:
-            cached_date = str(apod_data.get("date") or "")
-            if cached_date and cached_date != self._expected_latest_date():
-                logger.info("缓存日期落后于最新一期，正在刷新缓存。")
-                expired = True
-        if expired:
-            logger.info("缓存中的数据已过期，正在刷新缓存。")
-            fresh = await refresh()
-            if fresh is not None:
-                return fresh
-            logger.warning("刷新失败，回退使用过期的缓存。")
-        setattr(self, stale_attr, apod_data)
-        return apod_data
+            # 时间元数据损坏只应触发刷新：刷新失败仍可使用手里的旧内容，
+            # 不因新鲜度信息缺失而把可用正文判定为失败。
+            retrieved_at = None
+            retrieved_at_raw = apod_data.get("retrieved_at")
+            if retrieved_at_raw:
+                try:
+                    retrieved_at = datetime.fromisoformat(retrieved_at_raw)
+                    if retrieved_at.tzinfo is None:
+                        # 历史 naive 值为服务器本地时间，按本地时区补齐。
+                        retrieved_at = retrieved_at.astimezone()
+                except (TypeError, ValueError):
+                    logger.warning("缓存中的时间格式无效，将刷新缓存。")
+                    retrieved_at = None
+            if retrieved_at is None:
+                logger.info("缓存缺少有效 retrieved_at，正在刷新缓存。")
+                return await refresh() or apod_data
+
+            age = (
+                datetime.now(timezone.utc) - retrieved_at.astimezone(timezone.utc)
+            ).total_seconds()
+            # 新鲜度判断以“美东今天”为基准（两个内容源都约在美东每日更新）：
+            #   - 12 小时硬 TTL；
+            #   - 缓存超过 1 小时且日期落后于最新一期时提前刷新，
+            #     避免新一期发布后最长要等满 12 小时才能刷出来。
+            expired = age > 12 * 3600
+            if not expired and age > 3600:
+                cached_date = str(apod_data.get("date") or "")
+                if cached_date and cached_date != self._expected_latest_date():
+                    logger.info("缓存日期落后于最新一期，正在刷新缓存。")
+                    expired = True
+            if expired:
+                logger.info("缓存中的数据已过期，正在刷新缓存。")
+                fresh = await refresh()
+                if fresh is not None:
+                    return fresh
+                logger.warning("刷新失败，回退使用过期的缓存。")
+            setattr(self, stale_attr, apod_data)
+            return apod_data
 
     async def _get_latest_apod(self) -> Optional[dict]:
         return await self._get_cached_data(
@@ -1068,7 +1081,9 @@ class APOD(Star):
         sessions = self._get_push_sessions()
         if not sessions:
             return True
-        apod_data = await self._fetch_latest_apod()
+        apod_data = await self._get_cached_data(
+            "apod_cache", self._fetch_latest_apod, "_stale_apod", force_refresh=True
+        )
         if apod_data is None:
             return False
         link = str(apod_data.get("link") or "")
