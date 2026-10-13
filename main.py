@@ -1134,11 +1134,24 @@ class APOD(Star):
 
         last = await self.get_cache("last_pushed_apod")
         last_link = str(last.get("link") or "") if isinstance(last, dict) else ""
+        last_delivered = (
+            bool(last.get("delivered", True)) if isinstance(last, dict) else True
+        )
+
+        pending = [umo for umo in sessions if pushed.get(umo) != link]
+
         if not last_link and self.push_mode == "upstream":
-            # 上游更新模式：首次检查只建立监测基准，不把启动时的旧一期当作“新刊”群发。
-            await self.put_cache("last_pushed_apod", {"date": date, "link": link})
+            # 上游模式首次巡检只建立观察基准：旧一期不向订阅者分发。
+            await self.put_cache(
+                "last_pushed_apod", {"date": date, "link": link, "delivered": False}
+            )
             logger.info(f"APOD 推送基准已建立：{date}")
             return True
+
+        if link == last_link and not last_delivered:
+            # 基准尚未作为“新刊”分发过：上游未变化前保持静默。
+            return True
+
         if not pending:
             return True
 
@@ -1174,7 +1187,9 @@ class APOD(Star):
                 logger.error(f"{exc}：本轮推送中止。")
                 return False
             delivered += 1
-        await self.put_cache("last_pushed_apod", {"date": date, "link": link})
+        await self.put_cache(
+            "last_pushed_apod", {"date": date, "link": link, "delivered": True}
+        )
         missed = len(pending) - delivered
         logger.info(
             f"APOD 新一期已推送：{date}，本次送达 {delivered}/{len(pending)} 个会话"
