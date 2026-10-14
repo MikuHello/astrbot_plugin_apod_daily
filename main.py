@@ -1179,10 +1179,19 @@ class APOD(Star):
     # 订阅名单以插件配置页为唯一数据源：指令订阅/退订即时回写配置，
     # 配置页手改保存并重载插件后同样生效。
     def _get_push_sessions(self) -> list:
-        """读取订阅名单：校验类型、去首尾空格并保序去重。"""
+        """读取订阅名单：校验容器与条目类型、去首尾空格并保序去重。"""
         push_cfg = self._ensure_dict(self.config.get("push", {}))
+        raw_sessions = push_cfg.get("sessions")
+        if raw_sessions is None:
+            return []
+        if not isinstance(raw_sessions, list):
+            # 容器类型错误（如手改配置存成字符串）整体忽略，不按字符遍历。
+            logger.warning(
+                f"订阅名单配置不是列表，已忽略：{type(raw_sessions).__name__}"
+            )
+            return []
         sessions = []
-        for item in push_cfg.get("sessions") or []:
+        for item in raw_sessions:
             if not isinstance(item, str):
                 logger.warning(f"订阅名单存在非字符串条目，已跳过：{item!r}")
                 continue
