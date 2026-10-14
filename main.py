@@ -651,28 +651,67 @@ class APOD(Star):
             lock = self._content_locks[cache_key] = asyncio.Lock()
         return lock
 
+    async def _attempt_refresh(
+        self, cache_key: str, refresh, *, respect_cooldown: bool
+    ) -> Optional[dict]:
+        """统一刷新入口：冷却期内跳过抓取；任何分支的抓取失败都记入
+        5 分钟冷却期，成功则清除。
+
+        返回 None 表示“处于冷却未抓取”或“抓取失败”，由调用方按各自
+        语义回退（冷缓存回退 stale、损坏缓存不回传、投递不发送）。
+        """
+        if respect_cooldown:
+            cooldown_until = self._refresh_cooldowns.get(cache_key)
+            if (
+                cooldown_until is not None
+                and datetime.now(timezone.utc) < cooldown_until
+            ):
+                logger.info("刷新处于失败冷却期，跳过本次抓取。")
+                return None
+        fresh = await refresh()
+        if fresh is not None:
+            self._refresh_cooldowns.pop(cache_key, None)
+            return fresh
+        self._refresh_cooldowns[cache_key] = datetime.now(timezone.utc) + timedelta(
+            minutes=5
+        )
+        logger.warning("刷新失败，进入冷却期。")
+        return None
+
     async def _get_cached_data(
         self, cache_key: str, fetch, stale_attr: str, force_refresh: bool = False
     ) -> Optional[dict]:
         """当日内容缓存：12h 硬 TTL；超 1h 且日期落后美东今天时提前刷新；
         刷新失败回退 KV 旧值或内存 stale，避免直接对用户报错。
         按来源加锁双检：并发冷启动只触发一次抓取；force_refresh 供推送
-        强制刷新并同步写回共享缓存。"""
+        强制刷新并同步写回共享缓存。
+        失败冷却统一收口在 _attempt_refresh：冷缓存、数据无效、时间戳
+        缺失与过期刷新共用同一入口，冷却内一律复用旧内容。"""
 
         async def refresh() -> Optional[dict]:
             return await self._refresh_cached_data(cache_key, fetch, stale_attr)
 
         async with self._content_lock(cache_key):
             if force_refresh:
-                return await refresh()
+                # 投递语义：强制刷新必须真正尝试抓取（不受冷却拦截）；
+                # 抓取失败返回 None，由调用方决定不发送，不拿旧缓存当新内容。
+                return await self._attempt_refresh(
+                    cache_key, refresh, respect_cooldown=False
+                )
 
             apod_data = await self.get_cache(cache_key)
             if apod_data is None:
-                return await refresh() or getattr(self, stale_attr, None)
+                fresh = await self._attempt_refresh(
+                    cache_key, refresh, respect_cooldown=True
+                )
+                return fresh or getattr(self, stale_attr, None)
 
             if not self._is_valid_apod_data(apod_data):
                 logger.warning("缓存中的数据无效，正在刷新缓存。")
-                return await refresh() or getattr(self, stale_attr, None)
+                fresh = await self._attempt_refresh(
+                    cache_key, refresh, respect_cooldown=True
+                )
+                return fresh or getattr(self, stale_attr, None)
 
             # 时间元数据损坏只应触发刷新：刷新失败仍可使用手里的旧内容，
             # 不因新鲜度信息缺失而把可用正文判定为失败。
@@ -689,7 +728,10 @@ class APOD(Star):
                     retrieved_at = None
             if retrieved_at is None:
                 logger.info("缓存缺少有效 retrieved_at，正在刷新缓存。")
-                return await refresh() or apod_data
+                fresh = await self._attempt_refresh(
+                    cache_key, refresh, respect_cooldown=True
+                )
+                return fresh or apod_data
 
             age = (
                 datetime.now(timezone.utc) - retrieved_at.astimezone(timezone.utc)
@@ -705,23 +747,13 @@ class APOD(Star):
                     logger.info("缓存日期落后于最新一期，正在刷新缓存。")
                     expired = True
             if expired:
-                cooldown_until = self._refresh_cooldowns.get(cache_key)
-                if (
-                    cooldown_until is not None
-                    and datetime.now(timezone.utc) < cooldown_until
-                ):
-                    logger.info("刷新处于失败冷却期，复用过期缓存。")
-                    setattr(self, stale_attr, apod_data)
-                    return apod_data
                 logger.info("缓存中的数据已过期，正在刷新缓存。")
-                fresh = await refresh()
+                fresh = await self._attempt_refresh(
+                    cache_key, refresh, respect_cooldown=True
+                )
                 if fresh is not None:
-                    self._refresh_cooldowns.pop(cache_key, None)
                     return fresh
-                self._refresh_cooldowns[cache_key] = datetime.now(
-                    timezone.utc
-                ) + timedelta(minutes=5)
-                logger.warning("刷新失败，进入冷却期并回退使用过期的缓存。")
+                logger.warning("刷新失败或处于冷却期，回退使用过期缓存。")
             setattr(self, stale_attr, apod_data)
             return apod_data
 
