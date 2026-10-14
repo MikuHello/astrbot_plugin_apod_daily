@@ -1283,8 +1283,6 @@ class APOD(Star):
             bool(last.get("delivered", True)) if isinstance(last, dict) else True
         )
 
-        pending = [umo for umo in sessions if pushed.get(umo) != link]
-
         if not last_link and self.push_mode == "upstream":
             # 上游模式首次巡检只建立观察基准：旧一期不向订阅者分发。
             await self.put_cache(
