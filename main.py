@@ -137,7 +137,7 @@ class APOD(Star):
         self._stale_apod: Optional[dict] = None
         self._stale_nasa: Optional[dict] = None
         self._content_locks: Dict[str, asyncio.Lock] = {}
-        self._translation_flights: Dict[str, asyncio.Future] = {}
+        self._translation_flights: Dict[str, asyncio.Task] = {}
         self._refresh_cooldowns: Dict[str, datetime] = {}
         self._translate_index_lock = asyncio.Lock()
 
@@ -498,7 +498,9 @@ class APOD(Star):
         """带缓存与 single-flight 的翻译：相同键并发只调用一次模型。
 
         模型调用或写缓存失败时返回 None（本次降级为原文），不写缓存；
-        翻译整体受 timeout 预算约束，超时同样降级为原文。
+        worker 持有强引用并由 terminate 统一取消，模型调用自身受 timeout
+        预算约束；等待方超时/取消经 shield 隔离，不影响 worker 与其他
+        等待者；失败统一在 worker 内消费为 None，不留未检索的异常。
         """
         if provider_id is None:
             provider_id = await self._resolve_chat_provider_id()
@@ -509,33 +511,39 @@ class APOD(Star):
 
         flight = self._translation_flights.get(cache_key)
         if flight is None:
-            flight = asyncio.get_running_loop().create_future()
+            flight = asyncio.create_task(
+                self._run_translation_flight(cache_key, text, provider_id)
+            )
             self._translation_flights[cache_key] = flight
 
-            async def run_flight():
-                try:
-                    translation = await self.translate_explanation(text, provider_id)
-                    if not translation or not translation.strip():
-                        raise RuntimeError("翻译返回空结果")
-                    await self._cache_translation(cache_key, translation)
-                except Exception as exc:
-                    self._translation_flights.pop(cache_key, None)
-                    if not flight.done():
-                        flight.set_exception(exc)
-                    return
-                self._translation_flights.pop(cache_key, None)
-                if not flight.done():
-                    flight.set_result(translation)
-
-            asyncio.create_task(run_flight())
-
         try:
+            # shield 隔离等待方取消：单个会话超时不终止共享 worker。
             return await asyncio.wait_for(
                 asyncio.shield(flight), timeout=self.timeout
             )
         except Exception as exc:
             logger.warning(f"翻译未在预算内完成，本次降级使用原文：{exc}")
             return None
+
+    async def _run_translation_flight(
+        self, cache_key: str, text: str, provider_id: Optional[str]
+    ) -> Optional[str]:
+        """single-flight 工作体：模型调用限时，失败统一降级为 None 并清理表项。"""
+        try:
+            translation = await asyncio.wait_for(
+                self.translate_explanation(text, provider_id), timeout=self.timeout
+            )
+            if not translation or not translation.strip():
+                raise RuntimeError("翻译返回空结果")
+            await self._cache_translation(cache_key, translation)
+            return translation
+        except Exception as exc:
+            # 在 worker 内消费异常：即使已无等待者，
+            # 也不会出现 “Future exception was never retrieved”。
+            logger.warning(f"翻译执行失败，降级为原文：{exc}")
+            return None
+        finally:
+            self._translation_flights.pop(cache_key, None)
 
     @staticmethod
     def _format_date_cn(date_str: str) -> str:
@@ -1327,3 +1335,11 @@ class APOD(Star):
             except asyncio.CancelledError:
                 pass
             self._push_task = None
+        # 翻译 worker 持有强引用：卸载时统一取消并等待退出，
+        # 避免悬挂的模型调用越过插件生命周期继续运行。
+        flights = list(self._translation_flights.values())
+        for flight in flights:
+            flight.cancel()
+        if flights:
+            await asyncio.gather(*flights, return_exceptions=True)
+        self._translation_flights.clear()
