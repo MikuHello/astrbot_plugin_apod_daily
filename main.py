@@ -69,20 +69,28 @@ NASA_POST_LINK_PATTERN = re.compile(
 PLACEHOLDER_MARKS = ("nasa-logo", "/themes/")
 
 
+# 文章发布时间只认这两种 meta 名，不拿更新时间冒充。
+PUBLISHED_META_KEYS = ("parsely-pub-date", "article:published_time")
+
+
 class _HTMLAttrParser(HTMLParser):
-    """收集 og:image 的 meta 与 <img> src：属性顺序、引号风格与大小写无关。"""
+    """收集 og:image、发布时间 meta 与 <img> src：属性顺序、引号风格与大小写无关。"""
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.og_image = ""
+        self.published_meta = ""
         self.img_srcs = []
 
     def handle_starttag(self, tag, attrs):
         attrs_map = {name.lower(): value or "" for name, value in attrs}
         if tag == "meta":
             key = attrs_map.get("property") or attrs_map.get("name")
-            if key and key.lower() == "og:image" and not self.og_image:
+            key = key.lower() if key else ""
+            if key == "og:image" and not self.og_image:
                 self.og_image = attrs_map.get("content", "")
+            elif key in PUBLISHED_META_KEYS and not self.published_meta:
+                self.published_meta = attrs_map.get("content", "")
         elif tag == "img" and attrs_map.get("src"):
             self.img_srcs.append(attrs_map["src"])
 IMAGE_URL_SOURCES = (
@@ -902,19 +910,9 @@ class APOD(Star):
                 continue
             explanation_parts.append(text)
         explanation = " ".join(part for part in explanation_parts if part)
-        # 结构化解析 meta 标签（属性顺序无关）；只认发布时间，不拿更新时间冒充。
-        published_raw = ""
-        for tag in re.findall(r"<meta\b[^>]*>", page_html):
-            name_match = re.search(r'(?:name|property)\s*=\s*["\']([^"\']+)["\']', tag)
-            content_match = re.search(r'content\s*=\s*["\']([^"\']*)["\']', tag)
-            if (
-                name_match
-                and content_match
-                and name_match.group(1).lower()
-                in ("parsely-pub-date", "article:published_time")
-            ):
-                published_raw = html_lib.unescape(content_match.group(1))
-                break
+        # 发布时间与 og:image 同源：meta 由同一解析器按属性解析收集
+        # （顺序/引号/大小写无关）；只认发布时间，不拿更新时间冒充。
+        published_raw = html_lib.unescape(page_parser.published_meta)
         date_match = re.match(r"(\d{4}-\d{2}-\d{2})", published_raw)
         # 通用正文构造器只接收 article region：主图解析到此为止，article
         # 内找不到就诚实返回无图，不回退扫描全页误选页脚或相关文章图片；
