@@ -916,10 +916,13 @@ class APOD(Star):
                 published_raw = html_lib.unescape(content_match.group(1))
                 break
         date_match = re.match(r"(\d{4}-\d{2}-\d{2})", published_raw)
+        # 通用正文构造器只接收 article region：主图解析到此为止，article
+        # 内找不到就诚实返回无图，不回退扫描全页误选页脚或相关文章图片；
+        # og:image 与发布时间仍在此前从全页提取。
         return self._build_apod_data(
             title,
             link,
-            page_html,
+            region,
             date_str=date_match.group(1) if date_match else "",
             explanation=explanation,
             credit=credit or None,
