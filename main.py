@@ -135,7 +135,7 @@ APOD_HELP = chr(10).join(
 )
 
 
-@register("apod", "Cysheper", "天文每日一图插件：APOD + NASA 每日一图，订阅推送、随机、LLM 翻译与函数工具。", "1.0.4")
+@register("apod", "Cysheper", "天文每日一图插件：APOD + NASA 每日一图，订阅推送、随机、LLM 翻译与函数工具。", "1.1.0")
 class APOD(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context, config)
