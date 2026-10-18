@@ -696,6 +696,16 @@ class ApodCachePolicyTests(unittest.TestCase):
         )
         self.assertEqual(valid, datetime(2026, 10, 18, 0, 15, tzinfo=et))
 
+    def test_fetch_inside_grace_window_expires_same_day(self):
+        from datetime import datetime
+
+        et = self.plugin._et_timezone()
+        # 00:08（宽限窗口内）抓取 → 只算到当天 00:15，不会被推到明天
+        valid = self.plugin._apod_cache_valid_until(
+            datetime(2026, 10, 18, 0, 8, tzinfo=et)
+        )
+        self.assertEqual(valid, datetime(2026, 10, 18, 0, 15, tzinfo=et))
+
     def test_just_fetched_is_fresh(self):
         from datetime import datetime, timezone
 

@@ -1120,18 +1120,21 @@ class APOD(Star):
         )
 
     def _apod_cache_valid_until(self, retrieved_at: datetime) -> datetime:
-        """有效期到「下一次美东 00:05 发布」+ 宽限。"""
+        """有效期到「下一次美东 00:05 + 宽限」。
+
+        直接按 00:05+宽限 这个边界算：在宽限窗口内（如 00:08）抓取时只算到
+        当天的边界，不会因“下一个 00:05”被推到明天而锁一整天。"""
         tz = self._et_timezone()
         local = retrieved_at.astimezone(tz)
-        publish = local.replace(
+        cutoff = local.replace(
             hour=APOD_PUBLISH_ET_HOUR,
             minute=APOD_PUBLISH_ET_MINUTE,
             second=0,
             microsecond=0,
-        )
-        if publish <= local:
-            publish += timedelta(days=1)
-        return publish + timedelta(minutes=APOD_CACHE_GRACE_MINUTES)
+        ) + timedelta(minutes=APOD_CACHE_GRACE_MINUTES)
+        if cutoff <= local:
+            cutoff += timedelta(days=1)
+        return cutoff
 
     def _apod_cache_fresh(self, apod_data: dict) -> bool:
         """APOD 缓存是否仍有效：只看是否跨过了下一个过期点。"""
@@ -1147,18 +1150,10 @@ class APOD(Star):
         return datetime.now(timezone.utc) < self._apod_cache_valid_until(retrieved_at)
 
     def _seconds_until_apod_prefetch(self) -> float:
-        """距下一次「APOD 发布 + 宽限」的秒数（美东时区）。"""
+        """距下一次过期边界（美东 00:05 + 宽限）的秒数。"""
         tz = self._et_timezone()
         now = datetime.now(tz)
-        target = now.replace(
-            hour=APOD_PUBLISH_ET_HOUR,
-            minute=APOD_PUBLISH_ET_MINUTE,
-            second=0,
-            microsecond=0,
-        ) + timedelta(minutes=APOD_CACHE_GRACE_MINUTES)
-        if target <= now:
-            target += timedelta(days=1)
-        return (target - now).total_seconds()
+        return (self._apod_cache_valid_until(now) - now).total_seconds()
 
     async def _prefetch_loop(self) -> None:
         """定时预缓存：每天 APOD 发布后主动抓取 + 翻译，预热缓存。"""
