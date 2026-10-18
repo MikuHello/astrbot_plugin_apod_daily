@@ -1,69 +1,75 @@
 {
-    "image": {
-        "description": "发送图片",
-        "hint": "每日天文图的主体内容，建议开启",
-        "type": "bool",
-        "default": true
-    },
-    "title": {
-        "description": "标题配置",
+    "send": {
+        "description": "发送配置",
         "type": "object",
         "items": {
-            "is_show": {
-                "description": "是否发送标题",
-                "hint": "展示当期天文图的标题",
+            "media": {
+                "description": "发送图片 & 视频",
+                "hint": "每日天文图的主体媒体；视频期发送视频，平台不支持时退化为文字+链接",
                 "type": "bool",
                 "default": true
             },
-            "is_translate": {
-                "description": "是否翻译标题",
-                "hint": "翻译为简体中文",
+            "title": {
+                "description": "发送标题",
+                "hint": "展示当期标题；有译文时显示「译文（原文）」",
                 "type": "bool",
                 "default": true
-            }
-        }
-    },
-    "explanation": {
-        "description": "图片说明",
-        "type": "object",
-        "items": {
-            "is_show": {
-                "description": "是否发送官方说明",
+            },
+            "explanation": {
+                "description": "发送说明",
                 "hint": "官方说明通常比较长，包含丰富的科学信息",
                 "type": "bool",
                 "default": true
             },
-            "is_translate": {
-                "description": "是否翻译说明",
-                "hint": "翻译为简体中文",
-                "type": "bool",
-                "default": true
-            }
-        }
-    },
-    "date": {
-        "description": "日期配置",
-        "type": "object",
-        "items": {
-            "is_show": {
-                "description": "是否发送日期",
+            "date": {
+                "description": "发送日期",
                 "hint": "展示当期日期（NASA 按美东时间发布）",
                 "type": "bool",
                 "default": true
             }
         }
     },
-    "provider": {
-        "description": "翻译所使用的LLM提供商",
-        "hint": "留空时使用当前对话模型进行翻译",
-        "_special": "select_provider",
-        "type": "string"
-    },
     "is_divided": {
         "description": "分开发送图片和文本",
-        "hint": "关闭后图片与文本合并为一条消息发送",
+        "hint": "开启后图片与正文分为两条消息发送",
         "type": "bool",
         "default": true
+    },
+    "translate": {
+        "description": "翻译配置",
+        "type": "object",
+        "items": {
+            "title": {
+                "description": "翻译标题",
+                "hint": "标题翻译为简体中文；不可译时保留原文",
+                "type": "bool",
+                "default": true
+            },
+            "explanation": {
+                "description": "翻译说明",
+                "hint": "说明翻译为简体中文",
+                "type": "bool",
+                "default": true
+            },
+            "provider": {
+                "description": "翻译所使用的 LLM 提供商",
+                "hint": "留空时使用当前对话模型进行翻译",
+                "_special": "select_provider",
+                "type": "string",
+                "default": ""
+            },
+            "parse_retry": {
+                "description": "结构解析失败重试次数",
+                "hint": "标题/说明未按标签结构返回时重试；0 表示不重试",
+                "type": "int",
+                "default": 1,
+                "slider": {
+                    "min": 0,
+                    "max": 5,
+                    "step": 1
+                }
+            }
+        }
     },
     "push": {
         "description": "推送/订阅配置",
@@ -101,20 +107,22 @@
                 "default": []
             },
             "translate": {
-                "description": "推送前翻译",
+                "description": "（旧）推送前翻译",
                 "type": "bool",
-                "default": true
+                "default": true,
+                "invisible": true
             },
             "send_image": {
-                "description": "推送附带图片",
+                "description": "（旧）推送附带图片",
                 "type": "bool",
-                "default": true
+                "default": true,
+                "invisible": true
             }
         }
     },
     "translate_cache_limit": {
         "description": "翻译缓存条数上限",
-        "hint": "超过上限时按写入顺序淘汰最旧的翻译缓存，0 表示不限制",
+        "hint": "超过上限时按写入顺序淘汰最旧的翻译缓存，0 表示不限制；/apod管理 清理 可手动清空",
         "type": "int",
         "default": 1000
     },
@@ -124,8 +132,46 @@
         "default": 120
     },
     "retry_count": {
-        "description": "获取失败时的重试次数",
+        "description": "网络获取失败时的重试次数",
         "type": "int",
         "default": 2
+    },
+    "image": {
+        "description": "（旧）发送图片",
+        "type": "bool",
+        "default": true,
+        "invisible": true
+    },
+    "title": {
+        "description": "（旧）标题配置",
+        "type": "object",
+        "invisible": true,
+        "items": {
+            "is_show": {"type": "bool", "default": true},
+            "is_translate": {"type": "bool", "default": true}
+        }
+    },
+    "explanation": {
+        "description": "（旧）说明配置",
+        "type": "object",
+        "invisible": true,
+        "items": {
+            "is_show": {"type": "bool", "default": true},
+            "is_translate": {"type": "bool", "default": true}
+        }
+    },
+    "date": {
+        "description": "（旧）日期配置",
+        "type": "object",
+        "invisible": true,
+        "items": {
+            "is_show": {"type": "bool", "default": true}
+        }
+    },
+    "provider": {
+        "description": "（旧）翻译所使用的 LLM 提供商",
+        "type": "string",
+        "default": "",
+        "invisible": true
     }
 }

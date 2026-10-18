@@ -181,17 +181,106 @@ class APOD(Star):
         ).hexdigest()
         return f"translate_cache:{digest}"
 
+    async def _migrate_config(self) -> None:
+        """旧版扁平配置 → 新版「发送配置 / 翻译配置」分组的一次性迁移。
+
+        AstrBot 会在插件加载前按新 schema 归一化配置，并删除未声明的键，
+        因此旧键必须保留在 schema 里（invisible）。用 KV 标记保证只迁移一次，
+        之后不再覆盖用户在新分组上的改动。
+        """
+        if await self.get_cache("config_layout_v2"):
+            return
+
+        send_cfg = self._ensure_dict(self.config.setdefault("send", {}))
+        translate_cfg = self._ensure_dict(self.config.setdefault("translate", {}))
+        push_cfg = self._ensure_dict(self.config.get("push", {}))
+        old_title = self._ensure_dict(self.config.get("title"))
+        old_expl = self._ensure_dict(self.config.get("explanation"))
+        old_date = self._ensure_dict(self.config.get("date"))
+
+        if "image" in self.config:
+            send_cfg["media"] = bool(self.config.get("image"))
+        if "send_image" in push_cfg:
+            send_cfg.setdefault("media", bool(push_cfg.get("send_image")))
+        if "is_show" in old_title:
+            send_cfg["title"] = bool(old_title.get("is_show"))
+        if "is_show" in old_expl:
+            send_cfg["explanation"] = bool(old_expl.get("is_show"))
+        if "is_show" in old_date:
+            send_cfg["date"] = bool(old_date.get("is_show"))
+        if "is_translate" in old_title:
+            translate_cfg["title"] = bool(old_title.get("is_translate"))
+        if "is_translate" in old_expl:
+            translate_cfg["explanation"] = bool(old_expl.get("is_translate"))
+        if "provider" in self.config:
+            translate_cfg["provider"] = str(self.config.get("provider") or "")
+        # 旧推送翻译开关：仅作为兼容来源，统一归一到翻译配置。
+        if push_cfg.get("translate") is True:
+            translate_cfg.setdefault("title", True)
+            translate_cfg.setdefault("explanation", True)
+
+        await self.put_cache("config_layout_v2", True)
+        await self.config.save_config_async()
+        logger.info("APOD 配置已迁移到新的发送/翻译分组。")
+
+    async def _clear_reusable_caches(self) -> int:
+        """清空可复用缓存（翻译 + 内容），保留推送状态（避免重复群发）。
+
+        翻译缓存用范围读枚举：插件自带的 FIFO 索引可能漏键（已实测 43 vs 25），
+        而 sp.range_get_async 能拿到本插件全部 KV。返回删除项数。"""
+        from astrbot.core import sp  # 本地导入：避免模块级依赖核心内部对象
+
+        deleted = 0
+        try:
+            prefs = await sp.range_get_async("plugin", self.plugin_id)
+        except Exception as exc:
+            logger.error(f"枚举插件缓存失败，仅清理已知键：{exc}")
+            prefs = []
+        for pref in prefs:
+            key = getattr(pref, "key", None)
+            if isinstance(key, str) and key.startswith("translate_cache"):
+                await self.delete_cache(key)
+                deleted += 1
+
+        for key in ("apod_cache", "nasa_cache"):
+            await self.delete_cache(key)
+            deleted += 1
+
+        # 内存态一并复位：避免清库后仍从 stale/cooldown/在途任务回填。
+        self._stale_apod = None
+        self._stale_nasa = None
+        self._refresh_cooldowns.clear()
+        flights = list(self._translation_flights.values())
+        for flight in flights:
+            flight.cancel()
+        if flights:
+            await asyncio.gather(*flights, return_exceptions=True)
+        self._translation_flights.clear()
+        logger.info(f"已清理 APOD 可复用缓存，共 {deleted} 项。")
+        return deleted
+
     async def initialize(self):
         logger.info("正在初始化 NASA APOD 插件...")
 
-        # 读取配置；嵌套配置统一规范成字典。RSS 数据源无需任何密钥。
-        self.image = self.config.get("image", True)
-        self.explanation = self._ensure_dict(self.config.get("explanation", {}))
-        self.title = self._ensure_dict(self.config.get("title", {}))
+        # 旧版配置先迁移到 send/translate 分组，再读取。
+        await self._migrate_config()
+
+        send_cfg = self._ensure_dict(self.config.get("send", {}))
+        self.send_media = bool(send_cfg.get("media", True))
+        self.send_title = bool(send_cfg.get("title", True))
+        self.send_explanation = bool(send_cfg.get("explanation", True))
+        self.send_date = bool(send_cfg.get("date", True))
+
+        translate_cfg = self._ensure_dict(self.config.get("translate", {}))
+        self.translate_title = bool(translate_cfg.get("title", True))
+        self.translate_explanation = bool(translate_cfg.get("explanation", True))
         # 翻译模型：优先用插件配置的 provider，未配置时回落到 AstrBot 默认对话模型。
-        self.provider = self.config.get("provider", "")
-        self.date = self._ensure_dict(self.config.get("date", {}))
-        self.is_divided = self.config.get("is_divided", True)
+        self.provider = str(translate_cfg.get("provider", "") or "")
+        self.translate_parse_retry = max(
+            0, int(translate_cfg.get("parse_retry", 1))
+        )
+
+        self.is_divided = bool(self.config.get("is_divided", True))
         self.timeout = max(1, int(self.config.get("timeout", 120)))
         self.retry_count = max(0, int(self.config.get("retry_count", 2)))
         self.translate_cache_limit = max(
@@ -205,8 +294,6 @@ class APOD(Star):
             self.push_mode = "scheduled"
         self.push_time = str(push_cfg.get("push_time", "01:00")).strip() or "01:00"
         self.push_interval_minutes = max(5, int(push_cfg.get("interval_minutes", 30)))
-        self.push_translate = bool(push_cfg.get("translate", True))
-        self.push_send_image = bool(push_cfg.get("send_image", True))
         self._push_task: Optional[asyncio.Task] = None
 
         # 历史版本把订阅名单存在 KV；现以插件配置为唯一数据源，启动时做一次性迁移。
@@ -276,7 +363,7 @@ class APOD(Star):
         # 图片/视频都可以直接作为媒体发送；没有可用媒体时降级为文字+链接，
         # 不再把视频型条目当成错误回退。
         media_component = None
-        if self.image and url:
+        if self.send_media and url:
             if media_type == "video":
                 media_component = Comp.Video.fromURL(url)
             else:
@@ -350,6 +437,14 @@ class APOD(Star):
                 yield event.plain_result("本会话还没有订阅 APOD 推送喵。")
             return
 
+        if sub in ("清理", "清理缓存", "clear"):
+            deleted = await self._clear_reusable_caches()
+            yield event.plain_result(
+                f"已清理可复用缓存（翻译/内容）共 {deleted} 项；"
+                "推送记录保持不变。"
+            )
+            return
+
         # 裸指令：输出支持的子命令与填写方式。
         usage = (
             "APOD 订阅管理指令："
@@ -357,6 +452,8 @@ class APOD(Star):
             + "/apod管理 订阅 —— 订阅本会话的每日推送"
             + chr(10)
             + "/apod管理 退订 —— 退订本会话的每日推送"
+            + chr(10)
+            + "/apod管理 清理 —— 清空翻译与内容缓存（不影响推送记录）"
             + chr(10)
             + "订阅名单可在插件配置页「推送/订阅名单 (UMO)」中维护"
         )
@@ -403,7 +500,7 @@ class APOD(Star):
             return self.last_apod_error or f"获取{label}失败，请稍后重试。"
         # 没有可用媒体（视频/无图）时不再判失败：消息链只带文字+原文链接。
         title_zh, explanation_zh = await self._translate_fields(
-            apod_data, include_hidden=True, umo=event.unified_msg_origin
+            apod_data, umo=event.unified_msg_origin
         )
         display_name = (
             NASA_DISPLAY_NAME if label.startswith("NASA") else PLUGIN_DISPLAY_NAME
@@ -412,8 +509,7 @@ class APOD(Star):
             apod_data,
             title_zh,
             explanation_zh,
-            include_hidden=True,
-            with_image=self.image,
+            with_media=self.send_media,
             display_name=display_name,
         )
         sent = False
@@ -425,7 +521,7 @@ class APOD(Star):
             logger.error(f"发送{label}消息链失败：{exc}")
         if (
             sent is False
-            and self.image
+            and self.send_media
             and str(apod_data.get("media_type") or "").lower() == "video"
         ):
             # 视频组件不受平台支持时，降级为“文字+原文链接”。
@@ -433,8 +529,7 @@ class APOD(Star):
                 apod_data,
                 title_zh,
                 explanation_zh,
-                include_hidden=True,
-                with_image=False,
+                with_media=False,
                 display_name=display_name,
             )
             try:
@@ -516,53 +611,81 @@ class APOD(Star):
     async def _translate_fields(
         self,
         apod_data: Dict[str, Any],
-        include_hidden: bool = False,
         umo: Optional[str] = None,
     ) -> tuple[Optional[str], Optional[str]]:
-        """按配置翻译标题与解说；相同键并发翻译自动合并为单次模型调用。"""
-        provider_id = None
+        """按发送/翻译配置翻译标题与说明。
+
+        一条请求可同时翻译两个字段；缓存仍按字段各自存放（键不变），
+        因此开关变化不会产生版本化/迁移，最多重译。
+        """
         explanation = (apod_data.get("explanation") or "").strip()
         title = (apod_data.get("title") or "").strip()
+
+        want_title = bool(title) and self.translate_title and self.send_title
+        want_explanation = (
+            bool(explanation)
+            and self.translate_explanation
+            and self.send_explanation
+        )
+        if not want_title and not want_explanation:
+            return None, None
+
+        provider_id = await self._resolve_chat_provider_id(umo)
+        if not provider_id:
+            logger.warning("未能解析翻译模型，本次使用原文。")
+            return None, None
+
         title_zh = explanation_zh = None
+        if want_title:
+            title_zh = await self.get_cache(
+                self._build_translation_cache_key(provider_id, title)
+            )
+        if want_explanation:
+            explanation_zh = await self.get_cache(
+                self._build_translation_cache_key(provider_id, explanation)
+            )
 
-        if explanation and self.explanation.get("is_translate") and (
-            include_hidden or self.explanation.get("is_show")
-        ):
-            provider_id = await self._resolve_chat_provider_id(umo)
-            explanation_zh = await self._translate_cached(explanation, provider_id)
+        need_title = want_title and title_zh is None
+        need_explanation = want_explanation and explanation_zh is None
+        if not need_title and not need_explanation:
+            return title_zh, explanation_zh
 
-        if title and self.title.get("is_translate") and (
-            include_hidden or self.title.get("is_show")
-        ):
-            if provider_id is None:
-                provider_id = await self._resolve_chat_provider_id(umo)
-            title_zh = await self._translate_cached(title, provider_id)
-
+        got_title, got_explanation = await self._translate_batch(
+            title if need_title else None,
+            explanation if need_explanation else None,
+            provider_id,
+        )
+        if need_title and got_title:
+            title_zh = got_title
+            await self._cache_translation(
+                self._build_translation_cache_key(provider_id, title), got_title
+            )
+        if need_explanation and got_explanation:
+            explanation_zh = got_explanation
+            await self._cache_translation(
+                self._build_translation_cache_key(provider_id, explanation),
+                got_explanation,
+            )
         return title_zh, explanation_zh
 
-    async def _translate_cached(
-        self, text: str, provider_id: Optional[str]
-    ) -> Optional[str]:
-        """带缓存与 single-flight 的翻译：相同键并发只调用一次模型。
-
-        模型调用或写缓存失败时返回 None（本次降级为原文），不写缓存；
-        worker 持有强引用并由 terminate 统一取消，模型调用自身受 timeout
-        预算约束；等待方超时/取消经 shield 隔离，不影响 worker 与其他
-        等待者；失败统一在 worker 内消费为 None，不留未检索的异常。
-        """
-        if provider_id is None:
-            provider_id = await self._resolve_chat_provider_id()
-        cache_key = self._build_translation_cache_key(provider_id, text)
-        cached = await self.get_cache(cache_key)
-        if cached is not None:
-            return cached
-
-        flight = self._translation_flights.get(cache_key)
+    async def _translate_batch(
+        self,
+        title: Optional[str],
+        explanation: Optional[str],
+        provider_id: str,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """一条请求翻译缺失字段；single-flight 合并并发，失败降级 (None, None)。"""
+        request_key = self._build_translation_cache_key(
+            provider_id, f"batch\x00{title or ''}\x00{explanation or ''}"
+        )
+        flight = self._translation_flights.get(request_key)
         if flight is None:
             flight = asyncio.create_task(
-                self._run_translation_flight(cache_key, text, provider_id)
+                self._run_translation_flight(
+                    request_key, title, explanation, provider_id
+                )
             )
-            self._translation_flights[cache_key] = flight
+            self._translation_flights[request_key] = flight
 
         try:
             # shield 隔离等待方取消：单个会话超时不终止共享 worker。
@@ -571,27 +694,136 @@ class APOD(Star):
             )
         except Exception as exc:
             logger.warning(f"翻译未在预算内完成，本次降级使用原文：{exc}")
-            return None
+            return None, None
 
     async def _run_translation_flight(
-        self, cache_key: str, text: str, provider_id: Optional[str]
-    ) -> Optional[str]:
-        """single-flight 工作体：模型调用限时，失败统一降级为 None 并清理表项。"""
+        self,
+        request_key: str,
+        title: Optional[str],
+        explanation: Optional[str],
+        provider_id: str,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """single-flight 工作体：模型调用限时，失败与异常统一降级为 (None, None)。"""
         try:
-            translation = await asyncio.wait_for(
-                self.translate_explanation(text, provider_id), timeout=self.timeout
+            return await asyncio.wait_for(
+                self._translate_uncached(title, explanation, provider_id),
+                timeout=self.timeout,
             )
-            if not translation or not translation.strip():
-                raise RuntimeError("翻译返回空结果")
-            await self._cache_translation(cache_key, translation)
-            return translation
         except Exception as exc:
             # 在 worker 内消费异常：即使已无等待者，
             # 也不会出现 “Future exception was never retrieved”。
             logger.warning(f"翻译执行失败，降级为原文：{exc}")
-            return None
+            return None, None
         finally:
-            self._translation_flights.pop(cache_key, None)
+            self._translation_flights.pop(request_key, None)
+
+    async def _translate_uncached(
+        self,
+        title: Optional[str],
+        explanation: Optional[str],
+        provider_id: str,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """调用模型并按结构化标签解析；解析失败按配置重试，不缓存失败结果。"""
+        want_title = title is not None
+        want_explanation = explanation is not None
+        system_prompt = self._build_translation_system_prompt(
+            want_title, want_explanation
+        )
+        prompt = self._build_translation_input(title, explanation)
+
+        best_title: Optional[str] = None
+        best_explanation: Optional[str] = None
+        attempts = self.translate_parse_retry + 1
+        for attempt in range(attempts):
+            raw = await self._call_translation_llm(system_prompt, prompt, provider_id)
+            got_title, got_explanation = self._parse_translation_response(
+                raw, want_title, want_explanation
+            )
+            best_title = got_title or best_title
+            best_explanation = got_explanation or best_explanation
+            title_ok = not want_title or got_title is not None
+            explanation_ok = not want_explanation or got_explanation is not None
+            if title_ok and explanation_ok:
+                return best_title, best_explanation
+            logger.warning(f"翻译未按标签结构返回（{attempt + 1}/{attempts}）。")
+        return best_title, best_explanation
+
+    @staticmethod
+    def _build_translation_input(
+        title: Optional[str], explanation: Optional[str]
+    ) -> str:
+        # 输入与输出使用同一组标签：模型只需把标签里的内容翻译后放回。
+        parts = []
+        if title is not None:
+            parts.append(f"<title>{title}</title>")
+        if explanation is not None:
+            parts.append(f"<explanation>{explanation}</explanation>")
+        return chr(10).join(parts)
+
+    @staticmethod
+    def _build_translation_system_prompt(
+        want_title: bool, want_explanation: bool
+    ) -> str:
+        if want_title and want_explanation:
+            task = "把标签内的标题与说明分别翻译为简体中文"
+        elif want_title:
+            task = "把标签内的标题翻译为简体中文"
+        else:
+            task = "把标签内的说明翻译为简体中文"
+
+        lines = [
+            "你是一位精通天文学的翻译专家。",
+            f"一、遵循「信、达、雅」，{task}；",
+            "二、专有名词与编号保留原形（如 67P、ISS、APOD）；",
+        ]
+        if want_title:
+            lines.append("三、标题：不可译则不译，原样输出；单行，不加句号；")
+        lines.append(
+            f"{'四' if want_title else '三'}、禁止项：不要添加原文没有的 markdown、"
+            "引号、列表或解释文字。"
+        )
+        lines.append("只输出以下结构，标签之外不要有任何字符：")
+        if want_title:
+            lines.append("<title>译好的标题</title>")
+        if want_explanation:
+            lines.append("<explanation>译好的说明</explanation>")
+        lines.append("以上内容将直接用于发布，不经过二次编辑。")
+        return chr(10).join(lines)
+
+    @staticmethod
+    def _strip_code_fence(text: str) -> str:
+        # 模型偶尔自作主张包代码块；剥掉最外层围栏，标签外内容反正会被忽略。
+        return re.sub(r"^```[A-Za-z0-9_-]*\s*|\s*```$", "", text.strip()).strip()
+
+    @classmethod
+    def _parse_translation_response(
+        cls, text: Optional[str], want_title: bool, want_explanation: bool
+    ) -> tuple[Optional[str], Optional[str]]:
+        cleaned = cls._strip_code_fence(text or "")
+        if not cleaned:
+            return None, None
+
+        def grab(tag: str) -> Optional[str]:
+            matched = re.search(
+                rf"<{tag}\b[^>]*>(.*?)</{tag}>", cleaned, re.S | re.I
+            )
+            return matched.group(1).strip() if matched else None
+
+        title = grab("title") if want_title else None
+        explanation = grab("explanation") if want_explanation else None
+        # 单字段请求且模型没写标签 → 整体兜底；但标题必须是短单行，
+        # 否则视为解析失败（防小作文从无标签路径混进来）。
+        if want_title and not want_explanation and title is None:
+            candidate = cleaned.splitlines()[0].strip() if cleaned else ""
+            if candidate and len(candidate) <= 40:
+                title = candidate
+        if want_explanation and not want_title and explanation is None:
+            explanation = cleaned
+        if title is not None:
+            title = title.splitlines()[0].strip().rstrip("。.．") or None
+        if explanation is not None:
+            explanation = explanation.strip() or None
+        return title, explanation
 
     @staticmethod
     def _format_date_cn(date_str: str) -> str:
@@ -607,13 +839,12 @@ class APOD(Star):
         apod_data: Dict[str, Any],
         title_zh: Optional[str],
         explanation_zh: Optional[str],
-        include_hidden: bool = False,
         display_name: str = PLUGIN_DISPLAY_NAME,
     ) -> str:
         """生成“品牌头 + 标题/日期/版权 + 空行 + 说明”的正文。"""
-        show_title = include_hidden or self.title.get("is_show")
-        show_date = include_hidden or self.date.get("is_show")
-        show_explanation = include_hidden or self.explanation.get("is_show")
+        show_title = self.send_title
+        show_date = self.send_date
+        show_explanation = self.send_explanation
 
         title = (title_zh or apod_data.get("title") or "").strip()
         title_raw = str(apod_data.get("title") or "").strip()
@@ -666,24 +897,16 @@ class APOD(Star):
             logger.warning(f"获取 AstrBot 当前对话模型失败：{exc}")
         return None
 
-    async def translate_explanation(
-        self, explanation: str, provider_id: Optional[str] = None
-    ) -> str:
-        provider_id = provider_id or await self._resolve_chat_provider_id()
-        if not provider_id:
-            raise RuntimeError(
-                "翻译不可用：插件未配置 provider，且 AstrBot 没有可用的默认对话模型。"
-            )
+    async def _call_translation_llm(
+        self, system_prompt: str, prompt: str, provider_id: str
+    ) -> Optional[str]:
         logger.info(f"正在翻译 APOD 内容（provider={provider_id}）...")
         llm_resp = await self.context.llm_generate(
             chat_provider_id=provider_id,
-            system_prompt=(
-                "You are a professional astronomy translator. Translate the input text "
-                "into Simplified Chinese accurately, and do not add any extra explanation."
-            ),
-            prompt=explanation,
+            system_prompt=system_prompt,
+            prompt=prompt,
         )
-        return llm_resp.completion_text
+        return llm_resp.completion_text if llm_resp else None
 
     # “拉取并写入缓存”集中到这里，apod / nasa 最新内容共用同一套缓存语义。
     async def _refresh_cached_data(
@@ -1406,21 +1629,16 @@ class APOD(Star):
         if not pending:
             return True
 
-        title_zh, explanation_zh = (None, None)
-        if self.push_translate:
-            title_zh, explanation_zh = await self._translate_fields(
-                apod_data, include_hidden=True
-            )
+        title_zh, explanation_zh = await self._translate_fields(apod_data)
         chain = self._build_message_chain(
             apod_data,
             title_zh,
             explanation_zh,
-            include_hidden=True,
-            with_image=self.push_send_image,
+            with_media=self.send_media,
         )
         fallback = None
         if (
-            self.push_send_image
+            self.send_media
             and str(apod_data.get("media_type") or "").lower() == "video"
         ):
             # 视频组件发送不成功时降级为“文字+原文链接”，保证推送不丢消息。
@@ -1428,8 +1646,7 @@ class APOD(Star):
                 apod_data,
                 title_zh,
                 explanation_zh,
-                include_hidden=True,
-                with_image=False,
+                with_media=False,
             )
         delivered = 0
         for umo in pending:
@@ -1458,14 +1675,13 @@ class APOD(Star):
         apod_data: Dict[str, Any],
         title_zh: Optional[str],
         explanation_zh: Optional[str],
-        include_hidden: bool = False,
-        with_image: bool = True,
+        with_media: bool = True,
         display_name: str = PLUGIN_DISPLAY_NAME,
     ) -> MessageChain:
         chain = []
         url = apod_data.get("hdurl") or apod_data.get("url")
         media_type = str(apod_data.get("media_type") or "").strip().lower()
-        if with_image and url:
+        if with_media and url:
             if media_type == "video":
                 chain.append(Comp.Video.fromURL(url))
             else:
@@ -1474,7 +1690,6 @@ class APOD(Star):
             apod_data,
             title_zh,
             explanation_zh,
-            include_hidden=include_hidden,
             display_name=display_name,
         )
         if text:

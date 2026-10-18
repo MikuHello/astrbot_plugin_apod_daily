@@ -1,14 +1,16 @@
-"""APOD 视频型条目修复的回归测试。
+"""APOD 插件修复的回归测试。
 
 本机没有安装 astrbot，测试前用最小桩替换 `astrbot.*` 依赖，
-再直接从源码路径加载 main.py，只覆盖纯解析/渲染逻辑。
+再直接从源码路径加载 main.py，只覆盖纯解析/渲染/编排逻辑。
 """
+import asyncio
 import importlib.util
 import logging
 import sys
 import types
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO_DIR = Path(__file__).resolve().parent.parent
 MAIN_PATH = REPO_DIR / "main.py"
@@ -71,6 +73,18 @@ RSS_VIDEO = f"""<?xml version="1.0" encoding="UTF-8"?>
 </channel>
 </rss>
 """
+
+
+class _FakeSP:
+    def __init__(self):
+        self.prefs = []
+        self.removed = []
+
+    async def range_get_async(self, scope, scope_id, key=None):
+        return list(self.prefs)
+
+    async def remove_async(self, scope, scope_id, key):
+        self.removed.append(key)
 
 
 def _install_astrbot_stubs():
@@ -168,6 +182,9 @@ def _install_astrbot_stubs():
 
     star.Context, star.Star, star.register = Context, Star, register
 
+    core = mod("astrbot.core")
+    core.sp = _FakeSP()
+
     # aiohttp 只在网络层使用，解析/渲染测试不需要真实实现。
     aiohttp = mod("aiohttp")
 
@@ -195,13 +212,28 @@ sys.modules["apod_main"] = apod_main
 _spec.loader.exec_module(apod_main)
 
 
-def _make_plugin():
-    plugin = apod_main.APOD(None, {})
-    plugin.image = True
+class _FakeConfig(dict):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.saved = 0
+
+    async def save_config_async(self):
+        self.saved += 1
+
+
+def _make_plugin(config=None):
+    plugin = apod_main.APOD(None, config if config is not None else {})
+    plugin.plugin_id = "mikuhello/astrbot_plugin_apod_daily"
+    plugin.send_media = True
+    plugin.send_title = True
+    plugin.send_explanation = True
+    plugin.send_date = True
+    plugin.translate_title = True
+    plugin.translate_explanation = True
+    plugin.translate_parse_retry = 1
+    plugin.translate_cache_limit = 1000
     plugin.is_divided = True
-    plugin.title = {"is_show": True}
-    plugin.date = {"is_show": True}
-    plugin.explanation = {"is_show": True}
+    plugin.timeout = 30
     return plugin
 
 
@@ -291,6 +323,15 @@ class RenderingTests(unittest.TestCase):
         self.assertIn(f"原文链接：{LINK}", text)
         self.assertIn("Eric Holland", text)
 
+    def test_display_text_honours_send_flags(self):
+        self.plugin.send_title = False
+        self.plugin.send_date = False
+        self.plugin.send_explanation = False
+        text = self.plugin._build_display_text(self._video_data(), None, None)
+        self.assertNotIn("标题：", text)
+        self.assertNotIn("日期：", text)
+        self.assertNotIn("说明：", text)
+
     def test_display_text_other_shows_link_warning(self):
         data = self.plugin._build_apod_data("APOD: title", LINK, NO_MEDIA_ARTICLE)
         text = self.plugin._build_display_text(data, None, None)
@@ -303,12 +344,286 @@ class RenderingTests(unittest.TestCase):
         self.assertIsInstance(chain.chain[-1], _COMP.Plain)
         self.assertEqual(chain.chain[0].file, MP4)
 
-    def test_message_chain_with_image_false_is_text_only(self):
+    def test_message_chain_with_media_false_is_text_only(self):
         chain = self.plugin._build_message_chain(
-            self._video_data(), None, None, with_image=False
+            self._video_data(), None, None, with_media=False
         )
         self.assertEqual(len(chain.chain), 1)
         self.assertIsInstance(chain.chain[0], _COMP.Plain)
+
+
+class TranslationPromptTests(unittest.TestCase):
+    def setUp(self):
+        self.plugin = _make_plugin()
+
+    def test_both_fields_prompt(self):
+        prompt = self.plugin._build_translation_system_prompt(True, True)
+        self.assertIn("信、达、雅", prompt)
+        self.assertIn("专有名词与编号保留原形", prompt)
+        self.assertIn("不可译则不译", prompt)
+        self.assertIn("禁止项", prompt)
+        self.assertIn("直接用于发布", prompt)
+        self.assertIn("<title>译好的标题</title>", prompt)
+        self.assertIn("<explanation>译好的说明</explanation>", prompt)
+
+    def test_title_only_prompt(self):
+        prompt = self.plugin._build_translation_system_prompt(True, False)
+        self.assertIn("<title>译好的标题</title>", prompt)
+        self.assertNotIn("<explanation>", prompt)
+
+    def test_input_uses_same_tags(self):
+        text = self.plugin._build_translation_input("3D 67P", "Explained here.")
+        self.assertIn("<title>3D 67P</title>", text)
+        self.assertIn("<explanation>Explained here.</explanation>", text)
+
+
+class TranslationParseTests(unittest.TestCase):
+    def setUp(self):
+        self.plugin = _make_plugin()
+
+    def test_parse_both_fields(self):
+        title, expl = self.plugin._parse_translation_response(
+            "<title>67P 彗星的三维图</title>\n<explanation>这是说明。</explanation>",
+            True,
+            True,
+        )
+        self.assertEqual(title, "67P 彗星的三维图")
+        self.assertEqual(expl, "这是说明。")
+
+    def test_parse_strips_outer_code_fence_and_prose(self):
+        raw = (
+            "好的，以下是翻译：\n```xml\n"
+            "<title>67P 彗星的三维图</title>\n"
+            "<explanation>这是说明。</explanation>\n```\n请查收。"
+        )
+        title, expl = self.plugin._parse_translation_response(raw, True, True)
+        self.assertEqual(title, "67P 彗星的三维图")
+        self.assertEqual(expl, "这是说明。")
+
+    def test_title_takes_first_line_and_drops_period(self):
+        title, _ = self.plugin._parse_translation_response(
+            "<title>67P 彗星的三维图。\n多余第二行</title>", True, False
+        )
+        self.assertEqual(title, "67P 彗星的三维图")
+
+    def test_single_field_falls_back_to_whole_text(self):
+        title, _ = self.plugin._parse_translation_response("3D 67P", True, False)
+        self.assertEqual(title, "3D 67P")
+
+    def test_single_field_essay_fallback_is_rejected(self):
+        essay = (
+            "3D 67P 是一个天文学术语的组合，需要更多上下文才能准确翻译。"
+            "如果是指 67P/Churyumov-Gerasimenko，则可译为 67P彗星的三维图。"
+        )
+        title, _ = self.plugin._parse_translation_response(essay, True, False)
+        self.assertIsNone(title)
+
+    def test_unclosed_tag_is_a_failure(self):
+        title, expl = self.plugin._parse_translation_response(
+            "<title>67P 彗星的三维图</title><explanation>被截断的说明", True, True
+        )
+        self.assertEqual(title, "67P 彗星的三维图")
+        self.assertIsNone(expl)
+
+
+class _FakeContext:
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.calls = []
+
+    async def llm_generate(self, chat_provider_id=None, system_prompt=None, prompt=None, **kwargs):
+        self.calls.append({"system_prompt": system_prompt, "prompt": prompt})
+        return SimpleNamespace(completion_text=self.replies.pop(0))
+
+
+class TranslationFlowTests(unittest.TestCase):
+    def setUp(self):
+        self.plugin = _make_plugin()
+
+    def test_one_call_translates_both_fields(self):
+        self.plugin.context = _FakeContext(
+            ["<title>三维 67P</title><explanation>说明译文。</explanation>"]
+        )
+        title, expl = asyncio.run(
+            self.plugin._translate_uncached("3D 67P", "English text.", "prov")
+        )
+        self.assertEqual(title, "三维 67P")
+        self.assertEqual(expl, "说明译文。")
+        self.assertEqual(len(self.plugin.context.calls), 1)
+
+    def test_parse_failure_retries_then_succeeds(self):
+        self.plugin.translate_parse_retry = 1
+        self.plugin.context = _FakeContext(
+            [
+                "3D 67P 是一个天文学术语的组合，需要更多上下文……",
+                "<title>三维 67P</title><explanation>说明译文。</explanation>",
+            ]
+        )
+        title, expl = asyncio.run(
+            self.plugin._translate_uncached("3D 67P", "English text.", "prov")
+        )
+        self.assertEqual(title, "三维 67P")
+        self.assertEqual(len(self.plugin.context.calls), 2)
+
+    def test_no_retry_returns_partial(self):
+        self.plugin.translate_parse_retry = 0
+        self.plugin.context = _FakeContext(["<title>三维 67P</title>没有说明标签"])
+        title, expl = asyncio.run(
+            self.plugin._translate_uncached("3D 67P", "English text.", "prov")
+        )
+        self.assertEqual(title, "三维 67P")
+        self.assertIsNone(expl)
+
+
+class TranslationFieldFlowTests(unittest.TestCase):
+    def setUp(self):
+        self.plugin = _make_plugin()
+        self.store = {}
+
+        async def get_cache(key):
+            return self.store.get(key)
+
+        async def put_cache(key, value):
+            self.store[key] = value
+
+        async def delete_cache(key):
+            self.store.pop(key, None)
+
+        async def resolve(umo=None):
+            return "prov"
+
+        self.plugin.get_cache = get_cache
+        self.plugin.put_cache = put_cache
+        self.plugin.delete_cache = delete_cache
+        self.plugin._resolve_chat_provider_id = resolve
+        self.plugin.context = _FakeContext(
+            ["<title>三维 67P</title><explanation>说明译文。</explanation>"]
+        )
+
+    def test_translate_fields_uses_one_request_and_caches_per_field(self):
+        title, expl = asyncio.run(
+            self.plugin._translate_fields(
+                {"title": "3D 67P", "explanation": "English text."}
+            )
+        )
+        self.assertEqual((title, expl), ("三维 67P", "说明译文。"))
+        self.assertEqual(len(self.plugin.context.calls), 1)
+        key_title = self.plugin._build_translation_cache_key("prov", "3D 67P")
+        key_expl = self.plugin._build_translation_cache_key("prov", "English text.")
+        self.assertEqual(self.store[key_title], "三维 67P")
+        self.assertEqual(self.store[key_expl], "说明译文。")
+
+    def test_second_call_hits_field_cache(self):
+        payload = {"title": "3D 67P", "explanation": "English text."}
+        asyncio.run(self.plugin._translate_fields(payload))
+        asyncio.run(self.plugin._translate_fields(payload))
+        self.assertEqual(len(self.plugin.context.calls), 1)
+
+    def test_only_title_is_requested_when_explanation_not_sent(self):
+        self.plugin.send_explanation = False
+        title, expl = asyncio.run(
+            self.plugin._translate_fields(
+                {"title": "3D 67P", "explanation": "English text."}
+            )
+        )
+        self.assertEqual(title, "三维 67P")
+        self.assertIsNone(expl)
+        prompt = self.plugin.context.calls[0]["system_prompt"]
+        self.assertNotIn("<explanation>", prompt)
+
+
+class ConfigMigrationTests(unittest.TestCase):
+    def _plugin_with_cache(self, config):
+        plugin = _make_plugin(config)
+        store = {}
+
+        async def get_cache(key):
+            return store.get(key)
+
+        async def put_cache(key, value):
+            store[key] = value
+
+        plugin.get_cache = get_cache
+        plugin.put_cache = put_cache
+        return plugin, store
+
+    def test_migrate_old_flat_config(self):
+        config = _FakeConfig(
+            {
+                "image": False,
+                "title": {"is_show": True, "is_translate": False},
+                "explanation": {"is_show": False, "is_translate": True},
+                "date": {"is_show": True},
+                "provider": "liming/claude-opus-4-6",
+                "push": {"send_image": False, "translate": True, "sessions": []},
+            }
+        )
+        plugin, store = self._plugin_with_cache(config)
+        asyncio.run(plugin._migrate_config())
+        self.assertEqual(config["send"]["media"], False)
+        self.assertEqual(config["send"]["title"], True)
+        self.assertEqual(config["send"]["explanation"], False)
+        self.assertEqual(config["send"]["date"], True)
+        self.assertEqual(config["translate"]["title"], False)
+        self.assertEqual(config["translate"]["explanation"], True)
+        self.assertEqual(config["translate"]["provider"], "liming/claude-opus-4-6")
+        self.assertTrue(store.get("config_layout_v2"))
+        self.assertEqual(config.saved, 1)
+
+    def test_migration_is_idempotent(self):
+        config = _FakeConfig({"send": {"media": False}, "translate": {"title": False}})
+        plugin, store = self._plugin_with_cache(config)
+        store["config_layout_v2"] = True
+        asyncio.run(plugin._migrate_config())
+        self.assertEqual(config.saved, 0)
+        self.assertEqual(config["send"]["media"], False)
+
+    def test_second_run_keeps_new_values(self):
+        config = _FakeConfig({"image": False, "send": {"media": True}})
+        plugin, _ = self._plugin_with_cache(config)
+        asyncio.run(plugin._migrate_config())
+        self.assertEqual(config["send"]["media"], False)
+        # 用户在新分组里改回 true，再次加载不得被旧键覆盖。
+        config["send"]["media"] = True
+        asyncio.run(plugin._migrate_config())
+        self.assertEqual(config["send"]["media"], True)
+
+
+class ClearCacheTests(unittest.TestCase):
+    def test_clear_keeps_push_state(self):
+        import astrbot.core as core
+
+        plugin = _make_plugin()
+        removed = []
+
+        async def fake_delete(key):
+            removed.append(key)
+
+        plugin.delete_cache = fake_delete
+        core.sp.prefs = [
+            SimpleNamespace(key="translate_cache:aaa"),
+            SimpleNamespace(key="translate_cache_index"),
+            SimpleNamespace(key="apod_cache"),
+            SimpleNamespace(key="nasa_cache"),
+            SimpleNamespace(key="last_pushed_apod"),
+            SimpleNamespace(key="pushed_by_session"),
+        ]
+        plugin._stale_apod = {"x": 1}
+        plugin._stale_nasa = {"y": 1}
+        plugin._refresh_cooldowns["apod_cache"] = object()
+
+        count = asyncio.run(plugin._clear_reusable_caches())
+
+        self.assertEqual(count, 4)
+        self.assertIn("translate_cache:aaa", removed)
+        self.assertIn("translate_cache_index", removed)
+        self.assertIn("apod_cache", removed)
+        self.assertIn("nasa_cache", removed)
+        self.assertNotIn("last_pushed_apod", removed)
+        self.assertNotIn("pushed_by_session", removed)
+        self.assertIsNone(plugin._stale_apod)
+        self.assertIsNone(plugin._stale_nasa)
+        self.assertEqual(plugin._refresh_cooldowns, {})
 
 
 if __name__ == "__main__":
