@@ -230,10 +230,10 @@ class APOD(Star):
             translate_cfg["explanation"] = bool(old_expl.get("is_translate"))
         if self.config.get("provider"):
             translate_cfg["provider"] = str(self.config.get("provider"))
-        # 旧推送翻译开关：仅作为兼容来源，统一归一到翻译配置。
-        if push_cfg.get("translate") is True:
-            translate_cfg.setdefault("title", True)
-            translate_cfg.setdefault("explanation", True)
+        # 旧推送翻译开关：false 表示当时不想翻译，归一为全局翻译关闭。
+        if push_cfg.get("translate") is False:
+            translate_cfg["title"] = False
+            translate_cfg["explanation"] = False
 
         await self.put_cache("config_layout_v2", True)
         await self.config.save_config_async()
