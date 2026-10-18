@@ -1920,16 +1920,29 @@ class APOD(Star):
         try:
             if not os.path.exists(path):
                 os.makedirs(os.path.dirname(path), exist_ok=True)
+                tmp_path = path + ".part"
                 timeout = aiohttp.ClientTimeout(total=self.timeout)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(url) as response:
-                        if response.status != 200:
-                            raise RuntimeError(f"状态码={response.status}")
-                        data = await response.read()
-                if not data:
-                    raise RuntimeError("空响应")
-                with open(path, "wb") as handle:
-                    handle.write(data)
+                try:
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        async with session.get(url) as response:
+                            if response.status != 200:
+                                raise RuntimeError(f"状态码={response.status}")
+                            written = 0
+                            with open(tmp_path, "wb") as handle:
+                                async for chunk in response.content.iter_chunked(
+                                    65536
+                                ):
+                                    handle.write(chunk)
+                                    written += len(chunk)
+                    if not written:
+                        raise RuntimeError("空响应")
+                    os.replace(tmp_path, path)
+                except Exception:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                    raise
             await self._touch_image_cache(path)
             return path
         except Exception as exc:
