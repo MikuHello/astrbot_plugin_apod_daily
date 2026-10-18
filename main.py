@@ -58,7 +58,7 @@ RANDOM_POST_LINK_PATTERN = re.compile(
     r"https://science\.nasa\.gov/image-article/[^\s\"'<>]+"
 )
 CREDIT_PREFIX_PATTERN = re.compile(
-    r"^(?:Image\s+)?Credit(?:\s*&\s*Copyright)?\s*:\s*", re.IGNORECASE
+    r"^(?:(?:Image|Video)\s+)?Credit(?:\s*&\s*Copyright)?\s*:\s*", re.IGNORECASE
 )
 # NASA 每日一图（IOTD）：无 feed/REST/日期元数据，只能抓两级页面；
 # og:image 即主图，展示日期按美东抓取日（与官网“当日”语义一致）。
@@ -66,7 +66,10 @@ NASA_PAGE_URL = "https://www.nasa.gov/image-of-the-day/"
 NASA_POST_LINK_PATTERN = re.compile(
     r"https://www\.nasa\.gov/image-article/[^\s\"'<>]+"
 )
-PLACEHOLDER_MARKS = ("nasa-logo", "/themes/")
+# 视频型条目（如 2026-10-16 的猎鹰9号延时摄影）：science.nasa.gov 不给海报帧，
+# og:image 会退化成 NASA logo，真正的媒体是 og:video / <video><source src> 直链。
+# 注意 logo 的 URL 实际是 NASA_logo-1.png（下划线），两种写法都要拦截。
+PLACEHOLDER_MARKS = ("nasa-logo", "nasa_logo", "/themes/")
 
 
 # 文章发布时间只认这两种 meta 名，不拿更新时间冒充。
@@ -79,8 +82,10 @@ class _HTMLAttrParser(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.og_image = ""
+        self.og_video = ""
         self.published_meta = ""
         self.img_srcs = []
+        self.video_srcs = []
 
     def handle_starttag(self, tag, attrs):
         attrs_map = {name.lower(): value or "" for name, value in attrs}
@@ -89,16 +94,24 @@ class _HTMLAttrParser(HTMLParser):
             key = key.lower() if key else ""
             if key == "og:image" and not self.og_image:
                 self.og_image = attrs_map.get("content", "")
+            elif key in OG_VIDEO_META_KEYS and not self.og_video:
+                self.og_video = attrs_map.get("content", "")
             elif key in PUBLISHED_META_KEYS and not self.published_meta:
                 self.published_meta = attrs_map.get("content", "")
         elif tag == "img" and attrs_map.get("src"):
             self.img_srcs.append(attrs_map["src"])
+        elif tag in ("video", "source") and attrs_map.get("src"):
+            # <video src> 与 <video><source src> 都算候选视频直链。
+            self.video_srcs.append(attrs_map["src"])
 IMAGE_URL_SOURCES = (
     "assets.science.nasa.gov",
     "apod.nasa.gov/apod/image",
     "images-assets.nasa.gov",
     "wp-content/uploads",
 )
+# 视频直链：优先看扩展名，同时兼容 og:video 的多种 property 写法。
+VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".m4v", ".ogv", ".m3u8")
+OG_VIDEO_META_KEYS = ("og:video", "og:video:url", "og:video:secure_url")
 EXPLANATION_STOP_MARKERS = (
     "APOD's main NASA site is moving",
     "Tomorrow's picture",
@@ -258,15 +271,16 @@ class APOD(Star):
         self, event: AstrMessageEvent, apod_data: dict, display_name: str = PLUGIN_DISPLAY_NAME
     ):
         """按展示配置渲染并发送某一期内容（apod 今日/随机、nasa 共用）。"""
-        # 当要求返回图片时，如果该期 APOD 不是图片类型，就直接视为失败。
-        if apod_data.get("media_type") != "image" and self.image:
-            yield event.plain_result("这一期 APOD 不是图片类型，请稍后再试。")
-            return
-
+        media_type = str(apod_data.get("media_type") or "").strip().lower()
         url = apod_data.get("hdurl") or apod_data.get("url")
-        if not url and self.image:
-            yield event.plain_result("获取 APOD 图片链接失败，请稍后重试。")
-            return
+        # 图片/视频都可以直接作为媒体发送；没有可用媒体时降级为文字+链接，
+        # 不再把视频型条目当成错误回退。
+        media_component = None
+        if self.image and url:
+            if media_type == "video":
+                media_component = Comp.Video.fromURL(url)
+            else:
+                media_component = Comp.Image.fromURL(url)
 
         title_zh, explanation_zh = await self._translate_fields(
             apod_data, umo=event.unified_msg_origin
@@ -278,9 +292,12 @@ class APOD(Star):
         if self.is_divided:
             # 图片一条、文本一条。
             has_output = False
-            if self.image and url:
+            if media_component is not None:
                 has_output = True
-                yield event.image_result(url)
+                if media_type == "video":
+                    yield event.chain_result([media_component])
+                else:
+                    yield event.image_result(url)
             if display_text:
                 has_output = True
                 yield event.plain_result(display_text)
@@ -288,10 +305,10 @@ class APOD(Star):
                 yield event.plain_result("当前配置未启用任何可返回的内容。")
             return
 
-        # 图 + 文聚合为一条消息链。
+        # 图/视频 + 文聚合为一条消息链。
         chain = []
-        if self.image and url:
-            chain.append(Comp.Image.fromURL(url))
+        if media_component is not None:
+            chain.append(media_component)
         if display_text:
             chain.append(Comp.Plain(display_text))
         if not chain:
@@ -384,8 +401,7 @@ class APOD(Star):
     ) -> str:
         if apod_data is None:
             return self.last_apod_error or f"获取{label}失败，请稍后重试。"
-        if self.image and not (apod_data.get("hdurl") or apod_data.get("url")):
-            return "这一期内容不是图片类型，无法展示。"
+        # 没有可用媒体（视频/无图）时不再判失败：消息链只带文字+原文链接。
         title_zh, explanation_zh = await self._translate_fields(
             apod_data, include_hidden=True, umo=event.unified_msg_origin
         )
@@ -400,11 +416,35 @@ class APOD(Star):
             with_image=self.image,
             display_name=display_name,
         )
+        sent = False
         try:
-            sent = await self.context.send_message(event.unified_msg_origin, message)
+            sent = await self.context.send_message(
+                event.unified_msg_origin, message
+            )
         except Exception as exc:
             logger.error(f"发送{label}消息链失败：{exc}")
-            return f"{label}发送失败，请提示用户稍后重试。"
+        if (
+            sent is False
+            and self.image
+            and str(apod_data.get("media_type") or "").lower() == "video"
+        ):
+            # 视频组件不受平台支持时，降级为“文字+原文链接”。
+            fallback = self._build_message_chain(
+                apod_data,
+                title_zh,
+                explanation_zh,
+                include_hidden=True,
+                with_image=False,
+                display_name=display_name,
+            )
+            try:
+                sent = await self.context.send_message(
+                    event.unified_msg_origin, fallback
+                )
+                logger.info(f"{label}视频发送失败，已降级为文字+链接。")
+            except Exception as exc:
+                logger.error(f"发送{label}降级消息链失败：{exc}")
+                sent = False
         if sent is False:
             logger.warning(f"发送{label}：未匹配到消息平台。")
             return f"{label}发送失败：未找到可用的消息平台。"
@@ -583,6 +623,8 @@ class APOD(Star):
 
         newline = chr(10)
         lines = [display_name]
+        media_type = str(apod_data.get("media_type") or "").strip().lower()
+        link = str(apod_data.get("link") or "").strip()
         if show_title and title:
             # 有译文且与原文不同时，展示“译文（原文）”；否则只展示其一
             if title_zh and title_raw and title_zh.strip() != title_raw:
@@ -591,8 +633,15 @@ class APOD(Star):
                 lines.append(f"标题：{title}")
         if show_date and date_cn:
             lines.append(f"日期：{date_cn}")
+        if media_type == "video":
+            lines.append("▶ 本期为视频")
+        elif media_type not in ("image", ""):
+            lines.append("⚠️ 本期无可用图片，可查看原文")
         if credit:
             lines.append(f"{CREDIT_LABEL}：{credit}")
+        # 非图片条目（视频/无媒体）必须把原文链接带上，避免只剩文字。
+        if link and media_type != "image":
+            lines.append(f"原文链接：{link}")
         text = newline.join(lines)
         if show_explanation and explanation:
             text = (
@@ -888,6 +937,9 @@ class APOD(Star):
         image_url = html_lib.unescape(page_parser.og_image).strip()
         if image_url and not self._is_usable_image(image_url):
             image_url = ""
+        video_url = html_lib.unescape(page_parser.og_video).strip()
+        if video_url and not self._is_usable_video(video_url):
+            video_url = ""
         if not image_url:
             region_parser = _HTMLAttrParser()
             region_parser.feed(region)
@@ -903,8 +955,8 @@ class APOD(Star):
         for p in re.findall(r"<p[^>]*>(.*?)</p>", region, re.S):
             text = self._strip_html(p)
             lowered = text.lower()
-            if not credit and lowered.startswith("image credit:"):
-                credit = text[len("Image credit:") :].strip()
+            if not credit and lowered.startswith(("image credit:", "video credit:")):
+                credit = text.split(":", 1)[1].strip()
                 continue
             if lowered.startswith(("learn more", "image article")):
                 continue
@@ -925,6 +977,7 @@ class APOD(Star):
             explanation=explanation,
             credit=credit or None,
             image_url=image_url,
+            video_url=video_url,
         )
 
     async def _fetch_text(
@@ -978,13 +1031,28 @@ class APOD(Star):
                 continue
             content_html = ""
             pub_date_raw = ""
+            enclosure_url = ""
             for child in item:
                 tag = child.tag.rsplit("}", 1)[-1]
                 if tag == "encoded":
                     content_html = child.text or ""
                 elif tag == "pubDate":
                     pub_date_raw = (child.text or "").strip()
-            return self._build_apod_data(title_raw, link, content_html, pub_date_raw)
+                elif tag in ("enclosure", "content") and not enclosure_url:
+                    # RSS enclosure / media:content 里 type="video/..." 或
+                    # medium="video" 的 url 就是视频直链。
+                    media_kind = " ".join(
+                        (
+                            child.attrib.get("type", ""),
+                            child.attrib.get("medium", ""),
+                        )
+                    ).lower()
+                    candidate = child.attrib.get("url", "")
+                    if candidate and "video" in media_kind:
+                        enclosure_url = candidate
+            return self._build_apod_data(
+                title_raw, link, content_html, pub_date_raw, video_url=enclosure_url
+            )
         logger.warning("NASA feed 中未找到 APOD 条目。")
         return None
 
@@ -1065,13 +1133,18 @@ class APOD(Star):
     @classmethod
     def _credit_from_meta_rows(cls, content_html: str) -> str:
         for label, value in cls._parse_meta_rows(content_html or ""):
-            if label.lower().startswith("credit"):
+            if "credit" in label.lower():
                 return CREDIT_PREFIX_PATTERN.sub("", value).strip()
         return ""
 
     @staticmethod
     def _credit_from_markers(normalized_text: str, plain_text: str) -> str:
-        for credit_marker in ("Credit & Copyright:", "Image Credit:", "Credit:"):
+        for credit_marker in (
+            "Video Credit:",
+            "Credit & Copyright:",
+            "Image Credit:",
+            "Credit:",
+        ):
             marker_index = normalized_text.find(credit_marker)
             if marker_index < 0:
                 continue
@@ -1097,6 +1170,7 @@ class APOD(Star):
         explanation: Optional[str] = None,
         credit: Optional[str] = None,
         image_url: Optional[str] = None,
+        video_url: Optional[str] = None,
     ) -> Optional[dict]:
         plain_text = self._strip_html(META_ROW_PATTERN.sub(" ", content_html or ""))
         # 原文的撇号是 U+2019（’），标记匹配前统一映射为 ASCII 撇号；
@@ -1116,14 +1190,29 @@ class APOD(Star):
             if not explanation:
                 explanation = self._fallback_explanation(content_html)
 
+        content_parser = _HTMLAttrParser()
+        content_parser.feed(content_html or "")
         if not image_url:
-            content_parser = _HTMLAttrParser()
-            content_parser.feed(content_html or "")
             for src in content_parser.img_srcs:
                 candidate = html_lib.unescape(src).strip()
                 if self._is_usable_image(candidate):
                     image_url = candidate
                     break
+
+        # 视频直链候选：显式传入（feed enclosure / NASA og:video）→ og:video →
+        # 正文 <video>/<source>；任何一个可用即按视频条目处理。
+        video_candidates = (
+            video_url,
+            content_parser.og_video,
+            *content_parser.video_srcs,
+        )
+        for candidate in video_candidates:
+            candidate = html_lib.unescape(candidate or "").strip()
+            if self._is_usable_video(candidate):
+                video_url = candidate
+                break
+        else:
+            video_url = ""
 
         title_matched = FEED_TITLE_PREFIX_PATTERN.match(title_raw or "")
         title = (
@@ -1143,14 +1232,21 @@ class APOD(Star):
             logger.error(f"内容信息不完整：link={link!r}")
             return None
 
+        if image_url:
+            media_type, media_url = "image", image_url
+        elif video_url:
+            media_type, media_url = "video", video_url
+        else:
+            media_type, media_url = "other", None
+
         return {
             "date": date_str,
             "title": title,
             "explanation": explanation,
             "credit": credit,
-            "url": image_url,
-            "hdurl": image_url,
-            "media_type": "image" if image_url else "other",
+            "url": media_url,
+            "hdurl": media_url,
+            "media_type": media_type,
             "service_version": "science.nasa.gov",
             "link": link,
         }
@@ -1163,6 +1259,17 @@ class APOD(Star):
         if any(mark in lowered for mark in PLACEHOLDER_MARKS):
             return False
         return any(source in lowered for source in IMAGE_URL_SOURCES)
+
+    @staticmethod
+    def _is_usable_video(url: str) -> bool:
+        """视频直链判定：只认 http(s) 且路径以已知视频扩展名结尾，拦截 logo 占位。"""
+        if not url.startswith("http"):
+            return False
+        lowered = url.lower()
+        if any(mark in lowered for mark in PLACEHOLDER_MARKS):
+            return False
+        path = lowered.split("?", 1)[0].split("#", 1)[0]
+        return path.endswith(VIDEO_EXTENSIONS)
 
     # ---------- 时区工具（pubDate 兜底换算与“最新一期”探测用） ----------
 
@@ -1311,17 +1418,22 @@ class APOD(Star):
             include_hidden=True,
             with_image=self.push_send_image,
         )
+        fallback = None
+        if (
+            self.push_send_image
+            and str(apod_data.get("media_type") or "").lower() == "video"
+        ):
+            # 视频组件发送不成功时降级为“文字+原文链接”，保证推送不丢消息。
+            fallback = self._build_message_chain(
+                apod_data,
+                title_zh,
+                explanation_zh,
+                include_hidden=True,
+                with_image=False,
+            )
         delivered = 0
         for umo in pending:
-            try:
-                sent = await asyncio.wait_for(
-                    self.context.send_message(umo, chain), timeout=60
-                )
-            except Exception as exc:
-                logger.error(f"APOD 推送到 {umo} 失败：{exc}")
-                continue
-            if sent is False:
-                logger.error(f"APOD 推送到 {umo} 失败：未匹配到消息平台。")
+            if not await self._send_chain_with_fallback(umo, chain, fallback):
                 continue
             pushed[umo] = link
             try:
@@ -1352,8 +1464,12 @@ class APOD(Star):
     ) -> MessageChain:
         chain = []
         url = apod_data.get("hdurl") or apod_data.get("url")
+        media_type = str(apod_data.get("media_type") or "").strip().lower()
         if with_image and url:
-            chain.append(Comp.Image.fromURL(url))
+            if media_type == "video":
+                chain.append(Comp.Video.fromURL(url))
+            else:
+                chain.append(Comp.Image.fromURL(url))
         text = self._build_display_text(
             apod_data,
             title_zh,
@@ -1364,6 +1480,32 @@ class APOD(Star):
         if text:
             chain.append(Comp.Plain(text))
         return MessageChain(chain=chain)
+
+    async def _send_chain_with_fallback(
+        self, umo: str, chain: MessageChain, fallback: Optional[MessageChain]
+    ) -> bool:
+        """发送消息链并返回是否成功；发送异常或返回 False 时，
+        若提供了降级链（视频→文字+链接）则再试一次。"""
+        try:
+            sent = await asyncio.wait_for(
+                self.context.send_message(umo, chain), timeout=60
+            )
+        except Exception as exc:
+            logger.error(f"APOD 推送到 {umo} 失败：{exc}")
+            sent = False
+        if sent is False and fallback is not None:
+            logger.warning(f"APOD 推送到 {umo} 的视频消息失败，降级为文字+链接。")
+            try:
+                sent = await asyncio.wait_for(
+                    self.context.send_message(umo, fallback), timeout=60
+                )
+            except Exception as exc:
+                logger.error(f"APOD 推送降级到 {umo} 失败：{exc}")
+                sent = False
+        if sent is False:
+            logger.error(f"APOD 推送到 {umo} 失败：未匹配到消息平台。")
+            return False
+        return True
 
     async def terminate(self):
         logger.info("正在终止 NASA APOD 插件...")
