@@ -1951,7 +1951,8 @@ class APOD(Star):
         try:
             if not os.path.exists(path):
                 os.makedirs(os.path.dirname(path), exist_ok=True)
-                tmp_path = path + ".part"
+                # 唯一临时名：同一 URL 并发下载不会互写同一个 .part。
+                tmp_path = f"{path}.{os.urandom(6).hex()}.part"
                 timeout = aiohttp.ClientTimeout(total=self.timeout)
                 try:
                     async with aiohttp.ClientSession(timeout=timeout) as session:
