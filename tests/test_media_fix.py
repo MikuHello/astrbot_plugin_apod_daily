@@ -1208,6 +1208,17 @@ class ImageCacheTests(unittest.TestCase):
         self.assertIsNone(got)
         self.assertFalse(os.path.exists(path))
 
+    def test_localize_refreshes_mtime_on_hit(self):
+        url = "https://x/hit.jpg"
+        path = self.plugin._image_cache_path(url)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(b"x")
+        old = time.time() - 5000
+        os.utime(path, (old, old))
+        asyncio.run(self.plugin._localize_image(url))
+        self.assertGreater(os.path.getmtime(path), old + 1000)
+
     def test_localize_disabled_returns_none(self):
         self.plugin.cache_images = False
         self.assertIsNone(

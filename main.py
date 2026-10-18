@@ -2135,6 +2135,11 @@ class APOD(Star):
                 except OSError:
                     pass
                 return None
+            try:
+                # 命中也要刷新 mtime：保护窗口从最近一次使用算起。
+                os.utime(path)
+            except OSError:
+                pass
             await self._touch_image_cache(path)
             return path
         except Exception as exc:
