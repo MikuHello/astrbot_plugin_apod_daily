@@ -78,6 +78,8 @@ APOD_PUBLISH_ET_HOUR = 0
 APOD_PUBLISH_ET_MINUTE = 5
 # 固定过期点 = 下一次美东 00:05 + 宽限；宽限用于躲过 feed 的 CDN 缓存窗口（max-age=300）。
 APOD_CACHE_GRACE_MINUTES = 10
+# 抓到旧一期（源站/CDN 尚未更新）时只短时有效，尽快重试。
+APOD_STALE_RETRY_MINUTES = 5
 
 
 # 文章发布时间只认这两种 meta 名，不拿更新时间冒充。
@@ -1159,8 +1161,19 @@ class APOD(Star):
             cutoff += timedelta(days=1)
         return cutoff
 
+    def _expected_latest_apod_date(self) -> str:
+        """美东当前应有的最新 APOD 日期：00:05 发布前仍算前一天。"""
+        tz = self._et_timezone()
+        now = datetime.now(tz)
+        if (now.hour, now.minute) < (
+            APOD_PUBLISH_ET_HOUR,
+            APOD_PUBLISH_ET_MINUTE,
+        ):
+            now -= timedelta(days=1)
+        return now.strftime("%Y-%m-%d")
+
     def _apod_cache_fresh(self, apod_data: dict) -> bool:
-        """APOD 缓存是否仍有效：只看是否跨过了下一个过期点。"""
+        """APOD 缓存是否仍有效：过期点 + 内容日期双重判断。"""
         retrieved_at_raw = apod_data.get("retrieved_at")
         if not retrieved_at_raw:
             return False
@@ -1170,7 +1183,17 @@ class APOD(Star):
             return False
         if retrieved_at.tzinfo is None:
             retrieved_at = retrieved_at.astimezone()
-        return datetime.now(timezone.utc) < self._apod_cache_valid_until(retrieved_at)
+        now = datetime.now(timezone.utc)
+        if now >= self._apod_cache_valid_until(retrieved_at):
+            return False
+        cached_date = str(apod_data.get("date") or "")
+        if cached_date and cached_date != self._expected_latest_apod_date():
+            # 抓到的是旧一期：只短时有效，尽快重试，不锁到下一个过期点。
+            retry_until = retrieved_at.astimezone(timezone.utc) + timedelta(
+                minutes=APOD_STALE_RETRY_MINUTES
+            )
+            return now < retry_until
+        return True
 
     def _seconds_until_apod_prefetch(self) -> float:
         """距下一次过期边界（美东 00:05 + 宽限）的秒数。"""
