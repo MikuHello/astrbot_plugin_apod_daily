@@ -467,6 +467,13 @@ class TranslationParseTests(unittest.TestCase):
         self.assertEqual(title, "67P 彗星的三维图")
         self.assertIsNone(expl)
 
+    def test_empty_title_tag_does_not_raise(self):
+        title, expl = self.plugin._parse_translation_response(
+            "<title></title><explanation>说明译文。</explanation>", True, True
+        )
+        self.assertIsNone(title)
+        self.assertEqual(expl, "说明译文。")
+
     def test_partial_tag_is_not_fallbacked(self):
         title, _ = self.plugin._parse_translation_response(
             "<title>三维 67P", True, False

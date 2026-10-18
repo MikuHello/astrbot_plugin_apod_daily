@@ -925,8 +925,11 @@ class APOD(Star):
             and not leftover_tag
         ):
             explanation = cleaned
+        # 空标签（<title></title>）会产生空串，splitlines()[0] 会抛 IndexError，
+        # 所以取首行前先允许空值。
         if title is not None:
-            title = title.splitlines()[0].strip().rstrip("。.．") or None
+            first_line = next(iter(title.splitlines()), "")
+            title = first_line.strip().rstrip("。.．") or None
         if explanation is not None:
             explanation = explanation.strip() or None
         return title, explanation
