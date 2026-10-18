@@ -180,6 +180,7 @@ class APOD(Star):
         self._translate_index_lock = asyncio.Lock()
         self._image_index_lock = asyncio.Lock()
         self._image_reconcile_task: Optional[asyncio.Task] = None
+        self._nasa_probe_flight: Optional[asyncio.Task] = None
         self._cache_epoch = 0
 
     @staticmethod
@@ -1271,13 +1272,14 @@ class APOD(Star):
         变了才抓文章页重新解析并覆盖写入（旧记录自然过期）。
         核对失败时退回缓存，不冒险重抓也不报错。"""
         cache_key = "nasa_cache"
+        # 指纹核对放在锁外并 single-flight：并发时只探一次，不串行放大。
+        latest_link = await self._coalesced_nasa_probe()
         async with self._content_lock(cache_key):
             cached = await self.get_cache(cache_key)
             if cached is not None and not self._is_valid_apod_data(cached):
                 cached = None
             cached_link = str(cached.get("link") or "") if cached else ""
 
-            latest_link = await self._probe_nasa_latest_link()
             if latest_link and cached and latest_link == cached_link:
                 self._stale_nasa = cached
                 return cached
@@ -1396,6 +1398,14 @@ class APOD(Star):
             logger.warning(f"NASA 指纹核对失败：{exc}")
             return None
         return self._extract_nasa_latest_link(page_html)
+
+    async def _coalesced_nasa_probe(self) -> Optional[str]:
+        """并发请求共享同一次在途指纹核对，避免每个等待者各探一次。"""
+        flight = self._nasa_probe_flight
+        if flight is None or flight.done():
+            flight = asyncio.create_task(self._probe_nasa_latest_link())
+            self._nasa_probe_flight = flight
+        return await asyncio.shield(flight)
 
     async def _refresh_nasa(self, link: Optional[str]) -> Optional[dict]:
         """抓取指定文章页并解析；link 为空时先重新解析列表页。"""
@@ -2146,7 +2156,12 @@ class APOD(Star):
 
     async def terminate(self):
         logger.info("正在终止 NASA APOD 插件...")
-        for attr in ("_push_task", "_prefetch_task", "_image_reconcile_task"):
+        for attr in (
+            "_push_task",
+            "_prefetch_task",
+            "_image_reconcile_task",
+            "_nasa_probe_flight",
+        ):
             task = getattr(self, attr, None)
             if task:
                 task.cancel()
