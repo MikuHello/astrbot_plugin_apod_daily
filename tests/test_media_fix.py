@@ -597,6 +597,15 @@ class TranslationFieldFlowTests(unittest.TestCase):
         asyncio.run(self.plugin._translate_fields(payload))
         self.assertEqual(len(self.plugin.context.calls), 1)
 
+    def test_cache_translation_skips_stale_epoch(self):
+        plugin = self.plugin
+        plugin._cache_epoch = 5
+        item = plugin._build_translation_cache_key("prov", "3D 67P")
+        asyncio.run(plugin._cache_translation(item, "old", epoch=4))
+        self.assertIsNone(self.store.get(item))
+        asyncio.run(plugin._cache_translation(item, "new", epoch=5))
+        self.assertEqual(self.store.get(item), "new")
+
     def test_only_title_is_requested_when_explanation_not_sent(self):
         self.plugin.send_explanation = False
         title, expl = asyncio.run(
