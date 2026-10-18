@@ -505,7 +505,7 @@ class TranslationFlowTests(unittest.TestCase):
         self.assertEqual(expl, "说明译文。")
         self.assertEqual(len(self.plugin.context.calls), 1)
 
-    def test_parse_failure_retries_then_succeeds(self):
+    def test_parse_failure_retries_with_correction_notice(self):
         self.plugin.translate_parse_retry = 1
         self.plugin.context = _FakeContext(
             [
@@ -516,20 +516,8 @@ class TranslationFlowTests(unittest.TestCase):
         title, expl = asyncio.run(
             self.plugin._translate_uncached("3D 67P", "English text.", "prov")
         )
-        self.assertEqual(title, "三维 67P")
+        self.assertEqual((title, expl), ("三维 67P", "说明译文。"))
         self.assertEqual(len(self.plugin.context.calls), 2)
-
-    def test_retry_appends_correction_notice(self):
-        self.plugin.translate_parse_retry = 1
-        self.plugin.context = _FakeContext(
-            [
-                "3D 67P 是一个天文学术语的组合，需要更多上下文……",
-                "<title>三维 67P</title><explanation>说明译文。</explanation>",
-            ]
-        )
-        asyncio.run(
-            self.plugin._translate_uncached("3D 67P", "English text.", "prov")
-        )
         first = self.plugin.context.calls[0]["prompt"]
         second = self.plugin.context.calls[1]["prompt"]
         self.assertNotIn("上次输出未遵守结构", first)
