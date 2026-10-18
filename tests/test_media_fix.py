@@ -931,6 +931,56 @@ class NasaProbeTests(unittest.TestCase):
         self.assertIsNone(apod_main.APOD._extract_nasa_latest_link("<h1>x</h1>"))
 
 
+class NasaProbeTimeoutTests(unittest.TestCase):
+    def setUp(self):
+        self.plugin = _make_plugin()
+
+    @staticmethod
+    def _patch_session(status, body=""):
+        import unittest.mock as mock
+
+        class _Resp:
+            def __init__(self):
+                self.status = status
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def text(self):
+                return body
+
+        class _Session:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def get(self, url):
+                return _Resp()
+
+        return mock.patch.object(apod_main.aiohttp, "ClientSession", _Session)
+
+    def test_probe_returns_link_on_200(self):
+        body = (
+            '<h1>Image of the Day</h1>'
+            '<a href="https://www.nasa.gov/image-article/abc/">x</a>'
+        )
+        with self._patch_session(200, body):
+            link = asyncio.run(self.plugin._probe_nasa_latest_link())
+        self.assertEqual(link, "https://www.nasa.gov/image-article/abc/")
+
+    def test_probe_failure_returns_none(self):
+        with self._patch_session(503):
+            self.assertIsNone(asyncio.run(self.plugin._probe_nasa_latest_link()))
+
+
 class ImageCacheTests(unittest.TestCase):
     def setUp(self):
         self.plugin = _make_plugin()
