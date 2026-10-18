@@ -1276,5 +1276,63 @@ class ImageCacheTests(unittest.TestCase):
         )
 
 
+class PushPerSessionChainTests(unittest.TestCase):
+    def test_chain_rebuilt_per_session(self):
+        config = _FakeConfig({"push": {"sessions": ["a", "b", "c", "d"]}})
+        plugin = _make_plugin(config)
+        plugin.push_mode = "scheduled"
+        plugin.send_media = True
+        apod_data = {
+            "date": "2026-10-18",
+            "title": "t",
+            "explanation": "e",
+            "media_type": "image",
+            "url": "https://x/a.jpg",
+            "hdurl": "https://x/a.jpg",
+            "link": "https://x/article/",
+        }
+        store = {}
+        calls = {"n": 0}
+
+        async def get_cached_data(*args, **kwargs):
+            return apod_data
+
+        async def load_ck():
+            return {}
+
+        async def save_ck(pushed):
+            return None
+
+        async def translate(*args, **kwargs):
+            return None, None
+
+        async def get_cache(key):
+            return store.get(key)
+
+        async def put_cache(key, value):
+            store[key] = value
+
+        async def build(*args, **kwargs):
+            calls["n"] += 1
+            return apod_main.MessageChain(chain=[])
+
+        async def send(umo, chain, fallback):
+            return True
+
+        plugin._get_cached_data = get_cached_data
+        plugin._load_push_checkpoint = load_ck
+        plugin._save_push_checkpoint = save_ck
+        plugin._translate_fields = translate
+        plugin.get_cache = get_cache
+        plugin.put_cache = put_cache
+        plugin._build_message_chain = build
+        plugin._send_chain_with_fallback = send
+
+        ok = asyncio.run(plugin._push_check())
+        self.assertTrue(ok)
+        # 4 个会话各重建一次，避免复用同一个可能失效的本地路径
+        self.assertEqual(calls["n"], 4)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

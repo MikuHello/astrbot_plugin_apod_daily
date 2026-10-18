@@ -1966,26 +1966,28 @@ class APOD(Star):
             return True
 
         title_zh, explanation_zh = await self._translate_fields(apod_data)
-        chain = await self._build_message_chain(
-            apod_data,
-            title_zh,
-            explanation_zh,
-            with_media=self.send_media,
-        )
-        fallback = None
-        if (
-            self.send_media
-            and str(apod_data.get("media_type") or "").lower() == "video"
-        ):
-            # 视频组件发送不成功时降级为“文字+原文链接”，保证推送不丢消息。
-            fallback = await self._build_message_chain(
+        delivered = 0
+        for umo in pending:
+            # 每个会话发送前重建消息链：本地图片可能已被其他请求淘汰，
+            # 重建会命中缓存并刷新保护时间（必要时重新下载）。
+            chain = await self._build_message_chain(
                 apod_data,
                 title_zh,
                 explanation_zh,
-                with_media=False,
+                with_media=self.send_media,
             )
-        delivered = 0
-        for umo in pending:
+            fallback = None
+            if (
+                self.send_media
+                and str(apod_data.get("media_type") or "").lower() == "video"
+            ):
+                # 视频组件发送不成功时降级为“文字+原文链接”，保证推送不丢消息。
+                fallback = await self._build_message_chain(
+                    apod_data,
+                    title_zh,
+                    explanation_zh,
+                    with_media=False,
+                )
             if not await self._send_chain_with_fallback(umo, chain, fallback):
                 continue
             pushed[umo] = link
