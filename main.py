@@ -240,9 +240,20 @@ class APOD(Star):
             translate_cfg["title"] = False
             translate_cfg["explanation"] = False
 
-        await self.put_cache("config_layout_v2", True)
-        await self.config.save_config_async()
-        logger.info("APOD 配置已迁移到新的发送/翻译分组。")
+        if await self._persist_config():
+            await self.put_cache("config_layout_v2", True)
+            logger.info("APOD 配置已迁移到新的发送/翻译分组。")
+        else:
+            logger.error("配置保存失败，迁移标记留待下次重试。")
+
+    async def _persist_config(self) -> bool:
+        """保存插件配置；返回是否确认落盘（异常与 False 都算失败）。"""
+        try:
+            saved = await self.config.save_config_async()
+        except Exception as exc:
+            logger.error(f"保存插件配置失败：{exc}")
+            return False
+        return saved is not False
 
     async def _migrate_cache_limit(self) -> None:
         """把旧 translate_cache_limit 并入 apod_cache_limit（同样用 KV 标记只跑一次）。"""
@@ -252,8 +263,10 @@ class APOD(Star):
         # 旧键为默认值时不算用户意图，避免覆盖导入的新配置。
         if "translate_cache_limit" in self.config and legacy_limit != 1000:
             self.config["apod_cache_limit"] = max(0, legacy_limit)
-        await self.put_cache("config_layout_v3", True)
-        await self.config.save_config_async()
+        if await self._persist_config():
+            await self.put_cache("config_layout_v3", True)
+        else:
+            logger.error("配置保存失败，缓存上限迁移将在下次重试。")
 
     async def _clear_reusable_caches(self) -> int:
         """清空可复用缓存（翻译 + 内容），保留推送状态（避免重复群发）。

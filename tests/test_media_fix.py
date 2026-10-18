@@ -743,6 +743,19 @@ class ConfigMigrationTests(unittest.TestCase):
         self.assertEqual(config["translate"]["title"], False)
         self.assertEqual(config["translate"]["explanation"], False)
 
+    def test_migration_marker_only_after_save(self):
+        class FailingConfig(dict):
+            def __init__(self):
+                super().__init__({"image": False})
+
+            async def save_config_async(self):
+                return False
+
+        config = FailingConfig()
+        plugin, store = self._plugin_with_cache(config)
+        asyncio.run(plugin._migrate_config())
+        self.assertFalse(store.get("config_layout_v2"))
+
     def test_cache_limit_migrates_from_legacy(self):
         config = _FakeConfig(
             {"apod_cache_limit": 1000, "translate_cache_limit": 250}
