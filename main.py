@@ -207,22 +207,22 @@ class APOD(Star):
         old_expl = self._ensure_dict(self.config.get("explanation"))
         old_date = self._ensure_dict(self.config.get("date"))
 
-        if "image" in self.config:
+        if "image" in self.config and self.config.get("image") is not True:
             send_cfg["media"] = bool(self.config.get("image"))
-        if "send_image" in push_cfg:
+        if "send_image" in push_cfg and push_cfg.get("send_image") is not True:
             send_cfg.setdefault("media", bool(push_cfg.get("send_image")))
-        if "is_show" in old_title:
+        if "is_show" in old_title and old_title.get("is_show") is not True:
             send_cfg["title"] = bool(old_title.get("is_show"))
-        if "is_show" in old_expl:
+        if "is_show" in old_expl and old_expl.get("is_show") is not True:
             send_cfg["explanation"] = bool(old_expl.get("is_show"))
-        if "is_show" in old_date:
+        if "is_show" in old_date and old_date.get("is_show") is not True:
             send_cfg["date"] = bool(old_date.get("is_show"))
-        if "is_translate" in old_title:
+        if "is_translate" in old_title and old_title.get("is_translate") is not True:
             translate_cfg["title"] = bool(old_title.get("is_translate"))
-        if "is_translate" in old_expl:
+        if "is_translate" in old_expl and old_expl.get("is_translate") is not True:
             translate_cfg["explanation"] = bool(old_expl.get("is_translate"))
-        if "provider" in self.config:
-            translate_cfg["provider"] = str(self.config.get("provider") or "")
+        if self.config.get("provider"):
+            translate_cfg["provider"] = str(self.config.get("provider"))
         # 旧推送翻译开关：仅作为兼容来源，统一归一到翻译配置。
         if push_cfg.get("translate") is True:
             translate_cfg.setdefault("title", True)
@@ -236,10 +236,10 @@ class APOD(Star):
         """把旧 translate_cache_limit 并入 apod_cache_limit（同样用 KV 标记只跑一次）。"""
         if await self.get_cache("config_layout_v3"):
             return
-        if "translate_cache_limit" in self.config:
-            self.config["apod_cache_limit"] = max(
-                0, int(self.config.get("translate_cache_limit", 1000))
-            )
+        legacy_limit = int(self.config.get("translate_cache_limit", 1000))
+        # 旧键为默认值时不算用户意图，避免覆盖导入的新配置。
+        if "translate_cache_limit" in self.config and legacy_limit != 1000:
+            self.config["apod_cache_limit"] = max(0, legacy_limit)
         await self.put_cache("config_layout_v3", True)
         await self.config.save_config_async()
 

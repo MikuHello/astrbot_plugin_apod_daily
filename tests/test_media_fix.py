@@ -611,24 +611,52 @@ class ConfigMigrationTests(unittest.TestCase):
         config = _FakeConfig(
             {
                 "image": False,
-                "title": {"is_show": True, "is_translate": False},
-                "explanation": {"is_show": False, "is_translate": True},
-                "date": {"is_show": True},
+                "title": {"is_show": False, "is_translate": False},
+                "explanation": {"is_show": False, "is_translate": False},
+                "date": {"is_show": False},
                 "provider": "liming/claude-opus-4-6",
-                "push": {"send_image": False, "translate": True, "sessions": []},
+                "push": {"send_image": False, "translate": False, "sessions": []},
             }
         )
         plugin, store = self._plugin_with_cache(config)
         asyncio.run(plugin._migrate_config())
         self.assertEqual(config["send"]["media"], False)
-        self.assertEqual(config["send"]["title"], True)
+        self.assertEqual(config["send"]["title"], False)
         self.assertEqual(config["send"]["explanation"], False)
-        self.assertEqual(config["send"]["date"], True)
+        self.assertEqual(config["send"]["date"], False)
         self.assertEqual(config["translate"]["title"], False)
-        self.assertEqual(config["translate"]["explanation"], True)
+        self.assertEqual(config["translate"]["explanation"], False)
         self.assertEqual(config["translate"]["provider"], "liming/claude-opus-4-6")
         self.assertTrue(store.get("config_layout_v2"))
         self.assertEqual(config.saved, 1)
+
+    def test_new_config_not_clobbered_by_legacy_defaults(self):
+        config = _FakeConfig(
+            {
+                "send": {
+                    "media": False,
+                    "title": False,
+                    "explanation": False,
+                    "date": False,
+                },
+                "translate": {
+                    "title": False,
+                    "explanation": False,
+                    "provider": "keep/this",
+                },
+                "image": True,
+                "title": {"is_show": True, "is_translate": True},
+                "explanation": {"is_show": True, "is_translate": True},
+                "date": {"is_show": True},
+                "provider": "",
+            }
+        )
+        plugin, _ = self._plugin_with_cache(config)
+        asyncio.run(plugin._migrate_config())
+        self.assertEqual(config["send"]["media"], False)
+        self.assertEqual(config["send"]["title"], False)
+        self.assertEqual(config["translate"]["title"], False)
+        self.assertEqual(config["translate"]["provider"], "keep/this")
 
     def test_migration_is_idempotent(self):
         config = _FakeConfig({"send": {"media": False}, "translate": {"title": False}})
