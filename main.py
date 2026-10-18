@@ -65,6 +65,8 @@ CREDIT_PREFIX_PATTERN = re.compile(
 # NASA 每日一图（IOTD）：无 feed/REST/日期元数据，只能抓两级页面；
 # og:image 即主图，展示日期按美东抓取日（与官网“当日”语义一致）。
 NASA_PAGE_URL = "https://www.nasa.gov/image-of-the-day/"
+# 指纹核对是每次请求的前置检查，必须短：失败就直接回退缓存。
+NASA_PROBE_TIMEOUT_SECONDS = 15
 NASA_POST_LINK_PATTERN = re.compile(
     r"https://www\.nasa\.gov/image-article/[^\s\"'<>]+"
 )
@@ -1363,13 +1365,21 @@ class APOD(Star):
         return html_lib.unescape(match.group(0)) if match else None
 
     async def _probe_nasa_latest_link(self) -> Optional[str]:
-        """每次请求的指纹核对：1 次 GET 列表页，失败返回 None。"""
-        timeout = aiohttp.ClientTimeout(total=self.timeout)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            page_html = await self._fetch_text(
-                session, NASA_PAGE_URL, "NASA 每日一图页面"
-            )
-        if page_html is None:
+        """每次请求的指纹核对：单次 GET 列表页，短超时、不重试，失败返回 None。"""
+        timeout = aiohttp.ClientTimeout(
+            total=min(self.timeout, NASA_PROBE_TIMEOUT_SECONDS)
+        )
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(NASA_PAGE_URL) as response:
+                    if response.status != 200:
+                        logger.warning(
+                            f"NASA 指纹核对失败：状态码={response.status}"
+                        )
+                        return None
+                    page_html = await response.text()
+        except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+            logger.warning(f"NASA 指纹核对失败：{exc}")
             return None
         return self._extract_nasa_latest_link(page_html)
 
