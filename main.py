@@ -904,13 +904,25 @@ class APOD(Star):
 
         title = grab("title") if want_title else None
         explanation = grab("explanation") if want_explanation else None
-        # 单字段请求且模型没写标签 → 整体兜底；但标题必须是短单行，
+        # 残留未闭合标签 = 这次输出是残缺的，不能走纯文本兜底。
+        leftover_tag = bool(re.search(r"</?(?:title|explanation)\b", cleaned, re.I))
+        # 单字段请求且模型没写完整标签 → 整体兜底；但标题必须是短单行，
         # 否则视为解析失败（防小作文从无标签路径混进来）。
-        if want_title and not want_explanation and title is None:
+        if (
+            want_title
+            and not want_explanation
+            and title is None
+            and not leftover_tag
+        ):
             candidate = cleaned.splitlines()[0].strip() if cleaned else ""
             if candidate and len(candidate) <= 40:
                 title = candidate
-        if want_explanation and not want_title and explanation is None:
+        if (
+            want_explanation
+            and not want_title
+            and explanation is None
+            and not leftover_tag
+        ):
             explanation = cleaned
         if title is not None:
             title = title.splitlines()[0].strip().rstrip("。.．") or None
