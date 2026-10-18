@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import html as html_lib
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -70,6 +71,13 @@ NASA_POST_LINK_PATTERN = re.compile(
 # og:image 会退化成 NASA logo，真正的媒体是 og:video / <video><source src> 直链。
 # 注意 logo 的 URL 实际是 NASA_logo-1.png（下划线），两种写法都要拦截。
 PLACEHOLDER_MARKS = ("nasa-logo", "nasa_logo", "/themes/")
+
+# APOD 每天美东 00:05 发布（feed pubDate 实测逐秒固定 04:05 UTC / EDT）。
+# 因此缓存只按这个固定时刻过期，不再用「12h TTL + 1h 提前刷新」的启发式。
+APOD_PUBLISH_ET_HOUR = 0
+APOD_PUBLISH_ET_MINUTE = 5
+# 固定过期点 = 下一次美东 00:05 + 宽限；宽限用于躲过 feed 的 CDN 缓存窗口（max-age=300）。
+APOD_CACHE_GRACE_MINUTES = 10
 
 
 # 文章发布时间只认这两种 meta 名，不拿更新时间冒充。
@@ -246,6 +254,20 @@ class APOD(Star):
             await self.delete_cache(key)
             deleted += 1
 
+        # 图片缓存（若开启）：删文件 + 删索引。
+        try:
+            cache_dir = self._image_cache_dir()
+            if os.path.isdir(cache_dir):
+                for name in os.listdir(cache_dir):
+                    try:
+                        os.remove(os.path.join(cache_dir, name))
+                        deleted += 1
+                    except OSError:
+                        pass
+        except Exception as exc:
+            logger.error(f"清理图片缓存目录失败：{exc}")
+        await self.delete_cache("image_cache_index")
+
         # 内存态一并复位：避免清库后仍从 stale/cooldown/在途任务回填。
         self._stale_apod = None
         self._stale_nasa = None
@@ -283,9 +305,20 @@ class APOD(Star):
         self.is_divided = bool(self.config.get("is_divided", True))
         self.timeout = max(1, int(self.config.get("timeout", 120)))
         self.retry_count = max(0, int(self.config.get("retry_count", 3)))
-        self.translate_cache_limit = max(
-            0, int(self.config.get("translate_cache_limit", 1000))
+        # 统一条数上限：翻译缓存与图片缓存各自按它淘汰最旧。
+        self.cache_limit = max(
+            0,
+            int(
+                self.config.get(
+                    "apod_cache_limit",
+                    self.config.get("translate_cache_limit", 1000),
+                )
+            ),
         )
+        self.cache_images = bool(self.config.get("cache_images", True))
+        # 定时预缓存（默认关）：每天 APOD 发布后主动抓取 + 翻译，预热缓存。
+        self.prefetch_enabled = bool(self.config.get("prefetch", False))
+        self._prefetch_task: Optional[asyncio.Task] = None
 
         push_cfg = self._ensure_dict(self.config.get("push", {}))
         self.push_enabled = bool(push_cfg.get("enabled", False))
@@ -314,6 +347,10 @@ class APOD(Star):
                 logger.info(
                     f"APOD 定时推送已启动：每天 {self.push_time} 推送最新一期。"
                 )
+
+        if self.prefetch_enabled:
+            self._prefetch_task = asyncio.create_task(self._prefetch_loop())
+            logger.info("APOD 定时预缓存已启动。")
 
     @filter.command("apod")
     async def apod(self, event: AstrMessageEvent):
@@ -363,11 +400,17 @@ class APOD(Star):
         # 图片/视频都可以直接作为媒体发送；没有可用媒体时降级为文字+链接，
         # 不再把视频型条目当成错误回退。
         media_component = None
+        media_path = None
         if self.send_media and url:
             if media_type == "video":
                 media_component = Comp.Video.fromURL(url)
             else:
-                media_component = Comp.Image.fromURL(url)
+                media_path = await self._localize_image(url)
+                media_component = (
+                    Comp.Image.fromFileSystem(media_path)
+                    if media_path
+                    else Comp.Image.fromURL(url)
+                )
 
         title_zh, explanation_zh = await self._translate_fields(
             apod_data, umo=event.unified_msg_origin
@@ -384,7 +427,7 @@ class APOD(Star):
                 if media_type == "video":
                     yield event.chain_result([media_component])
                 else:
-                    yield event.image_result(url)
+                    yield event.image_result(media_path or url)
             if display_text:
                 has_output = True
                 yield event.plain_result(display_text)
@@ -504,7 +547,7 @@ class APOD(Star):
         display_name = (
             NASA_DISPLAY_NAME if label.startswith("NASA") else PLUGIN_DISPLAY_NAME
         )
-        message = self._build_message_chain(
+        message = await self._build_message_chain(
             apod_data,
             title_zh,
             explanation_zh,
@@ -524,7 +567,7 @@ class APOD(Star):
             and str(apod_data.get("media_type") or "").lower() == "video"
         ):
             # 视频组件不受平台支持时，降级为“文字+原文链接”。
-            fallback = self._build_message_chain(
+            fallback = await self._build_message_chain(
                 apod_data,
                 title_zh,
                 explanation_zh,
@@ -602,7 +645,7 @@ class APOD(Star):
             )
             if key not in keys:
                 keys.append(key)
-            limit = self.translate_cache_limit
+            limit = self.cache_limit
             while limit > 0 and len(keys) > limit:
                 await self.delete_cache(keys.pop(0))
             await self.put_cache("translate_cache_index", keys)
@@ -983,9 +1026,15 @@ class APOD(Star):
         return None
 
     async def _get_cached_data(
-        self, cache_key: str, fetch, stale_attr: str, force_refresh: bool = False
+        self,
+        cache_key: str,
+        fetch,
+        stale_attr: str,
+        force_refresh: bool = False,
+        freshness=None,
     ) -> Optional[dict]:
-        """当日内容缓存：12h 硬 TTL；超 1h 且日期落后美东今天时提前刷新；
+        """内容缓存层：默认「12h 硬 TTL + 超 1h 日期落后即刷新」；
+        传入 freshness 时改用它判定（如 APOD 按固定发布时间过期）。
         刷新失败回退 KV 旧值或内存 stale，避免直接对用户报错。
         按来源加锁双检：并发冷启动只触发一次抓取；force_refresh 供推送
         强制刷新并同步写回共享缓存。
@@ -1040,16 +1089,17 @@ class APOD(Star):
             age = (
                 datetime.now(timezone.utc) - retrieved_at.astimezone(timezone.utc)
             ).total_seconds()
-            # 新鲜度判断以“美东今天”为基准（两个内容源都约在美东每日更新）：
-            #   - 12 小时硬 TTL；
-            #   - 缓存超过 1 小时且日期落后于最新一期时提前刷新，
-            #     避免新一期发布后最长要等满 12 小时才能刷出来。
-            expired = age > 12 * 3600
-            if not expired and age > 3600:
-                cached_date = str(apod_data.get("date") or "")
-                if cached_date and cached_date != self._expected_latest_date():
-                    logger.info("缓存日期落后于最新一期，正在刷新缓存。")
-                    expired = True
+            if freshness is not None:
+                # 固定时刻过期（APOD）：不用 12h/1h 启发式。
+                expired = not freshness(apod_data)
+            else:
+                # 12 小时硬 TTL；超 1h 且日期落后美东今天时提前刷新。
+                expired = age > 12 * 3600
+                if not expired and age > 3600:
+                    cached_date = str(apod_data.get("date") or "")
+                    if cached_date and cached_date != self._expected_latest_date():
+                        logger.info("缓存日期落后于最新一期，正在刷新缓存。")
+                        expired = True
             if expired:
                 logger.info("缓存中的数据已过期，正在刷新缓存。")
                 fresh = await self._attempt_refresh(
@@ -1063,13 +1113,112 @@ class APOD(Star):
 
     async def _get_latest_apod(self) -> Optional[dict]:
         return await self._get_cached_data(
-            "apod_cache", self._fetch_latest_apod, "_stale_apod"
+            "apod_cache",
+            self._fetch_latest_apod,
+            "_stale_apod",
+            freshness=self._apod_cache_fresh,
         )
 
-    async def _get_nasa(self) -> Optional[dict]:
-        return await self._get_cached_data(
-            "nasa_cache", self._fetch_nasa, "_stale_nasa"
+    def _apod_cache_valid_until(self, retrieved_at: datetime) -> datetime:
+        """有效期到「下一次美东 00:05 发布」+ 宽限。"""
+        tz = self._et_timezone()
+        local = retrieved_at.astimezone(tz)
+        publish = local.replace(
+            hour=APOD_PUBLISH_ET_HOUR,
+            minute=APOD_PUBLISH_ET_MINUTE,
+            second=0,
+            microsecond=0,
         )
+        if publish <= local:
+            publish += timedelta(days=1)
+        return publish + timedelta(minutes=APOD_CACHE_GRACE_MINUTES)
+
+    def _apod_cache_fresh(self, apod_data: dict) -> bool:
+        """APOD 缓存是否仍有效：只看是否跨过了下一个过期点。"""
+        retrieved_at_raw = apod_data.get("retrieved_at")
+        if not retrieved_at_raw:
+            return False
+        try:
+            retrieved_at = datetime.fromisoformat(str(retrieved_at_raw))
+        except (TypeError, ValueError):
+            return False
+        if retrieved_at.tzinfo is None:
+            retrieved_at = retrieved_at.astimezone()
+        return datetime.now(timezone.utc) < self._apod_cache_valid_until(retrieved_at)
+
+    def _seconds_until_apod_prefetch(self) -> float:
+        """距下一次「APOD 发布 + 宽限」的秒数（美东时区）。"""
+        tz = self._et_timezone()
+        now = datetime.now(tz)
+        target = now.replace(
+            hour=APOD_PUBLISH_ET_HOUR,
+            minute=APOD_PUBLISH_ET_MINUTE,
+            second=0,
+            microsecond=0,
+        ) + timedelta(minutes=APOD_CACHE_GRACE_MINUTES)
+        if target <= now:
+            target += timedelta(days=1)
+        return (target - now).total_seconds()
+
+    async def _prefetch_loop(self) -> None:
+        """定时预缓存：每天 APOD 发布后主动抓取 + 翻译，预热缓存。"""
+        try:
+            while True:
+                delay = self._seconds_until_apod_prefetch()
+                logger.info(f"APOD 定时预缓存：距下次约 {delay / 3600:.1f} 小时。")
+                await asyncio.sleep(delay)
+                try:
+                    apod_data = await self._get_cached_data(
+                        "apod_cache",
+                        self._fetch_latest_apod,
+                        "_stale_apod",
+                        force_refresh=True,
+                    )
+                    if apod_data is not None:
+                        await self._translate_fields(apod_data)
+                        logger.info(
+                            f"APOD 定时预缓存完成：{apod_data.get('date')}"
+                        )
+                except Exception as exc:
+                    logger.error(f"APOD 定时预缓存失败：{exc}")
+        except asyncio.CancelledError:
+            pass
+
+    async def _get_nasa(self) -> Optional[dict]:
+        """NASA IOTD：记录也缓存，但**每次请求都核对列表页指纹**。
+
+        核对只花 1 次 GET（列表页）；指纹未变直接用缓存记录，
+        变了才抓文章页重新解析并覆盖写入（旧记录自然过期）。
+        核对失败时退回缓存，不冒险重抓也不报错。"""
+        cache_key = "nasa_cache"
+        async with self._content_lock(cache_key):
+            cached = await self.get_cache(cache_key)
+            if cached is not None and not self._is_valid_apod_data(cached):
+                cached = None
+            cached_link = str(cached.get("link") or "") if cached else ""
+
+            latest_link = await self._probe_nasa_latest_link()
+            if latest_link and cached and latest_link == cached_link:
+                self._stale_nasa = cached
+                return cached
+            if latest_link is None and cached is not None:
+                # 核对失败：保持现有记录，避免源站抖动导致报错。
+                self._stale_nasa = cached
+                return cached
+
+            async def refresh() -> Optional[dict]:
+                return await self._refresh_cached_data(
+                    cache_key,
+                    lambda: self._refresh_nasa(latest_link),
+                    "_stale_nasa",
+                )
+
+            fresh = await self._attempt_refresh(
+                cache_key, refresh, respect_cooldown=True
+            )
+            if fresh is not None:
+                return fresh
+            return cached or self._stale_nasa
 
     # ---------- 数据获取主入口 ----------
     # 最新一期走站点 RSS（无需 token、无速率限制），失败时由缓存层兜底
@@ -1140,22 +1289,42 @@ class APOD(Star):
         title = self._strip_html(title_match.group(1)) if title_match else ""
         return self._build_apod_data(title, link, content_html)
 
-    async def _fetch_nasa(self) -> Optional[dict]:
+    @staticmethod
+    def _extract_nasa_latest_link(page_html: str) -> Optional[str]:
+        """从 IOTD 列表页取第一个 image-article 链接（正文 h1 之后）。"""
+        h1_index = (page_html or "").find("<h1")
+        match = NASA_POST_LINK_PATTERN.search(
+            page_html or "", h1_index + 1 if h1_index >= 0 else 0
+        )
+        return html_lib.unescape(match.group(0)) if match else None
+
+    async def _probe_nasa_latest_link(self) -> Optional[str]:
+        """每次请求的指纹核对：1 次 GET 列表页，失败返回 None。"""
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             page_html = await self._fetch_text(
                 session, NASA_PAGE_URL, "NASA 每日一图页面"
             )
-            if page_html is None:
-                return None
-            h1_index = page_html.find("<h1")
-            match = NASA_POST_LINK_PATTERN.search(
-                page_html, h1_index + 1 if h1_index >= 0 else 0
-            )
-            if match is None:
-                self.last_apod_error = "NASA 每日一图页面未找到今日条目，请稍后重试。"
-                return None
-            link = html_lib.unescape(match.group(0))
+        if page_html is None:
+            return None
+        return self._extract_nasa_latest_link(page_html)
+
+    async def _refresh_nasa(self, link: Optional[str]) -> Optional[dict]:
+        """抓取指定文章页并解析；link 为空时先重新解析列表页。"""
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            if not link:
+                page_html = await self._fetch_text(
+                    session, NASA_PAGE_URL, "NASA 每日一图页面"
+                )
+                if page_html is None:
+                    return None
+                link = self._extract_nasa_latest_link(page_html)
+                if not link:
+                    self.last_apod_error = (
+                        "NASA 每日一图页面未找到今日条目，请稍后重试。"
+                    )
+                    return None
             post_html = await self._fetch_text(session, link, "NASA 每日一图文章")
             if post_html is None:
                 return None
@@ -1654,7 +1823,7 @@ class APOD(Star):
             return True
 
         title_zh, explanation_zh = await self._translate_fields(apod_data)
-        chain = self._build_message_chain(
+        chain = await self._build_message_chain(
             apod_data,
             title_zh,
             explanation_zh,
@@ -1666,7 +1835,7 @@ class APOD(Star):
             and str(apod_data.get("media_type") or "").lower() == "video"
         ):
             # 视频组件发送不成功时降级为“文字+原文链接”，保证推送不丢消息。
-            fallback = self._build_message_chain(
+            fallback = await self._build_message_chain(
                 apod_data,
                 title_zh,
                 explanation_zh,
@@ -1694,7 +1863,67 @@ class APOD(Star):
         )
         return missed == 0
 
-    def _build_message_chain(
+    # ---------- 图片本地缓存（可选） ----------
+
+    def _image_cache_dir(self) -> str:
+        from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
+
+        return os.path.join(
+            get_astrbot_plugin_data_path(),
+            "astrbot_plugin_apod_daily",
+            "image_cache",
+        )
+
+    def _image_cache_path(self, url: str) -> str:
+        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
+        suffix = os.path.splitext(url.split("?", 1)[0])[1][:8] or ".img"
+        return os.path.join(self._image_cache_dir(), digest + suffix)
+
+    async def _touch_image_cache(self, path: str) -> None:
+        """维护图片缓存 FIFO 索引，超出上限时删最旧的文件。"""
+        index = await self.get_cache("image_cache_index")
+        names = (
+            [n for n in index if isinstance(n, str)]
+            if isinstance(index, list)
+            else []
+        )
+        name = os.path.basename(path)
+        if name in names:
+            names.remove(name)
+        names.append(name)
+        while self.cache_limit > 0 and len(names) > self.cache_limit:
+            oldest = names.pop(0)
+            try:
+                os.remove(os.path.join(self._image_cache_dir(), oldest))
+            except OSError:
+                pass
+        await self.put_cache("image_cache_index", names)
+
+    async def _localize_image(self, url: str) -> Optional[str]:
+        """按需把图片下载到本地缓存并返回本地路径；关闭/失败时返回 None（用 URL）。"""
+        if not self.cache_images or not url:
+            return None
+        path = self._image_cache_path(url)
+        try:
+            if not os.path.exists(path):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                timeout = aiohttp.ClientTimeout(total=self.timeout)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(url) as response:
+                        if response.status != 200:
+                            raise RuntimeError(f"状态码={response.status}")
+                        data = await response.read()
+                if not data:
+                    raise RuntimeError("空响应")
+                with open(path, "wb") as handle:
+                    handle.write(data)
+            await self._touch_image_cache(path)
+            return path
+        except Exception as exc:
+            logger.warning(f"图片缓存失败，改用原始链接：{exc}")
+            return None
+
+    async def _build_message_chain(
         self,
         apod_data: Dict[str, Any],
         title_zh: Optional[str],
@@ -1709,7 +1938,11 @@ class APOD(Star):
             if media_type == "video":
                 chain.append(Comp.Video.fromURL(url))
             else:
-                chain.append(Comp.Image.fromURL(url))
+                local_path = await self._localize_image(url)
+                if local_path:
+                    chain.append(Comp.Image.fromFileSystem(local_path))
+                else:
+                    chain.append(Comp.Image.fromURL(url))
         text = self._build_display_text(
             apod_data,
             title_zh,
@@ -1748,14 +1981,15 @@ class APOD(Star):
 
     async def terminate(self):
         logger.info("正在终止 NASA APOD 插件...")
-        task = getattr(self, "_push_task", None)
-        if task:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            self._push_task = None
+        for attr in ("_push_task", "_prefetch_task"):
+            task = getattr(self, attr, None)
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                setattr(self, attr, None)
         # 翻译 worker 持有强引用：卸载时统一取消并等待退出，
         # 避免悬挂的模型调用越过插件生命周期继续运行。
         flights = list(self._translation_flights.values())

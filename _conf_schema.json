@@ -115,12 +115,6 @@
             }
         }
     },
-    "translate_cache_limit": {
-        "description": "翻译缓存条数上限",
-        "hint": "超过上限时按写入顺序淘汰最旧的翻译缓存，0 表示不限制；/apod管理 清理 可手动清空",
-        "type": "int",
-        "default": 1000
-    },
     "timeout": {
         "description": "请求超时时间（秒）",
         "type": "int",
@@ -131,6 +125,24 @@
         "hint": "0 表示不重试",
         "type": "int",
         "default": 3
+    },
+    "apod_cache_limit": {
+        "description": "APOD 缓存条数上限",
+        "hint": "翻译与图片缓存各自保留的上限，超出按写入顺序淘汰最旧；0 表示不限制；/apod管理 清理 可手动清空",
+        "type": "int",
+        "default": 1000
+    },
+    "cache_images": {
+        "description": "缓存图片",
+        "hint": "把图片下载到本地复用，避免每次发送重复下载",
+        "type": "bool",
+        "default": true
+    },
+    "prefetch": {
+        "description": "定时预缓存",
+        "hint": "APOD 更新后自动抓取内容并缓存；若开启翻译则会进行翻译，响应更快",
+        "type": "bool",
+        "default": false
     },
     "image": {
         "description": "（旧）发送图片",

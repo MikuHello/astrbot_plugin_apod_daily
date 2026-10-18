@@ -6,9 +6,13 @@
 import asyncio
 import importlib.util
 import logging
+import os
 import sys
+import tempfile
 import types
 import unittest
+import zoneinfo
+from datetime import timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -112,6 +116,10 @@ def _install_astrbot_stubs():
         def fromURL(url):
             return Image(file=url)
 
+        @staticmethod
+        def fromFileSystem(path):
+            return Image(file=path, path=path)
+
     class Video(_Component):
         @staticmethod
         def fromURL(url):
@@ -184,6 +192,13 @@ def _install_astrbot_stubs():
 
     core = mod("astrbot.core")
     core.sp = _FakeSP()
+    core_utils = mod("astrbot.core.utils")
+    core_utils.__path__ = []
+    core.utils = core_utils
+    astrbot_path = mod("astrbot.core.utils.astrbot_path")
+    _PLUGIN_DATA_DIR = tempfile.mkdtemp(prefix="apod-plugin-data-")
+    astrbot_path.get_astrbot_plugin_data_path = lambda: _PLUGIN_DATA_DIR
+    core_utils.astrbot_path = astrbot_path
 
     # aiohttp 只在网络层使用，解析/渲染测试不需要真实实现。
     aiohttp = mod("aiohttp")
@@ -211,6 +226,13 @@ apod_main = importlib.util.module_from_spec(_spec)
 sys.modules["apod_main"] = apod_main
 _spec.loader.exec_module(apod_main)
 
+# 本机测试环境没有 tzdata（运行时 AstrBot 自带），统一固定为同一个 ET 时区。
+try:
+    _ET = zoneinfo.ZoneInfo("America/New_York")
+except Exception:  # noqa: BLE001 - 本地无 tzdata 时退化为固定 EDT
+    _ET = timezone(timedelta(hours=-4))
+apod_main.APOD._et_timezone = staticmethod(lambda: _ET)
+
 
 class _FakeConfig(dict):
     def __init__(self, *args, **kwargs):
@@ -231,7 +253,8 @@ def _make_plugin(config=None):
     plugin.translate_title = True
     plugin.translate_explanation = True
     plugin.translate_parse_retry = 1
-    plugin.translate_cache_limit = 1000
+    plugin.cache_limit = 1000
+    plugin.cache_images = False
     plugin.is_divided = True
     plugin.timeout = 30
     return plugin
@@ -339,14 +362,18 @@ class RenderingTests(unittest.TestCase):
         self.assertIn(f"原文链接：{LINK}", text)
 
     def test_message_chain_uses_video_component(self):
-        chain = self.plugin._build_message_chain(self._video_data(), None, None)
+        chain = asyncio.run(
+            self.plugin._build_message_chain(self._video_data(), None, None)
+        )
         self.assertIsInstance(chain.chain[0], _COMP.Video)
         self.assertIsInstance(chain.chain[-1], _COMP.Plain)
         self.assertEqual(chain.chain[0].file, MP4)
 
     def test_message_chain_with_media_false_is_text_only(self):
-        chain = self.plugin._build_message_chain(
-            self._video_data(), None, None, with_media=False
+        chain = asyncio.run(
+            self.plugin._build_message_chain(
+                self._video_data(), None, None, with_media=False
+            )
         )
         self.assertEqual(len(chain.chain), 1)
         self.assertIsInstance(chain.chain[0], _COMP.Plain)
@@ -644,6 +671,129 @@ class ClearCacheTests(unittest.TestCase):
         self.assertIsNone(plugin._stale_apod)
         self.assertIsNone(plugin._stale_nasa)
         self.assertEqual(plugin._refresh_cooldowns, {})
+
+
+class ApodCachePolicyTests(unittest.TestCase):
+    def setUp(self):
+        self.plugin = _make_plugin()
+
+    def test_valid_until_next_publish_plus_grace(self):
+        from datetime import datetime
+
+        et = self.plugin._et_timezone()
+        # 美东 10-17 12:00 抓取 → 10-18 00:05 + 10min == 10-18 00:15 ET
+        valid = self.plugin._apod_cache_valid_until(
+            datetime(2026, 10, 17, 12, 0, tzinfo=et)
+        )
+        self.assertEqual(valid, datetime(2026, 10, 18, 0, 15, tzinfo=et))
+
+    def test_valid_until_same_day_when_before_publish(self):
+        from datetime import datetime
+
+        et = self.plugin._et_timezone()
+        valid = self.plugin._apod_cache_valid_until(
+            datetime(2026, 10, 17, 23, 50, tzinfo=et)
+        )
+        self.assertEqual(valid, datetime(2026, 10, 18, 0, 15, tzinfo=et))
+
+    def test_just_fetched_is_fresh(self):
+        from datetime import datetime, timezone
+
+        data = {
+            "retrieved_at": datetime.now(timezone.utc).isoformat(),
+            "date": "2026-10-17",
+            "explanation": "x",
+        }
+        self.assertTrue(self.plugin._apod_cache_fresh(data))
+
+    def test_two_days_old_is_stale(self):
+        from datetime import datetime, timedelta, timezone
+
+        data = {
+            "retrieved_at": (
+                datetime.now(timezone.utc) - timedelta(days=2)
+            ).isoformat(),
+            "date": "2026-10-16",
+            "explanation": "x",
+        }
+        self.assertFalse(self.plugin._apod_cache_fresh(data))
+
+    def test_missing_timestamp_is_stale(self):
+        self.assertFalse(self.plugin._apod_cache_fresh({"date": "2026-10-17"}))
+
+    def test_seconds_until_prefetch_within_a_day(self):
+        seconds = self.plugin._seconds_until_apod_prefetch()
+        self.assertGreater(seconds, 0)
+        self.assertLessEqual(seconds, 24 * 3600)
+
+
+class NasaProbeTests(unittest.TestCase):
+    def test_extract_latest_link_after_h1(self):
+        page = (
+            '<h1>Image of the Day</h1>'
+            '<a href="https://www.nasa.gov/image-article/first/">x</a>'
+        )
+        self.assertEqual(
+            apod_main.APOD._extract_nasa_latest_link(page),
+            "https://www.nasa.gov/image-article/first/",
+        )
+
+    def test_extract_returns_none_without_link(self):
+        self.assertIsNone(apod_main.APOD._extract_nasa_latest_link("<h1>x</h1>"))
+
+
+class ImageCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.plugin = _make_plugin()
+        self.plugin.cache_images = True
+        self.plugin.cache_limit = 2
+        self.store = {}
+
+        async def get_cache(key):
+            return self.store.get(key)
+
+        async def put_cache(key, value):
+            self.store[key] = value
+
+        self.plugin.get_cache = get_cache
+        self.plugin.put_cache = put_cache
+
+    def test_path_is_stable_and_keeps_suffix(self):
+        p1 = self.plugin._image_cache_path("https://x/a.jpg?tok=1")
+        p2 = self.plugin._image_cache_path("https://x/a.jpg?tok=1")
+        self.assertEqual(p1, p2)
+        self.assertTrue(p1.endswith(".jpg"))
+
+    def test_localize_uses_existing_file_without_network(self):
+        url = "https://x/pre.jpg"
+        path = self.plugin._image_cache_path(url)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(b"img")
+        got = asyncio.run(self.plugin._localize_image(url))
+        self.assertEqual(got, path)
+        self.assertEqual(
+            self.store.get("image_cache_index"), [os.path.basename(path)]
+        )
+
+    def test_touch_evicts_oldest(self):
+        directory = self.plugin._image_cache_dir()
+        os.makedirs(directory, exist_ok=True)
+        paths = []
+        for i in range(3):
+            path = os.path.join(directory, f"f{i}.jpg")
+            with open(path, "wb") as handle:
+                handle.write(b"x")
+            paths.append(path)
+            asyncio.run(self.plugin._touch_image_cache(path))
+        self.assertFalse(os.path.exists(paths[0]))
+        self.assertTrue(os.path.exists(paths[2]))
+
+    def test_localize_disabled_returns_none(self):
+        self.plugin.cache_images = False
+        self.assertIsNone(
+            asyncio.run(self.plugin._localize_image("https://x/a.jpg"))
+        )
 
 
 if __name__ == "__main__":
