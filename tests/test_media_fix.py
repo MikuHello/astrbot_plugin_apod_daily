@@ -876,7 +876,8 @@ class ApodCachePolicyTests(unittest.TestCase):
         from datetime import datetime, timedelta, timezone
 
         et = self.plugin._et_timezone()
-        stale_date = (datetime.now(et) - timedelta(days=1)).strftime("%Y-%m-%d")
+        # 用 -2 天，避免美东 00:00-00:05（昨日仍算最新）导致测试定时失败。
+        stale_date = (datetime.now(et) - timedelta(days=2)).strftime("%Y-%m-%d")
         data = {
             "retrieved_at": (
                 datetime.now(timezone.utc) - timedelta(minutes=10)
@@ -890,7 +891,7 @@ class ApodCachePolicyTests(unittest.TestCase):
         from datetime import datetime, timedelta, timezone
 
         et = self.plugin._et_timezone()
-        stale_date = (datetime.now(et) - timedelta(days=1)).strftime("%Y-%m-%d")
+        stale_date = (datetime.now(et) - timedelta(days=2)).strftime("%Y-%m-%d")
         data = {
             "retrieved_at": datetime.now(timezone.utc).isoformat(),
             "date": stale_date,
