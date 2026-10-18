@@ -2004,8 +2004,12 @@ class APOD(Star):
                     names = self._image_index_names(
                         await self.get_cache("image_cache_index")
                     )
-                    self._trim_image_index(names)
+                    still_over = self._trim_image_index(names)
                     await self.put_cache("image_cache_index", names)
+                if still_over:
+                    # 又有新文件进入保护窗口：清掉自身引用后再排一轮。
+                    self._image_reconcile_task = None
+                    self._schedule_image_reconcile()
             except asyncio.CancelledError:
                 pass
 

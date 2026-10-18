@@ -1077,6 +1077,30 @@ class ImageCacheTests(unittest.TestCase):
         self.assertEqual(len(names), 1)
         self.assertFalse(os.path.exists(paths[0]))
 
+    def test_reconcile_reschedules_when_still_over(self):
+        import unittest.mock as mock
+
+        calls = {"n": 0}
+
+        def fake_trim(names):
+            calls["n"] += 1
+            return calls["n"] == 1  # 第一轮仍超额，第二轮收敛
+
+        self.plugin._trim_image_index = fake_trim
+
+        async def scenario():
+            self.plugin._schedule_image_reconcile()
+            first = self.plugin._image_reconcile_task
+            if first:
+                await first
+            second = self.plugin._image_reconcile_task
+            if second and second is not first:
+                await second
+
+        with mock.patch.object(apod_main, "IMAGE_CACHE_MIN_AGE_SECONDS", -1):
+            asyncio.run(scenario())
+        self.assertGreaterEqual(calls["n"], 2)
+
     def test_localize_disabled_returns_none(self):
         self.plugin.cache_images = False
         self.assertIsNone(
