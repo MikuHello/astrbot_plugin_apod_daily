@@ -303,6 +303,19 @@ class VideoParsingTests(unittest.TestCase):
         self.assertTrue(data["url"].endswith("67p.jpg"))
         self.assertEqual(data["credit"], "Jane Doe")
 
+    def test_video_preferred_over_image(self):
+        data = self.plugin._build_apod_data(
+            "APOD: 2026 October 16 \u2013 Chasing the International Space Station",
+            LINK,
+            VIDEO_ARTICLE,
+            image_url=(
+                "https://assets.science.nasa.gov/content/dam/science/cds/apod/"
+                "apod/2026/october/poster.jpg"
+            ),
+        )
+        self.assertEqual(data["media_type"], "video")
+        self.assertEqual(data["url"], MP4)
+
     def test_no_media_entry_stays_other(self):
         data = self.plugin._build_apod_data("APOD: title", LINK, NO_MEDIA_ARTICLE)
         self.assertEqual(data["media_type"], "other")

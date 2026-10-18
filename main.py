@@ -1656,10 +1656,12 @@ class APOD(Star):
             logger.error(f"内容信息不完整：link={link!r}")
             return None
 
-        if image_url:
-            media_type, media_url = "image", image_url
-        elif video_url:
+        # 直链视频（已经 _is_usable_video 过滤）优先于图片：APOD/IOTD 里
+        # 出现可用直链视频时几乎就是视频条目；图片可能只是海报帧。
+        if video_url:
             media_type, media_url = "video", video_url
+        elif image_url:
+            media_type, media_url = "image", image_url
         else:
             media_type, media_url = "other", None
 
