@@ -467,6 +467,18 @@ class TranslationParseTests(unittest.TestCase):
         self.assertEqual(title, "67P 彗星的三维图")
         self.assertIsNone(expl)
 
+    def test_partial_tag_is_not_fallbacked(self):
+        title, _ = self.plugin._parse_translation_response(
+            "<title>三维 67P", True, False
+        )
+        self.assertIsNone(title)
+
+    def test_partial_explanation_tag_is_not_fallbacked(self):
+        _, expl = self.plugin._parse_translation_response(
+            "<explanation>被截断的说明", False, True
+        )
+        self.assertIsNone(expl)
+
 
 class _FakeContext:
     def __init__(self, replies):
