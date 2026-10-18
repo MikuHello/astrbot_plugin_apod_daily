@@ -719,6 +719,20 @@ class ConfigMigrationTests(unittest.TestCase):
         asyncio.run(plugin._migrate_config())
         self.assertEqual(config["send"]["media"], False)
 
+    def test_legacy_push_translate_disabled_is_preserved(self):
+        config = _FakeConfig(
+            {
+                "translate": {"title": True, "explanation": True},
+                "title": {"is_show": True, "is_translate": True},
+                "explanation": {"is_show": True, "is_translate": True},
+                "push": {"translate": False},
+            }
+        )
+        plugin, _ = self._plugin_with_cache(config)
+        asyncio.run(plugin._migrate_config())
+        self.assertEqual(config["translate"]["title"], False)
+        self.assertEqual(config["translate"]["explanation"], False)
+
     def test_cache_limit_migrates_from_legacy(self):
         config = _FakeConfig(
             {"apod_cache_limit": 1000, "translate_cache_limit": 250}
