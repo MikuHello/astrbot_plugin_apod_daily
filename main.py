@@ -243,6 +243,12 @@ class APOD(Star):
             translate_cfg["title"] = False
             translate_cfg["explanation"] = False
 
+        # 迁移完成前清掉旧键：标记丢失时它们就不会再覆盖新设置。
+        for key in ("image", "title", "explanation", "date", "provider"):
+            self.config.pop(key, None)
+        push_cfg.pop("translate", None)
+        push_cfg.pop("send_image", None)
+
         if not await self._persist_config():
             logger.error("配置保存失败，迁移标记留待下次重试。")
             return
@@ -277,6 +283,7 @@ class APOD(Star):
         # 旧键为默认值时不算用户意图，避免覆盖导入的新配置。
         if "translate_cache_limit" in self.config and legacy_limit != 1000:
             self.config["apod_cache_limit"] = max(0, legacy_limit)
+        self.config.pop("translate_cache_limit", None)
         if not await self._persist_config():
             logger.error("配置保存失败，缓存上限迁移将在下次重试。")
             return
