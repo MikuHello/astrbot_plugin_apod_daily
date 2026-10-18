@@ -213,7 +213,8 @@ class APOD(Star):
         if "image" in self.config and self.config.get("image") is not True:
             send_cfg["media"] = bool(self.config.get("image"))
         if "send_image" in push_cfg and push_cfg.get("send_image") is not True:
-            send_cfg.setdefault("media", bool(push_cfg.get("send_image")))
+            # send.media 已由默认值占位，setdefault 无效；旧值 False 必须直接写入。
+            send_cfg["media"] = False
         if "is_show" in old_title and old_title.get("is_show") is not True:
             send_cfg["title"] = bool(old_title.get("is_show"))
         if "is_show" in old_expl and old_expl.get("is_show") is not True:
