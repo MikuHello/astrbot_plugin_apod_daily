@@ -181,5 +181,11 @@
         "type": "string",
         "default": "",
         "invisible": true
+    },
+    "translate_cache_limit": {
+        "description": "（旧）翻译缓存条数上限",
+        "type": "int",
+        "default": 1000,
+        "invisible": true
     }
 }

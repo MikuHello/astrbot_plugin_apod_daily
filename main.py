@@ -231,6 +231,17 @@ class APOD(Star):
         await self.config.save_config_async()
         logger.info("APOD 配置已迁移到新的发送/翻译分组。")
 
+    async def _migrate_cache_limit(self) -> None:
+        """把旧 translate_cache_limit 并入 apod_cache_limit（同样用 KV 标记只跑一次）。"""
+        if await self.get_cache("config_layout_v3"):
+            return
+        if "translate_cache_limit" in self.config:
+            self.config["apod_cache_limit"] = max(
+                0, int(self.config.get("translate_cache_limit", 1000))
+            )
+        await self.put_cache("config_layout_v3", True)
+        await self.config.save_config_async()
+
     async def _clear_reusable_caches(self) -> int:
         """清空可复用缓存（翻译 + 内容），保留推送状态（避免重复群发）。
 
@@ -286,6 +297,7 @@ class APOD(Star):
 
         # 旧版配置先迁移到 send/translate 分组，再读取。
         await self._migrate_config()
+        await self._migrate_cache_limit()
 
         send_cfg = self._ensure_dict(self.config.get("send", {}))
         self.send_media = bool(send_cfg.get("media", True))

@@ -635,6 +635,24 @@ class ConfigMigrationTests(unittest.TestCase):
         asyncio.run(plugin._migrate_config())
         self.assertEqual(config["send"]["media"], True)
 
+    def test_cache_limit_migrates_from_legacy(self):
+        config = _FakeConfig(
+            {"apod_cache_limit": 1000, "translate_cache_limit": 250}
+        )
+        plugin, store = self._plugin_with_cache(config)
+        asyncio.run(plugin._migrate_cache_limit())
+        self.assertEqual(config["apod_cache_limit"], 250)
+        self.assertTrue(store.get("config_layout_v3"))
+
+    def test_cache_limit_migration_is_idempotent(self):
+        config = _FakeConfig(
+            {"apod_cache_limit": 1000, "translate_cache_limit": 250}
+        )
+        plugin, store = self._plugin_with_cache(config)
+        store["config_layout_v3"] = True
+        asyncio.run(plugin._migrate_cache_limit())
+        self.assertEqual(config["apod_cache_limit"], 1000)
+
 
 class ClearCacheTests(unittest.TestCase):
     def test_clear_keeps_push_state(self):
