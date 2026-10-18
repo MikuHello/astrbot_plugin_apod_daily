@@ -300,19 +300,20 @@ class APOD(Star):
                 await self.delete_cache(key)
                 deleted += 1
 
-            # 图片缓存（若开启）：删文件 + 删索引。
-            try:
-                cache_dir = self._image_cache_dir()
-                if os.path.isdir(cache_dir):
-                    for name in os.listdir(cache_dir):
-                        try:
-                            os.remove(os.path.join(cache_dir, name))
-                            deleted += 1
-                        except OSError:
-                            pass
-            except Exception as exc:
-                logger.error(f"清理图片缓存目录失败：{exc}")
-            await self.delete_cache("image_cache_index")
+            # 图片缓存（若开启）：持图片锁删文件 + 删索引，避免与下载/登记交叉。
+            async with self._image_index_lock:
+                try:
+                    cache_dir = self._image_cache_dir()
+                    if os.path.isdir(cache_dir):
+                        for name in os.listdir(cache_dir):
+                            try:
+                                os.remove(os.path.join(cache_dir, name))
+                                deleted += 1
+                            except OSError:
+                                pass
+                except Exception as exc:
+                    logger.error(f"清理图片缓存目录失败：{exc}")
+                await self.delete_cache("image_cache_index")
 
         # 3) 内存态一并复位，避免清库后仍从 stale/cooldown 回填。
         self._stale_apod = None
@@ -2046,6 +2047,7 @@ class APOD(Star):
         if not self.cache_images or not url:
             return None
         path = self._image_cache_path(url)
+        epoch = self._cache_epoch
         try:
             if not os.path.exists(path):
                 os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -2073,6 +2075,13 @@ class APOD(Star):
                     except OSError:
                         pass
                     raise
+            if epoch != self._cache_epoch:
+                # 下载期间发生了清理：删掉刚下的文件，不要复活缓存。
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                return None
             await self._touch_image_cache(path)
             return path
         except Exception as exc:

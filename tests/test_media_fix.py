@@ -1114,6 +1114,50 @@ class ImageCacheTests(unittest.TestCase):
             asyncio.run(scenario())
         self.assertGreaterEqual(calls["n"], 2)
 
+    def test_localize_drops_file_when_cleared_during_download(self):
+        import unittest.mock as mock
+
+        plugin = self.plugin
+        url = "https://x/new.jpg"
+        path = plugin._image_cache_path(url)
+        plugin._cache_epoch = 0
+
+        class _Content:
+            def iter_chunked(self, size):
+                async def gen():
+                    plugin._cache_epoch += 1  # 模拟下载期间发生了清理
+                    yield b"data"
+
+                return gen()
+
+        class _Resp:
+            status = 200
+            content = _Content()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        class _Session:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def get(self, url):
+                return _Resp()
+
+        with mock.patch.object(apod_main.aiohttp, "ClientSession", _Session):
+            got = asyncio.run(plugin._localize_image(url))
+        self.assertIsNone(got)
+        self.assertFalse(os.path.exists(path))
+
     def test_localize_disabled_returns_none(self):
         self.plugin.cache_images = False
         self.assertIsNone(
