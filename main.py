@@ -432,7 +432,9 @@ class APOD(Star):
             apod_data, title_zh, explanation_zh, display_name=display_name
         )
 
-        if self.is_divided:
+        # 图片可按配置合并；视频始终分开发送：平台发不了视频时，
+        # 也不能把正文和原文链接一起拖下水。
+        if self.is_divided or media_type == "video":
             # 图片一条、文本一条。
             has_output = False
             if media_component is not None:
