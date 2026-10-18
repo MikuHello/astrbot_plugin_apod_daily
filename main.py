@@ -2121,6 +2121,13 @@ class APOD(Star):
                                     written += len(chunk)
                     if not written:
                         raise RuntimeError("空响应")
+                    if epoch != self._cache_epoch:
+                        # 下载期间发生了清理：丢弃临时文件，绝不覆盖目标路径。
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
+                        return None
                     os.replace(tmp_path, path)
                 except Exception:
                     try:
@@ -2128,18 +2135,15 @@ class APOD(Star):
                     except OSError:
                         pass
                     raise
-            if epoch != self._cache_epoch:
-                # 下载期间发生了清理：删掉刚下的文件，不要复活缓存。
+            else:
                 try:
-                    os.remove(path)
+                    # 命中也要刷新 mtime：保护窗口从最近一次使用算起。
+                    os.utime(path)
                 except OSError:
                     pass
-                return None
-            try:
-                # 命中也要刷新 mtime：保护窗口从最近一次使用算起。
-                os.utime(path)
-            except OSError:
-                pass
+            if epoch != self._cache_epoch:
+                # 期间发生过清理：不登记索引，直接用本地文件。
+                return path
             await self._touch_image_cache(path)
             return path
         except Exception as exc:
