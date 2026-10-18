@@ -4,6 +4,7 @@ import hashlib
 import html as html_lib
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
@@ -80,6 +81,8 @@ APOD_PUBLISH_ET_MINUTE = 5
 APOD_CACHE_GRACE_MINUTES = 10
 # 抓到旧一期（源站/CDN 尚未更新）时只短时有效，尽快重试。
 APOD_STALE_RETRY_MINUTES = 5
+# 图片缓存淘汰前的最小存活时间：待发送的消息可能还引用着刚写入的文件。
+IMAGE_CACHE_MIN_AGE_SECONDS = 120
 
 
 # 文章发布时间只认这两种 meta 名，不拿更新时间冒充。
@@ -1952,10 +1955,28 @@ class APOD(Star):
             if name in names:
                 names.remove(name)
             names.append(name)
+            now = time.time()
             while self.cache_limit > 0 and len(names) > self.cache_limit:
-                oldest = names.pop(0)
+                # 跳过刚写入的文件：它们可能正被待发送的消息引用。
+                victim = None
+                for name in names:
+                    try:
+                        too_fresh = (
+                            now - os.path.getmtime(
+                                os.path.join(self._image_cache_dir(), name)
+                            )
+                            < IMAGE_CACHE_MIN_AGE_SECONDS
+                        )
+                    except OSError:
+                        too_fresh = False  # 文件已不在，直接移出索引
+                    if not too_fresh:
+                        victim = name
+                        break
+                if victim is None:
+                    break
+                names.remove(victim)
                 try:
-                    os.remove(os.path.join(self._image_cache_dir(), oldest))
+                    os.remove(os.path.join(self._image_cache_dir(), victim))
                 except OSError:
                     pass
             await self.put_cache("image_cache_index", names)
