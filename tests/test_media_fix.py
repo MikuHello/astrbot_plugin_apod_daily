@@ -765,6 +765,33 @@ class ApodCachePolicyTests(unittest.TestCase):
         )
         self.assertEqual(valid, datetime(2026, 10, 18, 0, 15, tzinfo=et))
 
+    def test_stale_dated_entry_is_short_lived(self):
+        from datetime import datetime, timedelta, timezone
+
+        et = self.plugin._et_timezone()
+        stale_date = (datetime.now(et) - timedelta(days=1)).strftime("%Y-%m-%d")
+        data = {
+            "retrieved_at": (
+                datetime.now(timezone.utc) - timedelta(minutes=10)
+            ).isoformat(),
+            "date": stale_date,
+            "explanation": "x",
+        }
+        self.assertFalse(self.plugin._apod_cache_fresh(data))
+
+    def test_stale_dated_but_just_fetched_is_fresh(self):
+        from datetime import datetime, timedelta, timezone
+
+        et = self.plugin._et_timezone()
+        stale_date = (datetime.now(et) - timedelta(days=1)).strftime("%Y-%m-%d")
+        data = {
+            "retrieved_at": datetime.now(timezone.utc).isoformat(),
+            "date": stale_date,
+            "explanation": "x",
+        }
+        # 刚抓到的旧一期只给短重试窗口，不直接判死。
+        self.assertTrue(self.plugin._apod_cache_fresh(data))
+
     def test_just_fetched_is_fresh(self):
         from datetime import datetime, timezone
 
