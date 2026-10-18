@@ -9,6 +9,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 import zoneinfo
@@ -943,15 +944,32 @@ class ImageCacheTests(unittest.TestCase):
     def test_touch_evicts_oldest(self):
         directory = self.plugin._image_cache_dir()
         os.makedirs(directory, exist_ok=True)
+        old = time.time() - 1000
         paths = []
         for i in range(3):
             path = os.path.join(directory, f"f{i}.jpg")
             with open(path, "wb") as handle:
                 handle.write(b"x")
+            if i < 2:
+                os.utime(path, (old, old))
             paths.append(path)
             asyncio.run(self.plugin._touch_image_cache(path))
         self.assertFalse(os.path.exists(paths[0]))
         self.assertTrue(os.path.exists(paths[2]))
+
+    def test_touch_keeps_fresh_files(self):
+        directory = self.plugin._image_cache_dir()
+        os.makedirs(directory, exist_ok=True)
+        paths = []
+        for i in range(3):
+            path = os.path.join(directory, f"n{i}.jpg")
+            with open(path, "wb") as handle:
+                handle.write(b"x")
+            paths.append(path)
+            asyncio.run(self.plugin._touch_image_cache(path))
+        # 刚写入的文件可能还被待发送消息引用，不应被淘汰
+        for path in paths:
+            self.assertTrue(os.path.exists(path))
 
     def test_localize_disabled_returns_none(self):
         self.plugin.cache_images = False
