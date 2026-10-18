@@ -363,6 +363,8 @@ class TranslationPromptTests(unittest.TestCase):
         self.assertIn("不可译则不译", prompt)
         self.assertIn("禁止项", prompt)
         self.assertIn("直接用于发布", prompt)
+        # 只有返回结构示例被代码块包裹
+        self.assertIn("```\n<title>译好的标题</title>\n<explanation>译好的说明</explanation>\n```", prompt)
         self.assertIn("<title>译好的标题</title>", prompt)
         self.assertIn("<explanation>译好的说明</explanation>", prompt)
 
@@ -464,6 +466,24 @@ class TranslationFlowTests(unittest.TestCase):
         )
         self.assertEqual(title, "三维 67P")
         self.assertEqual(len(self.plugin.context.calls), 2)
+
+    def test_retry_appends_correction_notice(self):
+        self.plugin.translate_parse_retry = 1
+        self.plugin.context = _FakeContext(
+            [
+                "3D 67P 是一个天文学术语的组合，需要更多上下文……",
+                "<title>三维 67P</title><explanation>说明译文。</explanation>",
+            ]
+        )
+        asyncio.run(
+            self.plugin._translate_uncached("3D 67P", "English text.", "prov")
+        )
+        first = self.plugin.context.calls[0]["prompt"]
+        second = self.plugin.context.calls[1]["prompt"]
+        self.assertNotIn("上次输出未遵守结构", first)
+        self.assertIn("上次输出未遵守结构", second)
+        self.assertIn("<title>…</title>", second)
+        self.assertIn("<explanation>…</explanation>", second)
 
     def test_no_retry_returns_partial(self):
         self.plugin.translate_parse_retry = 0

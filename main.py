@@ -137,13 +137,13 @@ NASA_DISPLAY_NAME = "NASA 每日一图"
 CREDIT_LABEL = "图片来源与版权"
 APOD_HELP = chr(10).join(
     [
-        "✨ 天文每日一图 · 指令 ✨",
+        "✨ 天文每日一图 ✨",
         "",
-        "/apod 今日 —— 最新一期天文每日一图",
-        "/apod 随机 —— 随机一期历史天文图",
-        "/nasa —— 今日 NASA 每日一图",
+        "📷 /apod 今日 |—— 最新一期",
+        "🎲 /apod 随机 |—— 随机一期历史天文图",
+        "🌌 /nasa      |—— 最新 NASA 每日一图",
         "",
-        "🔔 推送订阅（管理员）：/apod管理 订阅",
+        "🔔 /apod管理  |—— 推送订阅设置",
     ]
 )
 
@@ -276,13 +276,13 @@ class APOD(Star):
         self.translate_explanation = bool(translate_cfg.get("explanation", True))
         # 翻译模型：优先用插件配置的 provider，未配置时回落到 AstrBot 默认对话模型。
         self.provider = str(translate_cfg.get("provider", "") or "")
-        self.translate_parse_retry = max(
-            0, int(translate_cfg.get("parse_retry", 1))
+        self.translate_parse_retry = (
+            1 if bool(translate_cfg.get("parse_retry", True)) else 0
         )
 
         self.is_divided = bool(self.config.get("is_divided", True))
         self.timeout = max(1, int(self.config.get("timeout", 120)))
-        self.retry_count = max(0, int(self.config.get("retry_count", 2)))
+        self.retry_count = max(0, int(self.config.get("retry_count", 3)))
         self.translate_cache_limit = max(
             0, int(self.config.get("translate_cache_limit", 1000))
         )
@@ -317,7 +317,7 @@ class APOD(Star):
 
     @filter.command("apod")
     async def apod(self, event: AstrMessageEvent):
-        """NASA 天文每日一图：apod 今日 | apod 随机"""
+        """输出帮助菜单，可用子命令：今日 / 随机"""
         tokens = (event.message_str or "").strip().split()
         if tokens and tokens[0].lower() == "apod":
             tokens = tokens[1:]
@@ -407,7 +407,7 @@ class APOD(Star):
     @filter.command("apod管理")
     @filter.permission_type(PermissionType.GROUP_ADMIN)
     async def apod_manage(self, event: AstrMessageEvent):
-        """APOD 推送订阅管理：订阅 / 退订（名单在插件配置页维护）"""
+        """输出管理帮助菜单，可用子命令：订阅 / 退订 / 清理"""
         tokens = (event.message_str or "").strip().split()
         if tokens and tokens[0] in ("apod管理", "APOD管理"):
             tokens = tokens[1:]
@@ -440,28 +440,27 @@ class APOD(Star):
         if sub in ("清理", "清理缓存", "clear"):
             deleted = await self._clear_reusable_caches()
             yield event.plain_result(
-                f"已清理可复用缓存（翻译/内容）共 {deleted} 项；"
-                "推送记录保持不变。"
+                f"已清理可复用缓存（翻译/内容）共 {deleted} 项。"
             )
             return
 
         # 裸指令：输出支持的子命令与填写方式。
-        usage = (
-            "APOD 订阅管理指令："
-            + chr(10)
-            + "/apod管理 订阅 —— 订阅本会话的每日推送"
-            + chr(10)
-            + "/apod管理 退订 —— 退订本会话的每日推送"
-            + chr(10)
-            + "/apod管理 清理 —— 清空翻译与内容缓存（不影响推送记录）"
-            + chr(10)
-            + "订阅名单可在插件配置页「推送/订阅名单 (UMO)」中维护"
+        usage = chr(10).join(
+            [
+                "🔔 推送管理",
+                "",
+                "✅ /apod管理 订阅 |—— 订阅本会话推送",
+                "🚫 /apod管理 退订 |—— 退订本会话推送",
+                "🧹 /apod管理 清理 |—— 清空翻译与内容缓存",
+                "",
+                "订阅名单可在插件配置页「推送/订阅名单 (UMO)」维护",
+            ]
         )
         yield event.plain_result(usage)
 
     @filter.command("nasa")
     async def nasa(self, event: AstrMessageEvent):
-        """获取 NASA 每日一图（Image of the Day，全员可用）"""
+        """获取 NASA 每日一图"""
         logger.info("正在获取 NASA 每日一图 ...")
         nasa_data = await self._get_nasa()
         if nasa_data is None:
@@ -733,9 +732,17 @@ class APOD(Star):
 
         best_title: Optional[str] = None
         best_explanation: Optional[str] = None
+        retry_notice = self._build_translation_retry_notice(
+            want_title, want_explanation
+        )
         attempts = self.translate_parse_retry + 1
         for attempt in range(attempts):
-            raw = await self._call_translation_llm(system_prompt, prompt, provider_id)
+            # 第 2 次起附上纠正提示：同一 prompt 纯重复收益很低，
+            # 把「上次错在哪」告诉模型，重试才有意义。
+            attempt_prompt = prompt if attempt == 0 else f"{prompt}\n\n{retry_notice}"
+            raw = await self._call_translation_llm(
+                system_prompt, attempt_prompt, provider_id
+            )
             got_title, got_explanation = self._parse_translation_response(
                 raw, want_title, want_explanation
             )
@@ -783,12 +790,29 @@ class APOD(Star):
             "引号、列表或解释文字。"
         )
         lines.append("只输出以下结构，标签之外不要有任何字符：")
+        lines.append("```")
         if want_title:
             lines.append("<title>译好的标题</title>")
         if want_explanation:
             lines.append("<explanation>译好的说明</explanation>")
+        lines.append("```")
         lines.append("以上内容将直接用于发布，不经过二次编辑。")
         return chr(10).join(lines)
+
+    @staticmethod
+    def _build_translation_retry_notice(
+        want_title: bool, want_explanation: bool
+    ) -> str:
+        tags = []
+        if want_title:
+            tags.append("<title>…</title>")
+        if want_explanation:
+            tags.append("<explanation>…</explanation>")
+        return (
+            "上次输出未遵守结构。请只输出 "
+            + " 和 ".join(tags)
+            + "，标签之外不要有任何字符。"
+        )
 
     @staticmethod
     def _strip_code_fence(text: str) -> str:

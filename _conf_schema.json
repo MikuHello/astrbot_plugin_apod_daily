@@ -59,15 +59,10 @@
                 "default": ""
             },
             "parse_retry": {
-                "description": "结构解析失败重试次数",
-                "hint": "标题/说明未按标签结构返回时重试；0 表示不重试",
-                "type": "int",
-                "default": 1,
-                "slider": {
-                    "min": 0,
-                    "max": 5,
-                    "step": 1
-                }
+                "description": "翻译解析失败重试",
+                "hint": "未按标签结构返回时，带上纠正提示再试一次；仍失败则展示原文",
+                "type": "bool",
+                "default": true
             }
         }
     },
@@ -133,8 +128,9 @@
     },
     "retry_count": {
         "description": "网络获取失败时的重试次数",
+        "hint": "0 表示不重试",
         "type": "int",
-        "default": 2
+        "default": 3
     },
     "image": {
         "description": "（旧）发送图片",
