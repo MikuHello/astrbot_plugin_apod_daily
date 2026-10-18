@@ -169,6 +169,7 @@ class APOD(Star):
         self._translation_flights: Dict[str, asyncio.Task] = {}
         self._refresh_cooldowns: Dict[str, datetime] = {}
         self._translate_index_lock = asyncio.Lock()
+        self._image_index_lock = asyncio.Lock()
 
     @staticmethod
     def _ensure_dict(value: Any) -> Dict[str, Any]:
@@ -1888,23 +1889,24 @@ class APOD(Star):
 
     async def _touch_image_cache(self, path: str) -> None:
         """维护图片缓存 FIFO 索引，超出上限时删最旧的文件。"""
-        index = await self.get_cache("image_cache_index")
-        names = (
-            [n for n in index if isinstance(n, str)]
-            if isinstance(index, list)
-            else []
-        )
-        name = os.path.basename(path)
-        if name in names:
-            names.remove(name)
-        names.append(name)
-        while self.cache_limit > 0 and len(names) > self.cache_limit:
-            oldest = names.pop(0)
-            try:
-                os.remove(os.path.join(self._image_cache_dir(), oldest))
-            except OSError:
-                pass
-        await self.put_cache("image_cache_index", names)
+        async with self._image_index_lock:
+            index = await self.get_cache("image_cache_index")
+            names = (
+                [n for n in index if isinstance(n, str)]
+                if isinstance(index, list)
+                else []
+            )
+            name = os.path.basename(path)
+            if name in names:
+                names.remove(name)
+            names.append(name)
+            while self.cache_limit > 0 and len(names) > self.cache_limit:
+                oldest = names.pop(0)
+                try:
+                    os.remove(os.path.join(self._image_cache_dir(), oldest))
+                except OSError:
+                    pass
+            await self.put_cache("image_cache_index", names)
 
     async def _localize_image(self, url: str) -> Optional[str]:
         """按需把图片下载到本地缓存并返回本地路径；关闭/失败时返回 None（用 URL）。"""
