@@ -995,6 +995,38 @@ class ImageCacheTests(unittest.TestCase):
         for path in paths:
             self.assertTrue(os.path.exists(path))
 
+    def test_trim_keeps_fresh_but_reports_over(self):
+        self.plugin.cache_limit = 1
+        directory = self.plugin._image_cache_dir()
+        os.makedirs(directory, exist_ok=True)
+        paths = []
+        for i in range(2):
+            path = os.path.join(directory, f"g{i}.jpg")
+            with open(path, "wb") as handle:
+                handle.write(b"x")
+            paths.append(path)
+        names = [os.path.basename(p) for p in paths]
+        self.assertTrue(self.plugin._trim_image_index(names))
+        for path in paths:
+            self.assertTrue(os.path.exists(path))
+
+    def test_trim_reconciles_once_old_enough(self):
+        self.plugin.cache_limit = 1
+        directory = self.plugin._image_cache_dir()
+        os.makedirs(directory, exist_ok=True)
+        old = time.time() - 1000
+        paths = []
+        for i in range(2):
+            path = os.path.join(directory, f"h{i}.jpg")
+            with open(path, "wb") as handle:
+                handle.write(b"x")
+            os.utime(path, (old, old))
+            paths.append(path)
+        names = [os.path.basename(p) for p in paths]
+        self.assertFalse(self.plugin._trim_image_index(names))
+        self.assertEqual(len(names), 1)
+        self.assertFalse(os.path.exists(paths[0]))
+
     def test_localize_disabled_returns_none(self):
         self.plugin.cache_images = False
         self.assertIsNone(

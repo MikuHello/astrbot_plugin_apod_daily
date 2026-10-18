@@ -177,6 +177,7 @@ class APOD(Star):
         self._refresh_cooldowns: Dict[str, datetime] = {}
         self._translate_index_lock = asyncio.Lock()
         self._image_index_lock = asyncio.Lock()
+        self._image_reconcile_task: Optional[asyncio.Task] = None
         self._cache_epoch = 0
 
     @staticmethod
@@ -1944,44 +1945,74 @@ class APOD(Star):
         suffix = os.path.splitext(url.split("?", 1)[0])[1][:8] or ".img"
         return os.path.join(self._image_cache_dir(), digest + suffix)
 
+    @staticmethod
+    def _image_index_names(index) -> list:
+        return (
+            [n for n in index if isinstance(n, str)]
+            if isinstance(index, list)
+            else []
+        )
+
+    def _trim_image_index(self, names: list) -> bool:
+        """FIFO 淘汰，跳过保护窗口内的新文件。返回是否仍超额。"""
+        now = time.time()
+        while self.cache_limit > 0 and len(names) > self.cache_limit:
+            victim = None
+            for name in names:
+                try:
+                    too_fresh = (
+                        now
+                        - os.path.getmtime(
+                            os.path.join(self._image_cache_dir(), name)
+                        )
+                        < IMAGE_CACHE_MIN_AGE_SECONDS
+                    )
+                except OSError:
+                    too_fresh = False  # 文件已不在，直接移出索引
+                if not too_fresh:
+                    victim = name
+                    break
+            if victim is None:
+                return True
+            names.remove(victim)
+            try:
+                os.remove(os.path.join(self._image_cache_dir(), victim))
+            except OSError:
+                pass
+        return False
+
+    def _schedule_image_reconcile(self) -> None:
+        """超额且全是新文件时，等保护窗口过后再回收一次。"""
+        task = self._image_reconcile_task
+        if task is not None and not task.done():
+            return
+
+        async def worker() -> None:
+            try:
+                await asyncio.sleep(IMAGE_CACHE_MIN_AGE_SECONDS + 1)
+                async with self._image_index_lock:
+                    names = self._image_index_names(
+                        await self.get_cache("image_cache_index")
+                    )
+                    self._trim_image_index(names)
+                    await self.put_cache("image_cache_index", names)
+            except asyncio.CancelledError:
+                pass
+
+        self._image_reconcile_task = asyncio.create_task(worker())
+
     async def _touch_image_cache(self, path: str) -> None:
         """维护图片缓存 FIFO 索引，超出上限时删最旧的文件。"""
         async with self._image_index_lock:
-            index = await self.get_cache("image_cache_index")
-            names = (
-                [n for n in index if isinstance(n, str)]
-                if isinstance(index, list)
-                else []
-            )
+            names = self._image_index_names(await self.get_cache("image_cache_index"))
             name = os.path.basename(path)
             if name in names:
                 names.remove(name)
             names.append(name)
-            now = time.time()
-            while self.cache_limit > 0 and len(names) > self.cache_limit:
-                # 跳过刚写入的文件：它们可能正被待发送的消息引用。
-                victim = None
-                for name in names:
-                    try:
-                        too_fresh = (
-                            now - os.path.getmtime(
-                                os.path.join(self._image_cache_dir(), name)
-                            )
-                            < IMAGE_CACHE_MIN_AGE_SECONDS
-                        )
-                    except OSError:
-                        too_fresh = False  # 文件已不在，直接移出索引
-                    if not too_fresh:
-                        victim = name
-                        break
-                if victim is None:
-                    break
-                names.remove(victim)
-                try:
-                    os.remove(os.path.join(self._image_cache_dir(), victim))
-                except OSError:
-                    pass
+            still_over = self._trim_image_index(names)
             await self.put_cache("image_cache_index", names)
+        if still_over:
+            self._schedule_image_reconcile()
 
     async def _localize_image(self, url: str) -> Optional[str]:
         """按需把图片下载到本地缓存并返回本地路径；关闭/失败时返回 None（用 URL）。"""
@@ -2079,7 +2110,7 @@ class APOD(Star):
 
     async def terminate(self):
         logger.info("正在终止 NASA APOD 插件...")
-        for attr in ("_push_task", "_prefetch_task"):
+        for attr in ("_push_task", "_prefetch_task", "_image_reconcile_task"):
             task = getattr(self, attr, None)
             if task:
                 task.cancel()
