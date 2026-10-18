@@ -678,6 +678,9 @@ class ConfigMigrationTests(unittest.TestCase):
         self.assertEqual(config["translate"]["provider"], "liming/claude-opus-4-6")
         self.assertTrue(store.get("config_layout_v2"))
         self.assertEqual(config.saved, 1)
+        # 旧键已清除，避免标记丢失时再次覆盖新设置
+        for key in ("image", "title", "explanation", "date", "provider"):
+            self.assertNotIn(key, config)
 
     def test_new_config_not_clobbered_by_legacy_defaults(self):
         config = _FakeConfig(
