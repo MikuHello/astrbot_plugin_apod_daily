@@ -172,6 +172,7 @@ class APOD(Star):
         self._refresh_cooldowns: Dict[str, datetime] = {}
         self._translate_index_lock = asyncio.Lock()
         self._image_index_lock = asyncio.Lock()
+        self._cache_epoch = 0
 
     @staticmethod
     def _ensure_dict(value: Any) -> Dict[str, Any]:
@@ -248,20 +249,15 @@ class APOD(Star):
     async def _clear_reusable_caches(self) -> int:
         """清空可复用缓存（翻译 + 内容），保留推送状态（避免重复群发）。
 
-        先停生产者再枚举：翻译飞行任务先取消并等待退出，
+        先停生产者再枚举：递增缓存代际（在途翻译的写回会被丢弃），
         并在两个内容锁内枚举/删除，避免删除后被并发刷新写回。
+        不取消翻译 flight：取消会把 CancelledError 传播给等待方，跳过原文降级。
         翻译缓存用范围读枚举：插件自带的 FIFO 索引可能漏键（已实测 43 vs 25），
         而 sp.range_get_async 能拿到本插件全部 KV。返回删除项数。"""
         from astrbot.core import sp  # 本地导入：避免模块级依赖核心内部对象
 
-        # 1) 先取消在途翻译，避免它们在删除之后写回。
-        flights = list(self._translation_flights.values())
-        for flight in flights:
-            flight.cancel()
-        if flights:
-            await asyncio.gather(*flights, return_exceptions=True)
-        self._translation_flights.clear()
-
+        # 1) 递增代际：等待方拿到结果也不会再写回缓存。
+        self._cache_epoch += 1
         deleted = 0
         # 2) 持有内容锁：等正在进行的刷新结束（它会写完），再枚举删除。
         async with self._content_lock("apod_cache"), self._content_lock(
@@ -717,22 +713,26 @@ class APOD(Star):
         if not need_title and not need_explanation:
             return title_zh, explanation_zh
 
+        epoch = self._cache_epoch
         got_title, got_explanation = await self._translate_batch(
             title if need_title else None,
             explanation if need_explanation else None,
             provider_id,
         )
+        # 清理（_cache_epoch 变化）之后不再写回，避免“清完又被填回”。
         if need_title and got_title:
             title_zh = got_title
-            await self._cache_translation(
-                self._build_translation_cache_key(provider_id, title), got_title
-            )
+            if epoch == self._cache_epoch:
+                await self._cache_translation(
+                    self._build_translation_cache_key(provider_id, title), got_title
+                )
         if need_explanation and got_explanation:
             explanation_zh = got_explanation
-            await self._cache_translation(
-                self._build_translation_cache_key(provider_id, explanation),
-                got_explanation,
-            )
+            if epoch == self._cache_epoch:
+                await self._cache_translation(
+                    self._build_translation_cache_key(provider_id, explanation),
+                    got_explanation,
+                )
         return title_zh, explanation_zh
 
     async def _translate_batch(

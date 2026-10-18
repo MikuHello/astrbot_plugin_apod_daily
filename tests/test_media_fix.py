@@ -592,6 +592,33 @@ class TranslationFieldFlowTests(unittest.TestCase):
         self.assertNotIn("<explanation>", prompt)
 
 
+    def test_clear_bumps_epoch_without_cancelling_flights(self):
+        import astrbot.core as core
+
+        plugin = _make_plugin()
+
+        async def fake_delete(key):
+            return None
+
+        plugin.delete_cache = fake_delete
+        core.sp.prefs = []
+
+        async def scenario():
+            async def slow():
+                await asyncio.sleep(0.05)
+                return "x"
+
+            task = asyncio.create_task(slow())
+            plugin._translation_flights["k"] = task
+            before = plugin._cache_epoch
+            await plugin._clear_reusable_caches()
+            return task.cancelled(), before, plugin._cache_epoch
+
+        cancelled, before, after = asyncio.run(scenario())
+        self.assertFalse(cancelled)
+        self.assertEqual(after, before + 1)
+
+
 class ConfigMigrationTests(unittest.TestCase):
     def _plugin_with_cache(self, config):
         plugin = _make_plugin(config)
