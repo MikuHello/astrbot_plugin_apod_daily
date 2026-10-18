@@ -695,13 +695,18 @@ class APOD(Star):
         except Exception as exc:
             raise RuntimeError(f"写入推送检查点失败：{exc}") from exc
 
-    async def _cache_translation(self, key: str, value: str) -> None:
+    async def _cache_translation(
+        self, key: str, value: str, epoch: Optional[int] = None
+    ) -> None:
         """写入翻译缓存并按配置上限淘汰最旧条目（FIFO 索引，真删除）。
 
-        索引在任何配置下都维护：限量关闭期间的写入也要参与未来的淘汰。"""
+        索引在任何配置下都维护：限量关闭期间的写入也要参与未来的淘汰。
+        epoch 校验在索引锁内完成，避免等锁期间被清理却仍然写回。"""
         if not value:
             return
         async with self._translate_index_lock:
+            if epoch is not None and epoch != self._cache_epoch:
+                return
             await self.put_cache(key, value)
             index = await self.get_cache("translate_cache_index")
             keys = (
@@ -764,20 +769,19 @@ class APOD(Star):
             explanation if need_explanation else None,
             provider_id,
         )
-        # 清理（_cache_epoch 变化）之后不再写回，避免“清完又被填回”。
+        # 清理（_cache_epoch 变化）之后不再写回；校验在写入锁内进行。
         if need_title and got_title:
             title_zh = got_title
-            if epoch == self._cache_epoch:
-                await self._cache_translation(
-                    self._build_translation_cache_key(provider_id, title), got_title
-                )
+            await self._cache_translation(
+                self._build_translation_cache_key(provider_id, title), got_title, epoch
+            )
         if need_explanation and got_explanation:
             explanation_zh = got_explanation
-            if epoch == self._cache_epoch:
-                await self._cache_translation(
-                    self._build_translation_cache_key(provider_id, explanation),
-                    got_explanation,
-                )
+            await self._cache_translation(
+                self._build_translation_cache_key(provider_id, explanation),
+                got_explanation,
+                epoch,
+            )
         return title_zh, explanation_zh
 
     async def _translate_batch(
