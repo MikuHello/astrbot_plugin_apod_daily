@@ -768,6 +768,32 @@ class ApodCachePolicyTests(unittest.TestCase):
         self.assertLessEqual(seconds, 24 * 3600)
 
 
+class ReplyPathVariableTests(unittest.TestCase):
+    def test_video_always_sent_separately(self):
+        plugin = _make_plugin()
+        plugin.is_divided = False
+
+        async def translate(apod_data, umo=None):
+            return None, None
+
+        plugin._translate_fields = translate
+        event = SimpleNamespace(
+            unified_msg_origin="umo",
+            plain_result=lambda text: ("text", text),
+            image_result=lambda url: ("image", url),
+            chain_result=lambda chain: ("chain", chain),
+        )
+        data = plugin._build_apod_data("APOD: t", LINK, VIDEO_ARTICLE)
+
+        async def collect():
+            return [item async for item in plugin._reply_apod(event, data)]
+
+        results = asyncio.run(collect())
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0][0], "chain")
+        self.assertEqual(results[1][0], "text")
+
+
 class NasaProbeTests(unittest.TestCase):
     def test_extract_latest_link_after_h1(self):
         page = (
