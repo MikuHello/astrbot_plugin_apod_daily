@@ -246,50 +246,58 @@ class APOD(Star):
     async def _clear_reusable_caches(self) -> int:
         """清空可复用缓存（翻译 + 内容），保留推送状态（避免重复群发）。
 
+        先停生产者再枚举：翻译飞行任务先取消并等待退出，
+        并在两个内容锁内枚举/删除，避免删除后被并发刷新写回。
         翻译缓存用范围读枚举：插件自带的 FIFO 索引可能漏键（已实测 43 vs 25），
         而 sp.range_get_async 能拿到本插件全部 KV。返回删除项数。"""
         from astrbot.core import sp  # 本地导入：避免模块级依赖核心内部对象
 
-        deleted = 0
-        try:
-            prefs = await sp.range_get_async("plugin", self.plugin_id)
-        except Exception as exc:
-            logger.error(f"枚举插件缓存失败，仅清理已知键：{exc}")
-            prefs = []
-        for pref in prefs:
-            key = getattr(pref, "key", None)
-            if isinstance(key, str) and key.startswith("translate_cache"):
-                await self.delete_cache(key)
-                deleted += 1
-
-        for key in ("apod_cache", "nasa_cache"):
-            await self.delete_cache(key)
-            deleted += 1
-
-        # 图片缓存（若开启）：删文件 + 删索引。
-        try:
-            cache_dir = self._image_cache_dir()
-            if os.path.isdir(cache_dir):
-                for name in os.listdir(cache_dir):
-                    try:
-                        os.remove(os.path.join(cache_dir, name))
-                        deleted += 1
-                    except OSError:
-                        pass
-        except Exception as exc:
-            logger.error(f"清理图片缓存目录失败：{exc}")
-        await self.delete_cache("image_cache_index")
-
-        # 内存态一并复位：避免清库后仍从 stale/cooldown/在途任务回填。
-        self._stale_apod = None
-        self._stale_nasa = None
-        self._refresh_cooldowns.clear()
+        # 1) 先取消在途翻译，避免它们在删除之后写回。
         flights = list(self._translation_flights.values())
         for flight in flights:
             flight.cancel()
         if flights:
             await asyncio.gather(*flights, return_exceptions=True)
         self._translation_flights.clear()
+
+        deleted = 0
+        # 2) 持有内容锁：等正在进行的刷新结束（它会写完），再枚举删除。
+        async with self._content_lock("apod_cache"), self._content_lock(
+            "nasa_cache"
+        ):
+            try:
+                prefs = await sp.range_get_async("plugin", self.plugin_id)
+            except Exception as exc:
+                logger.error(f"枚举插件缓存失败，仅清理已知键：{exc}")
+                prefs = []
+            for pref in prefs:
+                key = getattr(pref, "key", None)
+                if isinstance(key, str) and key.startswith("translate_cache"):
+                    await self.delete_cache(key)
+                    deleted += 1
+
+            for key in ("apod_cache", "nasa_cache"):
+                await self.delete_cache(key)
+                deleted += 1
+
+            # 图片缓存（若开启）：删文件 + 删索引。
+            try:
+                cache_dir = self._image_cache_dir()
+                if os.path.isdir(cache_dir):
+                    for name in os.listdir(cache_dir):
+                        try:
+                            os.remove(os.path.join(cache_dir, name))
+                            deleted += 1
+                        except OSError:
+                            pass
+            except Exception as exc:
+                logger.error(f"清理图片缓存目录失败：{exc}")
+            await self.delete_cache("image_cache_index")
+
+        # 3) 内存态一并复位，避免清库后仍从 stale/cooldown 回填。
+        self._stale_apod = None
+        self._stale_nasa = None
+        self._refresh_cooldowns.clear()
         logger.info(f"已清理 APOD 可复用缓存，共 {deleted} 项。")
         return deleted
 
