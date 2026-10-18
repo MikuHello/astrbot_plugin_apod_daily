@@ -944,6 +944,29 @@ class NasaProbeTests(unittest.TestCase):
         self.assertIsNone(apod_main.APOD._extract_nasa_latest_link("<h1>x</h1>"))
 
 
+    def test_concurrent_probes_are_coalesced(self):
+        plugin = _make_plugin()
+        calls = {"n": 0}
+
+        async def fake_probe():
+            calls["n"] += 1
+            await asyncio.sleep(0.05)
+            return "https://www.nasa.gov/image-article/abc/"
+
+        plugin._probe_nasa_latest_link = fake_probe
+
+        async def scenario():
+            return await asyncio.gather(
+                *[plugin._coalesced_nasa_probe() for _ in range(5)]
+            )
+
+        results = asyncio.run(scenario())
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(
+            set(results), {"https://www.nasa.gov/image-article/abc/"}
+        )
+
+
 class NasaProbeTimeoutTests(unittest.TestCase):
     def setUp(self):
         self.plugin = _make_plugin()
