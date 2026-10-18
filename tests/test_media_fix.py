@@ -1219,6 +1219,55 @@ class ImageCacheTests(unittest.TestCase):
         asyncio.run(self.plugin._localize_image(url))
         self.assertGreater(os.path.getmtime(path), old + 1000)
 
+    def test_stale_download_does_not_clobber_new_file(self):
+        import unittest.mock as mock
+
+        plugin = self.plugin
+        url = "https://x/clash.jpg"
+        path = plugin._image_cache_path(url)
+        plugin._cache_epoch = 0
+
+        class _Content:
+            def iter_chunked(self, size):
+                async def gen():
+                    # 模拟：下载期间发生清理，且新请求写出了有效文件
+                    plugin._cache_epoch += 1
+                    with open(path, "wb") as handle:
+                        handle.write(b"new")
+                    yield b"old"
+
+                return gen()
+
+        class _Resp:
+            status = 200
+            content = _Content()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        class _Session:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def get(self, url):
+                return _Resp()
+
+        with mock.patch.object(apod_main.aiohttp, "ClientSession", _Session):
+            got = asyncio.run(plugin._localize_image(url))
+        self.assertIsNone(got)
+        self.assertTrue(os.path.exists(path))
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), b"new")
+
     def test_localize_disabled_returns_none(self):
         self.plugin.cache_images = False
         self.assertIsNone(
