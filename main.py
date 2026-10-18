@@ -418,6 +418,14 @@ class APOD(Star):
         url = apod_data.get("hdurl") or apod_data.get("url")
         # 图片/视频都可以直接作为媒体发送；没有可用媒体时降级为文字+链接，
         # 不再把视频型条目当成错误回退。
+        title_zh, explanation_zh = await self._translate_fields(
+            apod_data, umo=event.unified_msg_origin
+        )
+        display_text = self._build_display_text(
+            apod_data, title_zh, explanation_zh, display_name=display_name
+        )
+
+        # 翻译可能较慢；放在本地化之前，缩短“待发送文件被淘汰”的窗口。
         media_component = None
         media_path = None
         if self.send_media and url:
@@ -430,13 +438,6 @@ class APOD(Star):
                     if media_path
                     else Comp.Image.fromURL(url)
                 )
-
-        title_zh, explanation_zh = await self._translate_fields(
-            apod_data, umo=event.unified_msg_origin
-        )
-        display_text = self._build_display_text(
-            apod_data, title_zh, explanation_zh, display_name=display_name
-        )
 
         # 图片可按配置合并；视频始终分开发送：平台发不了视频时，
         # 也不能把正文和原文链接一起拖下水。
