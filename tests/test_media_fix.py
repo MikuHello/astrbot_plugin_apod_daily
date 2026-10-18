@@ -648,8 +648,12 @@ class ConfigMigrationTests(unittest.TestCase):
         async def put_cache(key, value):
             store[key] = value
 
+        async def put_kv_data(key, value):
+            store[key] = value
+
         plugin.get_cache = get_cache
         plugin.put_cache = put_cache
+        plugin.put_kv_data = put_kv_data
         return plugin, store
 
     def test_migrate_old_flat_config(self):
@@ -753,6 +757,17 @@ class ConfigMigrationTests(unittest.TestCase):
 
         config = FailingConfig()
         plugin, store = self._plugin_with_cache(config)
+        asyncio.run(plugin._migrate_config())
+        self.assertFalse(store.get("config_layout_v2"))
+
+    def test_migration_marker_write_failure_is_visible(self):
+        config = _FakeConfig({"image": False})
+        plugin, store = self._plugin_with_cache(config)
+
+        async def failing_put(key, value):
+            raise RuntimeError("kv down")
+
+        plugin.put_kv_data = failing_put
         asyncio.run(plugin._migrate_config())
         self.assertFalse(store.get("config_layout_v2"))
 
