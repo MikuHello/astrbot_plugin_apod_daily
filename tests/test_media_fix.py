@@ -296,6 +296,16 @@ class VideoParsingTests(unittest.TestCase):
         self.assertEqual(data["credit"], "Eric Holland")
         self.assertIn("Landing Zone 40", data["explanation"])
 
+    def test_explanation_stops_before_video_credit(self):
+        data = self.plugin._build_apod_data("APOD: t", LINK, VIDEO_ARTICLE)
+        self.assertTrue(data["explanation"].endswith("Landing Zone 40."))
+
+    def test_explanation_stops_before_image_credit(self):
+        data = self.plugin._build_apod_data(
+            "APOD: 2026 October 17 \u2013 3D 67P", LINK, IMAGE_ARTICLE
+        )
+        self.assertTrue(data["explanation"].endswith("mission team."))
+
     def test_image_entry_still_parses_as_image(self):
         data = self.plugin._build_apod_data(
             "APOD: 2026 October 17 \u2013 3D 67P", LINK, IMAGE_ARTICLE
