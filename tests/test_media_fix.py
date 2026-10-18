@@ -703,6 +703,14 @@ class ConfigMigrationTests(unittest.TestCase):
         asyncio.run(plugin._migrate_config())
         self.assertEqual(config["send"]["media"], True)
 
+    def test_legacy_push_media_disabled_is_preserved(self):
+        config = _FakeConfig(
+            {"send": {"media": True}, "image": True, "push": {"send_image": False}}
+        )
+        plugin, _ = self._plugin_with_cache(config)
+        asyncio.run(plugin._migrate_config())
+        self.assertEqual(config["send"]["media"], False)
+
     def test_cache_limit_migrates_from_legacy(self):
         config = _FakeConfig(
             {"apod_cache_limit": 1000, "translate_cache_limit": 250}
