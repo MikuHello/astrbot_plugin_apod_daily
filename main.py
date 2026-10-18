@@ -83,6 +83,8 @@ APOD_PUBLISH_ET_MINUTE = 5
 APOD_CACHE_GRACE_MINUTES = 10
 # 抓到旧一期（源站/CDN 尚未更新）时只短时有效，尽快重试。
 APOD_STALE_RETRY_MINUTES = 5
+# 预缓存遇到源站未更新时的重试次数（有上限，避免死循环）。
+APOD_PREFETCH_RETRY_ATTEMPTS = 3
 # 图片缓存淘汰前的最小存活时间：待发送的消息可能还引用着刚写入的文件。
 IMAGE_CACHE_MIN_AGE_SECONDS = 120
 
@@ -1248,20 +1250,39 @@ class APOD(Star):
                 delay = self._seconds_until_apod_prefetch()
                 logger.info(f"APOD 定时预缓存：距下次约 {delay / 3600:.1f} 小时。")
                 await asyncio.sleep(delay)
-                try:
-                    apod_data = await self._get_cached_data(
-                        "apod_cache",
-                        self._fetch_latest_apod,
-                        "_stale_apod",
-                        force_refresh=True,
+                # 源站晚发时会抓到旧一期：按 stale 间隔重试若干次，
+                # 否则用户首个请求还得自己抓取 + 翻译。
+                apod_data = None
+                for _ in range(APOD_PREFETCH_RETRY_ATTEMPTS):
+                    try:
+                        apod_data = await self._get_cached_data(
+                            "apod_cache",
+                            self._fetch_latest_apod,
+                            "_stale_apod",
+                            force_refresh=True,
+                        )
+                    except Exception as exc:
+                        logger.error(f"APOD 定时预缓存失败：{exc}")
+                        apod_data = None
+                    if (
+                        apod_data is not None
+                        and str(apod_data.get("date") or "")
+                        == self._expected_latest_apod_date()
+                    ):
+                        break
+                    logger.warning(
+                        "APOD 定时预缓存：源站尚未更新，"
+                        f"{APOD_STALE_RETRY_MINUTES} 分钟后重试。"
                     )
-                    if apod_data is not None:
+                    await asyncio.sleep(APOD_STALE_RETRY_MINUTES * 60)
+                if apod_data is not None:
+                    try:
                         await self._translate_fields(apod_data)
                         logger.info(
                             f"APOD 定时预缓存完成：{apod_data.get('date')}"
                         )
-                except Exception as exc:
-                    logger.error(f"APOD 定时预缓存失败：{exc}")
+                    except Exception as exc:
+                        logger.error(f"APOD 定时预缓存翻译失败：{exc}")
         except asyncio.CancelledError:
             pass
 
