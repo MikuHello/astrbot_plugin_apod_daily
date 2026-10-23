@@ -168,6 +168,12 @@ CREDIT_STOP_MARKERS = (
     "Yesterday's Image",
     "The post ",
 )
+# 说明末尾的「明日一图」预告：现代站点写作
+# <strong>Tomorrow&#8217;s picture:</strong> 短语，与说明同在一个 <p> 里。
+TOMORROW_TITLE_PATTERN = re.compile(
+    r"<(?:strong|b)>\s*Tomorrow[^<]{0,30}?picture\s*:\s*</(?:strong|b)>(.*?)</p>",
+    re.S | re.I,
+)
 PLUGIN_DISPLAY_NAME = "天文每日一图"
 NASA_DISPLAY_NAME = "NASA 每日一图"
 CREDIT_LABEL = "图片来源与版权"
@@ -1067,6 +1073,14 @@ class APOD(Star):
                 if text
                 else f"说明：{explanation}"
             )
+        tomorrow_title = str(apod_data.get("tomorrow_title") or "").strip()
+        if show_explanation and tomorrow_title:
+            tomorrow_line = f"明日一图：{tomorrow_title}"
+            text = (
+                f"{text}{newline}{newline}{tomorrow_line}"
+                if text
+                else tomorrow_line
+            )
         return text
 
     async def _resolve_chat_provider_id(
@@ -1685,6 +1699,12 @@ class APOD(Star):
         return " ".join(paragraphs) if paragraphs else self._strip_html(content_html)
 
     @classmethod
+    def _extract_tomorrow_title(cls, content_html: str) -> str:
+        """提取说明末尾的「明日一图」预告短语；没有该行时返回空串。"""
+        matched = TOMORROW_TITLE_PATTERN.search(content_html or "")
+        return cls._strip_html(matched.group(1)) if matched else ""
+
+    @classmethod
     def _parse_meta_rows(cls, content_html: str) -> list:
         rows = []
         for th_html, td_html in META_ROW_PATTERN.findall(content_html or ""):
@@ -1797,6 +1817,9 @@ class APOD(Star):
             if not explanation:
                 explanation = self._fallback_explanation(content_html)
 
+        # 「明日一图」与说明在同一个 <p> 里，但被停止标记截断，需单独提取。
+        tomorrow_title = self._extract_tomorrow_title(content_html)
+
         content_parser = _HTMLAttrParser()
         content_parser.feed(content_html or "")
         if not image_url:
@@ -1864,6 +1887,7 @@ class APOD(Star):
             "date": date_str,
             "title": title,
             "explanation": explanation,
+            "tomorrow_title": tomorrow_title,
             "credit": credit,
             "url": media_url,
             "hdurl": media_url,
