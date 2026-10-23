@@ -1769,20 +1769,6 @@ class APOD(Star):
             r"\s+", " ", html_lib.unescape(re.sub(r"<[^>]+>", " ", fragment or ""))
         ).strip()
 
-    def _fallback_explanation(self, content_html: str) -> str:
-        """无 Explanation 标记时的兜底：拼接正文 <p> 段落，避免整页纯文本混入导航与表格。"""
-        paragraphs = []
-        total = 0
-        for p in re.findall(r"<p[^>]*>(.*?)</p>", content_html or "", re.S):
-            text = self._strip_html(p)
-            if len(text) < 80:
-                continue
-            paragraphs.append(text)
-            total += len(text)
-            if total >= 800:
-                break
-        return " ".join(paragraphs) if paragraphs else self._strip_html(content_html)
-
     @classmethod
     def _extract_tomorrow_title(cls, content_html: str) -> str:
         """提取说明末尾的「明日一图」预告短语；没有该行时返回空串。"""
@@ -1899,8 +1885,6 @@ class APOD(Star):
                     stop_index = normalized_tail.find(stop_marker)
                     if stop_index > 0:
                         explanation = explanation[:stop_index].strip()
-            if not explanation:
-                explanation = self._fallback_explanation(content_html)
 
         # 「明日一图」与说明在同一个 <p> 里，但被停止标记截断，需单独提取。
         tomorrow_title = self._extract_tomorrow_title(content_html)

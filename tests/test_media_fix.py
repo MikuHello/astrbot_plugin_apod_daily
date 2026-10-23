@@ -386,6 +386,10 @@ class VideoParsingTests(unittest.TestCase):
         self.assertEqual(data["media_type"], "other")
         self.assertIsNone(data["url"])
 
+    def test_missing_explanation_marker_is_invalid(self):
+        html = "<article><h1>t</h1><p>No marker, just prose.</p></article>"
+        self.assertIsNone(self.plugin._build_apod_data("APOD: t", LINK, html))
+
     def test_nasa_video_logo_placeholder_is_not_used_as_image(self):
         page = (
             '<html><head>'
