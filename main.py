@@ -23,12 +23,16 @@ from astrbot.api.star import Context, Star, register
 # 数据层说明：
 #   最新一期：science.nasa.gov 站点 RSS feed（无需 API Key、无速率限制，
 #     每天约 UTC 04:05 发布标题形如 "APOD: 2026 October 11 – ..." 的条目），
-#     拉取失败时回退缓存（KV + 内存）。
+#     2026-10 起站点根 feed 只含新闻条目，按 APOD 分类 feed → image-article
+#     feed 兜底；全部失败时回退缓存（KV + 内存）。
 #   随机一期：官网 Random APOD 同款 embed 接口，单次 POST 返回与 feed
 #     content 同构的完整 HTML，不做缓存。
 #   解析：两类内容共用同一套解析器，来源差异只体现为 URL 与模式常量。
 # 已知坑：feed 的 XML 头畸形（两个 xmlns 声明之间缺空格），解析前需修复。
-FEED_URL = "https://science.nasa.gov/feed/"
+FEED_URLS = (
+    "https://science.nasa.gov/category/apod/feed/",
+    "https://science.nasa.gov/feed/?post_type=image-article",
+)
 FEED_XML_FIX_PATTERN = re.compile(r'"(?=xmlns:)')
 FEED_TITLE_DATE_PATTERN = re.compile(
     r"(\d{4})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})"
@@ -1590,20 +1594,28 @@ class APOD(Star):
         return None
 
     async def _fetch_from_feed(
-        self, session: aiohttp.ClientSession, feed_url: str = FEED_URL
+        self, session: aiohttp.ClientSession, feed_urls=FEED_URLS
     ) -> Optional[dict]:
-        raw_text = await self._fetch_text(session, feed_url, "NASA feed")
-        if raw_text is None:
-            return None
-        try:
-            apod_data = self._parse_feed(raw_text)
-        except ElementTree.ParseError as exc:
-            logger.error(f"解析 NASA feed XML 失败：{exc}")
-            self.last_apod_error = "NASA feed 数据格式异常，请稍后重试。"
-            return None
-        if apod_data is None:
-            self.last_apod_error = "NASA feed 中未找到有效的 APOD 条目，请稍后重试。"
-        return apod_data
+        """按顺序尝试各 feed 源：源站改版后根 feed 可能不再包含 APOD 条目。"""
+        if isinstance(feed_urls, str):
+            feed_urls = (feed_urls,)
+        last_error = None
+        for feed_url in feed_urls:
+            raw_text = await self._fetch_text(session, feed_url, "NASA feed")
+            if raw_text is None:
+                last_error = self.last_apod_error
+                continue
+            try:
+                apod_data = self._parse_feed(raw_text)
+            except ElementTree.ParseError as exc:
+                logger.error(f"解析 NASA feed XML 失败（{feed_url}）：{exc}")
+                last_error = "NASA feed 数据格式异常，请稍后重试。"
+                continue
+            if apod_data is not None:
+                return apod_data
+            last_error = "NASA feed 中未找到有效的 APOD 条目，请稍后重试。"
+        self.last_apod_error = last_error
+        return None
 
     def _parse_feed(self, raw_text: str) -> Optional[dict]:
         repaired = FEED_XML_FIX_PATTERN.sub('" ', raw_text)

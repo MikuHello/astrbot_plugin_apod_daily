@@ -553,6 +553,78 @@ class RenderingTests(unittest.TestCase):
         self.assertIsInstance(chain.chain[0], _COMP.Plain)
 
 
+class FeedSourceTests(unittest.TestCase):
+    NEWS_ONLY = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<rss version="2.0"><channel><item>'
+        "<title>NASA News</title><link>https://www.nasa.gov/news/</link>"
+        "</item></channel></rss>"
+    )
+
+    def setUp(self):
+        self.plugin = _make_plugin()
+        self.plugin.retry_count = 0
+
+    @staticmethod
+    def _session(bodies):
+        class _Resp:
+            status = 200
+
+            def __init__(self, body):
+                self._body = body
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def text(self):
+                return self._body
+
+        class _Session:
+            def get(self, url):
+                return _Resp(bodies.get(url, ""))
+
+        return _Session()
+
+    def _fetch(self, bodies):
+        return asyncio.run(self.plugin._fetch_from_feed(self._session(bodies)))
+
+    def test_first_source_is_apod_category_feed(self):
+        self.assertEqual(
+            apod_main.FEED_URLS[0],
+            "https://science.nasa.gov/category/apod/feed/",
+        )
+
+    def test_uses_first_source_when_it_has_apod(self):
+        data = self._fetch({apod_main.FEED_URLS[0]: RSS_YOUTUBE})
+        self.assertIsNotNone(data)
+        self.assertEqual(data["video_platform"], "youtube")
+
+    def test_falls_back_when_first_source_has_no_apod(self):
+        data = self._fetch(
+            {
+                apod_main.FEED_URLS[0]: self.NEWS_ONLY,
+                apod_main.FEED_URLS[1]: RSS_VIDEO,
+            }
+        )
+        self.assertIsNotNone(data)
+        self.assertEqual(data["url"], MP4)
+
+    def test_falls_back_when_first_source_is_malformed(self):
+        data = self._fetch(
+            {apod_main.FEED_URLS[0]: "<rss>", apod_main.FEED_URLS[1]: RSS_VIDEO}
+        )
+        self.assertIsNotNone(data)
+        self.assertEqual(data["url"], MP4)
+
+    def test_all_sources_without_apod_reports_error(self):
+        data = self._fetch({url: self.NEWS_ONLY for url in apod_main.FEED_URLS})
+        self.assertIsNone(data)
+        self.assertIn("未找到", self.plugin.last_apod_error)
+
+
 class TranslationPromptTests(unittest.TestCase):
     def setUp(self):
         self.plugin = _make_plugin()
