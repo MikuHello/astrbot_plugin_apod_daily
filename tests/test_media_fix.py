@@ -431,6 +431,20 @@ class YouTubeVideoTests(unittest.TestCase):
         ):
             self.assertEqual(self.plugin._youtube_watch_url(url), YOUTUBE_WATCH, url)
 
+    def test_protocol_relative_youtube_url_is_accepted(self):
+        self.assertEqual(
+            self.plugin._youtube_watch_url("//www.youtube.com/embed/DzrCEm1ZBRY"),
+            YOUTUBE_WATCH,
+        )
+
+    def test_protocol_relative_iframe_is_detected(self):
+        html = YOUTUBE_ARTICLE.replace(
+            "https://www.youtube.com/embed/", "//www.youtube.com/embed/"
+        )
+        data = self.plugin._build_apod_data("APOD: t", YOUTUBE_LINK, html)
+        self.assertEqual(data["video_platform"], "youtube")
+        self.assertEqual(data["url"], YOUTUBE_WATCH)
+
     def test_youtube_pattern_ignores_other_hosts(self):
         self.assertEqual(self.plugin._youtube_watch_url(MP4), "")
         self.assertEqual(
