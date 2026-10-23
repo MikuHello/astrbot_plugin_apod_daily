@@ -485,11 +485,15 @@ class APOD(Star):
         url = apod_data.get("hdurl") or apod_data.get("url")
         # 图片/视频都可以直接作为媒体发送；没有可用媒体时降级为文字+链接，
         # 不再把视频型条目当成错误回退。
-        title_zh, explanation_zh = await self._translate_fields(
+        title_zh, explanation_zh, tomorrow_zh = await self._translate_fields(
             apod_data, umo=event.unified_msg_origin
         )
         display_text = self._build_display_text(
-            apod_data, title_zh, explanation_zh, display_name=display_name
+            apod_data,
+            title_zh,
+            explanation_zh,
+            tomorrow_zh=tomorrow_zh,
+            display_name=display_name,
         )
 
         # 翻译可能较慢；放在本地化之前，缩短“待发送文件被淘汰”的窗口。
@@ -638,7 +642,7 @@ class APOD(Star):
         if apod_data is None:
             return self.last_apod_error or f"获取{label}失败，请稍后重试。"
         # 没有可用媒体（视频/无图）时不再判失败：消息链只带文字+原文链接。
-        title_zh, explanation_zh = await self._translate_fields(
+        title_zh, explanation_zh, tomorrow_zh = await self._translate_fields(
             apod_data, umo=event.unified_msg_origin
         )
         display_name = (
@@ -648,6 +652,7 @@ class APOD(Star):
             apod_data,
             title_zh,
             explanation_zh,
+            tomorrow_zh=tomorrow_zh,
             with_media=self.send_media,
             display_name=display_name,
         )
@@ -668,6 +673,7 @@ class APOD(Star):
                 apod_data,
                 title_zh,
                 explanation_zh,
+                tomorrow_zh=tomorrow_zh,
                 with_media=False,
                 display_name=display_name,
             )
@@ -756,14 +762,15 @@ class APOD(Star):
         self,
         apod_data: Dict[str, Any],
         umo: Optional[str] = None,
-    ) -> tuple[Optional[str], Optional[str]]:
-        """按发送/翻译配置翻译标题与说明。
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """按发送/翻译配置翻译标题、说明与「明日一图」。
 
-        一条请求可同时翻译两个字段；缓存仍按字段各自存放（键不变），
+        一条请求可同时翻译三个字段；缓存仍按字段各自存放（键不变），
         因此开关变化不会产生版本化/迁移，最多重译。
         """
         explanation = (apod_data.get("explanation") or "").strip()
         title = (apod_data.get("title") or "").strip()
+        tomorrow = (apod_data.get("tomorrow_title") or "").strip()
 
         want_title = bool(title) and self.translate_title and self.send_title
         want_explanation = (
@@ -771,15 +778,21 @@ class APOD(Star):
             and self.translate_explanation
             and self.send_explanation
         )
-        if not want_title and not want_explanation:
-            return None, None
+        # 「明日一图」跟着说明一起显示/翻译，不额外增加开关。
+        want_tomorrow = (
+            bool(tomorrow)
+            and self.translate_explanation
+            and self.send_explanation
+        )
+        if not want_title and not want_explanation and not want_tomorrow:
+            return None, None, None
 
         provider_id = await self._resolve_chat_provider_id(umo)
         if not provider_id:
             logger.warning("未能解析翻译模型，本次使用原文。")
-            return None, None
+            return None, None, None
 
-        title_zh = explanation_zh = None
+        title_zh = explanation_zh = tomorrow_zh = None
         if want_title:
             title_zh = await self.get_cache(
                 self._build_translation_cache_key(provider_id, title)
@@ -788,17 +801,23 @@ class APOD(Star):
             explanation_zh = await self.get_cache(
                 self._build_translation_cache_key(provider_id, explanation)
             )
+        if want_tomorrow:
+            tomorrow_zh = await self.get_cache(
+                self._build_translation_cache_key(provider_id, tomorrow)
+            )
 
         need_title = want_title and title_zh is None
         need_explanation = want_explanation and explanation_zh is None
-        if not need_title and not need_explanation:
-            return title_zh, explanation_zh
+        need_tomorrow = want_tomorrow and tomorrow_zh is None
+        if not need_title and not need_explanation and not need_tomorrow:
+            return title_zh, explanation_zh, tomorrow_zh
 
         epoch = self._cache_epoch
-        got_title, got_explanation = await self._translate_batch(
+        got_title, got_explanation, got_tomorrow = await self._translate_batch(
             title if need_title else None,
             explanation if need_explanation else None,
             provider_id,
+            tomorrow=tomorrow if need_tomorrow else None,
         )
         # 清理（_cache_epoch 变化）之后不再写回；校验在写入锁内进行。
         if need_title and got_title:
@@ -813,23 +832,32 @@ class APOD(Star):
                 got_explanation,
                 epoch,
             )
-        return title_zh, explanation_zh
+        if need_tomorrow and got_tomorrow:
+            tomorrow_zh = got_tomorrow
+            await self._cache_translation(
+                self._build_translation_cache_key(provider_id, tomorrow),
+                got_tomorrow,
+                epoch,
+            )
+        return title_zh, explanation_zh, tomorrow_zh
 
     async def _translate_batch(
         self,
         title: Optional[str],
         explanation: Optional[str],
         provider_id: str,
-    ) -> tuple[Optional[str], Optional[str]]:
-        """一条请求翻译缺失字段；single-flight 合并并发，失败降级 (None, None)。"""
+        tomorrow: Optional[str] = None,
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """一条请求翻译缺失字段；single-flight 合并并发，失败降级为 (None, None, None)。"""
         request_key = self._build_translation_cache_key(
-            provider_id, f"batch\x00{title or ''}\x00{explanation or ''}"
+            provider_id,
+            f"batch\x00{title or ''}\x00{explanation or ''}\x00{tomorrow or ''}",
         )
         flight = self._translation_flights.get(request_key)
         if flight is None:
             flight = asyncio.create_task(
                 self._run_translation_flight(
-                    request_key, title, explanation, provider_id
+                    request_key, title, explanation, provider_id, tomorrow
                 )
             )
             self._translation_flights[request_key] = flight
@@ -841,7 +869,7 @@ class APOD(Star):
             )
         except Exception as exc:
             logger.warning(f"翻译未在预算内完成，本次降级使用原文：{exc}")
-            return None, None
+            return None, None, None
 
     async def _run_translation_flight(
         self,
@@ -849,18 +877,19 @@ class APOD(Star):
         title: Optional[str],
         explanation: Optional[str],
         provider_id: str,
-    ) -> tuple[Optional[str], Optional[str]]:
-        """single-flight 工作体：模型调用限时，失败与异常统一降级为 (None, None)。"""
+        tomorrow: Optional[str] = None,
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """single-flight 工作体：模型调用限时，失败与异常统一降级。"""
         try:
             return await asyncio.wait_for(
-                self._translate_uncached(title, explanation, provider_id),
+                self._translate_uncached(title, explanation, provider_id, tomorrow),
                 timeout=self.timeout,
             )
         except Exception as exc:
             # 在 worker 内消费异常：即使已无等待者，
             # 也不会出现 “Future exception was never retrieved”。
             logger.warning(f"翻译执行失败，降级为原文：{exc}")
-            return None, None
+            return None, None, None
         finally:
             self._translation_flights.pop(request_key, None)
 
@@ -869,19 +898,22 @@ class APOD(Star):
         title: Optional[str],
         explanation: Optional[str],
         provider_id: str,
-    ) -> tuple[Optional[str], Optional[str]]:
+        tomorrow: Optional[str] = None,
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
         """调用模型并按结构化标签解析；解析失败按配置重试，不缓存失败结果。"""
         want_title = title is not None
         want_explanation = explanation is not None
+        want_tomorrow = tomorrow is not None
         system_prompt = self._build_translation_system_prompt(
-            want_title, want_explanation
+            want_title, want_explanation, want_tomorrow
         )
-        prompt = self._build_translation_input(title, explanation)
+        prompt = self._build_translation_input(title, explanation, tomorrow)
 
         best_title: Optional[str] = None
         best_explanation: Optional[str] = None
+        best_tomorrow: Optional[str] = None
         retry_notice = self._build_translation_retry_notice(
-            want_title, want_explanation
+            want_title, want_explanation, want_tomorrow
         )
         attempts = self.translate_parse_retry + 1
         for attempt in range(attempts):
@@ -891,21 +923,27 @@ class APOD(Star):
             raw = await self._call_translation_llm(
                 system_prompt, attempt_prompt, provider_id
             )
-            got_title, got_explanation = self._parse_translation_response(
-                raw, want_title, want_explanation
+            got_title, got_explanation, got_tomorrow = (
+                self._parse_translation_response(
+                    raw, want_title, want_explanation, want_tomorrow
+                )
             )
             best_title = got_title or best_title
             best_explanation = got_explanation or best_explanation
+            best_tomorrow = got_tomorrow or best_tomorrow
             title_ok = not want_title or got_title is not None
             explanation_ok = not want_explanation or got_explanation is not None
-            if title_ok and explanation_ok:
-                return best_title, best_explanation
+            tomorrow_ok = not want_tomorrow or got_tomorrow is not None
+            if title_ok and explanation_ok and tomorrow_ok:
+                return best_title, best_explanation, best_tomorrow
             logger.warning(f"翻译未按标签结构返回（{attempt + 1}/{attempts}）。")
-        return best_title, best_explanation
+        return best_title, best_explanation, best_tomorrow
 
     @staticmethod
     def _build_translation_input(
-        title: Optional[str], explanation: Optional[str]
+        title: Optional[str],
+        explanation: Optional[str],
+        tomorrow: Optional[str] = None,
     ) -> str:
         # 输入与输出使用同一组标签：模型只需把标签里的内容翻译后放回。
         parts = []
@@ -913,28 +951,41 @@ class APOD(Star):
             parts.append(f"<title>{title}</title>")
         if explanation is not None:
             parts.append(f"<explanation>{explanation}</explanation>")
+        if tomorrow is not None:
+            parts.append(f"<tomorrow>{tomorrow}</tomorrow>")
         return chr(10).join(parts)
 
     @staticmethod
     def _build_translation_system_prompt(
-        want_title: bool, want_explanation: bool
+        want_title: bool,
+        want_explanation: bool,
+        want_tomorrow: bool = False,
     ) -> str:
-        if want_title and want_explanation:
-            task = "把标签内的标题与说明分别翻译为简体中文"
-        elif want_title:
-            task = "把标签内的标题翻译为简体中文"
-        else:
-            task = "把标签内的说明翻译为简体中文"
+        targets = []
+        if want_title:
+            targets.append("标题")
+        if want_explanation:
+            targets.append("说明")
+        if want_tomorrow:
+            targets.append("「明日一图」预告")
+        task = f"把标签内的{'、'.join(targets)}翻译为简体中文"
 
         lines = [
             "你是一位精通天文学的翻译专家。",
             f"一、遵循「信、达、雅」，{task}；",
             "二、专有名词与编号保留原形（如 67P、ISS、APOD）；",
         ]
+        rule_no = 3
         if want_title:
-            lines.append("三、标题：不可译则不译，原样输出；单行，不加句号；")
+            lines.append(
+                f"{rule_no}、标题：不可译则不译，原样输出；单行，不加句号；"
+            )
+            rule_no += 1
+        if want_tomorrow:
+            lines.append(f"{rule_no}、明日一图：译成简短的中文短语，不加句号；")
+            rule_no += 1
         lines.append(
-            f"{'四' if want_title else '三'}、禁止项：不要添加原文没有的 markdown、"
+            f"{rule_no}、禁止项：不要添加原文没有的 markdown、"
             "引号、列表或解释文字。"
         )
         lines.append("只输出以下结构，标签之外不要有任何字符：")
@@ -943,19 +994,25 @@ class APOD(Star):
             lines.append("<title>译好的标题</title>")
         if want_explanation:
             lines.append("<explanation>译好的说明</explanation>")
+        if want_tomorrow:
+            lines.append("<tomorrow>译好的明日一图预告</tomorrow>")
         lines.append("```")
         lines.append("以上内容将直接用于发布，不经过二次编辑。")
         return chr(10).join(lines)
 
     @staticmethod
     def _build_translation_retry_notice(
-        want_title: bool, want_explanation: bool
+        want_title: bool,
+        want_explanation: bool,
+        want_tomorrow: bool = False,
     ) -> str:
         tags = []
         if want_title:
             tags.append("<title>…</title>")
         if want_explanation:
             tags.append("<explanation>…</explanation>")
+        if want_tomorrow:
+            tags.append("<tomorrow>…</tomorrow>")
         return (
             "上次输出未遵守结构。请只输出 "
             + " 和 ".join(tags)
@@ -969,11 +1026,15 @@ class APOD(Star):
 
     @classmethod
     def _parse_translation_response(
-        cls, text: Optional[str], want_title: bool, want_explanation: bool
-    ) -> tuple[Optional[str], Optional[str]]:
+        cls,
+        text: Optional[str],
+        want_title: bool,
+        want_explanation: bool,
+        want_tomorrow: bool = False,
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
         cleaned = cls._strip_code_fence(text or "")
         if not cleaned:
-            return None, None
+            return None, None, None
 
         def grab(tag: str) -> Optional[str]:
             matched = re.search(
@@ -983,13 +1044,17 @@ class APOD(Star):
 
         title = grab("title") if want_title else None
         explanation = grab("explanation") if want_explanation else None
+        tomorrow = grab("tomorrow") if want_tomorrow else None
         # 残留未闭合标签 = 这次输出是残缺的，不能走纯文本兜底。
-        leftover_tag = bool(re.search(r"</?(?:title|explanation)\b", cleaned, re.I))
+        leftover_tag = bool(
+            re.search(r"</?(?:title|explanation|tomorrow)\b", cleaned, re.I)
+        )
         # 单字段请求且模型没写完整标签 → 整体兜底；但标题必须是短单行，
         # 否则视为解析失败（防小作文从无标签路径混进来）。
         if (
             want_title
             and not want_explanation
+            and not want_tomorrow
             and title is None
             and not leftover_tag
         ):
@@ -999,10 +1064,21 @@ class APOD(Star):
         if (
             want_explanation
             and not want_title
+            and not want_tomorrow
             and explanation is None
             and not leftover_tag
         ):
             explanation = cleaned
+        if (
+            want_tomorrow
+            and not want_title
+            and not want_explanation
+            and tomorrow is None
+            and not leftover_tag
+        ):
+            candidate = cleaned.splitlines()[0].strip() if cleaned else ""
+            if candidate and len(candidate) <= 80:
+                tomorrow = candidate
         # 空标签（<title></title>）会产生空串，splitlines()[0] 会抛 IndexError，
         # 所以取首行前先允许空值。
         if title is not None:
@@ -1010,7 +1086,10 @@ class APOD(Star):
             title = first_line.strip().rstrip("。.．") or None
         if explanation is not None:
             explanation = explanation.strip() or None
-        return title, explanation
+        if tomorrow is not None:
+            first_line = next(iter(tomorrow.splitlines()), "")
+            tomorrow = first_line.strip().rstrip("。．") or None
+        return title, explanation, tomorrow
 
     @staticmethod
     def _format_date_cn(date_str: str) -> str:
@@ -1026,6 +1105,7 @@ class APOD(Star):
         apod_data: Dict[str, Any],
         title_zh: Optional[str],
         explanation_zh: Optional[str],
+        tomorrow_zh: Optional[str] = None,
         display_name: str = PLUGIN_DISPLAY_NAME,
     ) -> str:
         """生成“品牌头 + 标题/日期/版权 + 空行 + 说明”的正文。"""
@@ -1075,7 +1155,12 @@ class APOD(Star):
             )
         tomorrow_title = str(apod_data.get("tomorrow_title") or "").strip()
         if show_explanation and tomorrow_title:
-            tomorrow_line = f"明日一图：{tomorrow_title}"
+            tomorrow_zh = (tomorrow_zh or "").strip()
+            tomorrow_line = (
+                f"明日一图：{tomorrow_zh}（{tomorrow_title}）"
+                if tomorrow_zh and tomorrow_zh != tomorrow_title
+                else f"明日一图：{tomorrow_zh or tomorrow_title}"
+            )
             text = (
                 f"{text}{newline}{newline}{tomorrow_line}"
                 if text
@@ -2073,7 +2158,7 @@ class APOD(Star):
         if not pending:
             return True
 
-        title_zh, explanation_zh = await self._translate_fields(apod_data)
+        title_zh, explanation_zh, tomorrow_zh = await self._translate_fields(apod_data)
         delivered = 0
         for umo in pending:
             # 每个会话发送前重建消息链：本地图片可能已被其他请求淘汰，
@@ -2082,6 +2167,7 @@ class APOD(Star):
                 apod_data,
                 title_zh,
                 explanation_zh,
+                tomorrow_zh=tomorrow_zh,
                 with_media=self.send_media,
             )
             fallback = None
@@ -2094,6 +2180,7 @@ class APOD(Star):
                     apod_data,
                     title_zh,
                     explanation_zh,
+                    tomorrow_zh=tomorrow_zh,
                     with_media=False,
                 )
             if not await self._send_chain_with_fallback(umo, chain, fallback):
@@ -2265,6 +2352,7 @@ class APOD(Star):
         apod_data: Dict[str, Any],
         title_zh: Optional[str],
         explanation_zh: Optional[str],
+        tomorrow_zh: Optional[str] = None,
         with_media: bool = True,
         display_name: str = PLUGIN_DISPLAY_NAME,
     ) -> MessageChain:
@@ -2296,6 +2384,7 @@ class APOD(Star):
             apod_data,
             title_zh,
             explanation_zh,
+            tomorrow_zh=tomorrow_zh,
             display_name=display_name,
         )
         if text:

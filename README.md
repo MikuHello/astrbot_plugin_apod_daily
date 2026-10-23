@@ -7,7 +7,8 @@
 - 数据源切换为 science.nasa.gov 官方 RSS（上游 api.nasa.gov 在迁移期不稳定）
 - 新增订阅推送：定时推送（默认每天 01:00）/ 上游更新即推 两种模式
 - 新增随机天文图：复用官网 Random APOD 同款 embed 接口，一次请求取全量内容
-- 翻译未配置 provider 时自动使用 AstrBot 默认对话模型；标题与说明一次请求结构化返回
+- 翻译未配置 provider 时自动使用 AstrBot 默认对话模型；标题、说明与「明日一图」一次请求结构化返回
+- 显示说明末尾的「明日一图」预告（随说明一起翻译，缺译文时保留原文）
 - 支持视频型条目（解析 `<video>`/`og:video`/feed enclosure/YouTube iframe；YouTube 条目发观看链接，平台不支持时降级为文字+链接）
 - 修复缓存时区问题；移除已失效的 NASA API 依赖
 
