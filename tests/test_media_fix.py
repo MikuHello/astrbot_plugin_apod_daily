@@ -86,6 +86,11 @@ YOUTUBE_LINK = (
     "https://science.nasa.gov/image-article/"
     "apod-2026-october-18-sonified-eagle-nebula-pillars/"
 )
+POSTER = (
+    "https://assets.science.nasa.gov/dynamicimage/assets/science/cds/apod/apod/"
+    "2026/october/SonifiedEagleNebulaPillars.jpg?w=3048&h=1708&fit=clip"
+)
+POSTER_XML = POSTER.replace("&", "&#038;")
 
 YOUTUBE_ARTICLE = f"""
 <article>
@@ -104,7 +109,9 @@ RSS_YOUTUBE = f"""<?xml version="1.0" encoding="UTF-8"?>
 <item>
   <title>APOD: 2026 October 18 &#8211; Sonified: Eagle Nebula Pillars</title>
   <link>{YOUTUBE_LINK}</link>
-  <media:content url="https://www.youtube.com/embed/DzrCEm1ZBRY" medium="video" />
+  <media:content url="https://www.youtube.com/embed/DzrCEm1ZBRY" medium="video">
+    <media:thumbnail url="{POSTER_XML}" />
+  </media:content>
   <content:encoded><![CDATA[
   <p>Explanation: The Pillars of Creation are rendered as sound in this
      sonification of Hubble data.</p>
@@ -425,6 +432,7 @@ class YouTubeVideoTests(unittest.TestCase):
         self.assertEqual(data["media_type"], "video")
         self.assertEqual(data["video_platform"], "youtube")
         self.assertEqual(data["url"], YOUTUBE_WATCH)
+        self.assertEqual(data["poster_url"], POSTER)
         self.assertEqual(data["date"], "2026-10-18")
         self.assertEqual(data["link"], YOUTUBE_LINK)
 
@@ -450,15 +458,31 @@ class YouTubeVideoTests(unittest.TestCase):
         self.assertIn(f"原文链接：{YOUTUBE_LINK}", text)
         self.assertNotIn("⚠️", text)
 
-    def test_message_chain_skips_video_component(self):
+    def test_direct_video_poster_falls_back_to_og_image(self):
+        data = self.plugin._build_apod_data(
+            "APOD: t", LINK, VIDEO_ARTICLE, image_url=POSTER, video_url=MP4
+        )
+        self.assertEqual(data["media_type"], "video")
+        self.assertEqual(data["video_platform"], "direct")
+        self.assertEqual(data["poster_url"], POSTER)
+
+    def test_image_entry_has_no_poster(self):
+        data = self.plugin._build_apod_data(
+            "APOD: t", LINK, IMAGE_ARTICLE, poster_url=POSTER
+        )
+        self.assertEqual(data["media_type"], "image")
+        self.assertEqual(data["poster_url"], "")
+
+    def test_message_chain_uses_poster_instead_of_video(self):
         data = self.plugin._parse_feed(RSS_YOUTUBE)
         chain = asyncio.run(self.plugin._build_message_chain(data, None, None))
-        self.assertEqual(len(chain.chain), 1)
-        self.assertIsInstance(chain.chain[0], _COMP.Plain)
+        self.assertEqual(len(chain.chain), 2)
+        self.assertNotIsInstance(chain.chain[0], _COMP.Video)
+        self.assertIsInstance(chain.chain[0], _COMP.Image)
+        self.assertEqual(chain.chain[0].file, POSTER)
+        self.assertIsInstance(chain.chain[1], _COMP.Plain)
 
-    def test_reply_sends_text_only(self):
-        self.plugin.is_divided = False
-
+    def test_reply_sends_poster_then_text(self):
         async def translate(apod_data, umo=None):
             return None, None
 
@@ -475,8 +499,8 @@ class YouTubeVideoTests(unittest.TestCase):
             return [item async for item in self.plugin._reply_apod(event, data)]
 
         results = asyncio.run(collect())
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0][0], "text")
+        self.assertEqual([r[0] for r in results], ["image", "text"])
+        self.assertEqual(results[0][1], POSTER)
 
 
 class RenderingTests(unittest.TestCase):
