@@ -94,7 +94,7 @@ PUBLISHED_META_KEYS = ("parsely-pub-date", "article:published_time")
 
 
 class _HTMLAttrParser(HTMLParser):
-    """收集 og:image、发布时间 meta 与 <img> src：属性顺序、引号风格与大小写无关。"""
+    """收集 og:image、发布时间 meta 与媒体 src：属性顺序、引号风格与大小写无关。"""
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -103,6 +103,7 @@ class _HTMLAttrParser(HTMLParser):
         self.published_meta = ""
         self.img_srcs = []
         self.video_srcs = []
+        self.iframe_srcs = []
 
     def handle_starttag(self, tag, attrs):
         attrs_map = {name.lower(): value or "" for name, value in attrs}
@@ -120,6 +121,9 @@ class _HTMLAttrParser(HTMLParser):
         elif tag in ("video", "source") and attrs_map.get("src"):
             # <video src> 与 <video><source src> 都算候选视频直链。
             self.video_srcs.append(attrs_map["src"])
+        elif tag == "iframe" and attrs_map.get("src"):
+            # 嵌入播放器（YouTube 等）不会出现在 video/source 里。
+            self.iframe_srcs.append(attrs_map["src"])
 IMAGE_URL_SOURCES = (
     "assets.science.nasa.gov",
     "apod.nasa.gov/apod/image",
@@ -129,6 +133,15 @@ IMAGE_URL_SOURCES = (
 # 视频直链：优先看扩展名，同时兼容 og:video 的多种 property 写法。
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".m4v", ".ogv", ".m3u8")
 OG_VIDEO_META_KEYS = ("og:video", "og:video:url", "og:video:secure_url")
+# YouTube 嵌入条目：og:video 与 <iframe src> 给的是 embed 页而非视频文件，
+# 只对外提供归一化后的 watch 链接。锚定开头，避免把查询参数里的链接误判。
+YOUTUBE_ID_PATTERN = re.compile(
+    r"^(?:https?:)?//(?:www\.|m\.)?"
+    r"(?:youtube(?:-nocookie)?\.com/(?:embed/|shorts/|live/|watch\?(?:[^#]*&)?v=)"
+    r"|youtu\.be/)([A-Za-z0-9_-]{6,})"
+)
+VIDEO_PLATFORM_YOUTUBE = "youtube"
+VIDEO_PLATFORM_DIRECT = "direct"
 EXPLANATION_STOP_MARKERS = (
     "APOD's main NASA site is moving",
     "Tomorrow's picture",
@@ -470,9 +483,13 @@ class APOD(Star):
         )
 
         # 翻译可能较慢；放在本地化之前，缩短“待发送文件被淘汰”的窗口。
+        video_platform = str(apod_data.get("video_platform") or "").strip().lower()
+        is_youtube_video = (
+            media_type == "video" and video_platform == VIDEO_PLATFORM_YOUTUBE
+        )
         media_component = None
         media_path = None
-        if self.send_media and url:
+        if self.send_media and url and not is_youtube_video:
             if media_type == "video":
                 media_component = Comp.Video.fromURL(url)
             else:
@@ -1011,6 +1028,8 @@ class APOD(Star):
         newline = chr(10)
         lines = [display_name]
         media_type = str(apod_data.get("media_type") or "").strip().lower()
+        video_platform = str(apod_data.get("video_platform") or "").strip().lower()
+        video_url = str(apod_data.get("url") or "").strip()
         link = str(apod_data.get("link") or "").strip()
         if show_title and title:
             # 有译文且与原文不同时，展示“译文（原文）”；否则只展示其一
@@ -1021,7 +1040,11 @@ class APOD(Star):
         if show_date and date_cn:
             lines.append(f"日期：{date_cn}")
         if media_type == "video":
-            lines.append("▶ 本期为视频")
+            if video_platform == VIDEO_PLATFORM_YOUTUBE and video_url:
+                # YouTube 条目没有文件直链，直接给可点击的观看地址。
+                lines.append(f"▶ 本期为视频（YouTube）：{video_url}")
+            else:
+                lines.append("▶ 本期为视频")
         elif media_type not in ("image", ""):
             lines.append("⚠️ 本期无可用图片，可查看原文")
         if credit:
@@ -1494,9 +1517,9 @@ class APOD(Star):
         image_url = html_lib.unescape(page_parser.og_image).strip()
         if image_url and not self._is_usable_image(image_url):
             image_url = ""
-        video_url = html_lib.unescape(page_parser.og_video).strip()
-        if video_url and not self._is_usable_video(video_url):
-            video_url = ""
+        video_url, _ = self._classify_video(
+            html_lib.unescape(page_parser.og_video).strip()
+        )
         if not image_url:
             region_parser = _HTMLAttrParser()
             region_parser.feed(region)
@@ -1756,20 +1779,21 @@ class APOD(Star):
                     image_url = candidate
                     break
 
-        # 视频直链候选：显式传入（feed enclosure / NASA og:video）→ og:video →
-        # 正文 <video>/<source>；任何一个可用即按视频条目处理。
+        # 视频候选：显式传入（feed media:content / NASA og:video）→ og:video →
+        # 正文 <video>/<source> → <iframe>（YouTube 等嵌入播放器）。
+        # YouTube 没有文件直链，只保留归一化后的 watch 链接。
         video_candidates = (
             video_url,
             content_parser.og_video,
             *content_parser.video_srcs,
+            *content_parser.iframe_srcs,
         )
+        video_url, video_platform = "", ""
         for candidate in video_candidates:
             candidate = html_lib.unescape(candidate or "").strip()
-            if self._is_usable_video(candidate):
-                video_url = candidate
+            video_url, video_platform = self._classify_video(candidate)
+            if video_url:
                 break
-        else:
-            video_url = ""
 
         title_matched = FEED_TITLE_PREFIX_PATTERN.match(title_raw or "")
         title = (
@@ -1806,6 +1830,7 @@ class APOD(Star):
             "url": media_url,
             "hdurl": media_url,
             "media_type": media_type,
+            "video_platform": video_platform,
             "service_version": "science.nasa.gov",
             "link": link,
         }
@@ -1829,6 +1854,26 @@ class APOD(Star):
             return False
         path = lowered.split("?", 1)[0].split("#", 1)[0]
         return path.endswith(VIDEO_EXTENSIONS)
+
+    @staticmethod
+    def _youtube_watch_url(url: str) -> str:
+        """把 YouTube 的 embed/shorts/youtu.be 链接还原成 watch 链接；其它返回空串。"""
+        if not url.startswith("http"):
+            return ""
+        matched = YOUTUBE_ID_PATTERN.search(url)
+        return (
+            f"https://www.youtube.com/watch?v={matched.group(1)}" if matched else ""
+        )
+
+    @classmethod
+    def _classify_video(cls, url: str):
+        """候选地址 → (可用地址, 平台)：YouTube 归一化，其余按直链扩展名判定。"""
+        watch_url = cls._youtube_watch_url(url or "")
+        if watch_url:
+            return watch_url, VIDEO_PLATFORM_YOUTUBE
+        if cls._is_usable_video(url or ""):
+            return url, VIDEO_PLATFORM_DIRECT
+        return "", ""
 
     # ---------- 时区工具（pubDate 兜底换算与“最新一期”探测用） ----------
 
@@ -2163,9 +2208,13 @@ class APOD(Star):
         chain = []
         url = apod_data.get("hdurl") or apod_data.get("url")
         media_type = str(apod_data.get("media_type") or "").strip().lower()
+        video_platform = str(apod_data.get("video_platform") or "").strip().lower()
         if with_media and url:
             if media_type == "video":
-                chain.append(Comp.Video.fromURL(url))
+                # YouTube 只有网页地址，交给平台当视频发只会失败；
+                # 观看地址由正文字段展示。
+                if video_platform != VIDEO_PLATFORM_YOUTUBE:
+                    chain.append(Comp.Video.fromURL(url))
             else:
                 local_path = await self._localize_image(url)
                 if local_path:
