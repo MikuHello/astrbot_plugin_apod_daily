@@ -536,6 +536,17 @@ class TomorrowTitleTests(unittest.TestCase):
         data = self.plugin._build_apod_data("APOD: t", LINK, IMAGE_ARTICLE)
         self.assertEqual(data["tomorrow_title"], "")
 
+    def test_random_entry_has_no_tomorrow_line(self):
+        html = (
+            f'<h1>Random</h1><a href="{LINK}">x</a>'
+            "<p>Explanation: Some astronomy text."
+            "<br><strong>Tomorrow&#8217;s picture:</strong> eye in the sky</p>"
+        )
+        data = self.plugin._build_random_apod(html)
+        self.assertIsNotNone(data)
+        self.assertEqual(data["tomorrow_title"], "")
+        self.assertIn("Some astronomy text", data["explanation"])
+
     def test_tomorrow_line_rendered_after_explanation(self):
         text = self.plugin._build_display_text(self._data(), None, None)
         self.assertIn("\n\n明日一图：eye in the sky", text)
