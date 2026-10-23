@@ -124,6 +124,16 @@ RSS_YOUTUBE = f"""<?xml version="1.0" encoding="UTF-8"?>
 """
 
 
+TOMORROW_HTML = """
+<article>
+<h1>Example</h1>
+<p>Explanation: The sky is dark tonight, and the stars are out.
+  <br><br><strong>Tomorrow&#8217;s picture:</strong> eye in the sky
+</p>
+</article>
+"""
+
+
 class _FakeSP:
     def __init__(self):
         self.prefs = []
@@ -501,6 +511,36 @@ class YouTubeVideoTests(unittest.TestCase):
         results = asyncio.run(collect())
         self.assertEqual([r[0] for r in results], ["image", "text"])
         self.assertEqual(results[0][1], POSTER)
+
+
+class TomorrowTitleTests(unittest.TestCase):
+    def setUp(self):
+        self.plugin = _make_plugin()
+
+    def _data(self):
+        return self.plugin._build_apod_data("APOD: t", LINK, TOMORROW_HTML)
+
+    def test_tomorrow_line_is_extracted(self):
+        self.assertEqual(self._data()["tomorrow_title"], "eye in the sky")
+
+    def test_explanation_stops_before_tomorrow_line(self):
+        explanation = self._data()["explanation"]
+        self.assertTrue(explanation.endswith("stars are out."))
+        self.assertNotIn("Tomorrow", explanation)
+
+    def test_missing_tomorrow_line_is_empty(self):
+        data = self.plugin._build_apod_data("APOD: t", LINK, IMAGE_ARTICLE)
+        self.assertEqual(data["tomorrow_title"], "")
+
+    def test_tomorrow_line_rendered_after_explanation(self):
+        text = self.plugin._build_display_text(self._data(), None, None)
+        self.assertIn("\n\n明日一图：eye in the sky", text)
+        self.assertGreater(text.index("明日一图："), text.index("说明："))
+
+    def test_tomorrow_line_hidden_with_explanation(self):
+        self.plugin.send_explanation = False
+        text = self.plugin._build_display_text(self._data(), None, None)
+        self.assertNotIn("明日一图：", text)
 
 
 class RenderingTests(unittest.TestCase):
