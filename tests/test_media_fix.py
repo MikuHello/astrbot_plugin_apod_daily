@@ -80,6 +80,43 @@ RSS_VIDEO = f"""<?xml version="1.0" encoding="UTF-8"?>
 """
 
 
+YOUTUBE_EMBED = "https://www.youtube.com/embed/DzrCEm1ZBRY?feature=oembed"
+YOUTUBE_WATCH = "https://www.youtube.com/watch?v=DzrCEm1ZBRY"
+YOUTUBE_LINK = (
+    "https://science.nasa.gov/image-article/"
+    "apod-2026-october-18-sonified-eagle-nebula-pillars/"
+)
+
+YOUTUBE_ARTICLE = f"""
+<article>
+<h1>Sonified: Eagle Nebula Pillars</h1>
+<iframe title="Sonified: Eagle Nebula Pillars" src="{YOUTUBE_EMBED}"></iframe>
+<p>Explanation: The Pillars of Creation are rendered as sound in this
+  sonification of Hubble data.</p>
+</article>
+"""
+
+RSS_YOUTUBE = f"""<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+  xmlns:content="http://purl.org/rss/1.0/modules/content/"
+  xmlns:media="http://search.yahoo.com/mrss/">
+<channel>
+<item>
+  <title>APOD: 2026 October 18 &#8211; Sonified: Eagle Nebula Pillars</title>
+  <link>{YOUTUBE_LINK}</link>
+  <media:content url="https://www.youtube.com/embed/DzrCEm1ZBRY" medium="video" />
+  <content:encoded><![CDATA[
+  <p>Explanation: The Pillars of Creation are rendered as sound in this
+     sonification of Hubble data.</p>
+  <iframe src="{YOUTUBE_EMBED}"></iframe>
+  ]]></content:encoded>
+  <pubDate>Sun, 18 Oct 2026 04:05:00 +0000</pubDate>
+</item>
+</channel>
+</rss>
+"""
+
+
 class _FakeSP:
     def __init__(self):
         self.prefs = []
@@ -351,6 +388,95 @@ class VideoParsingTests(unittest.TestCase):
         self.assertEqual(data["url"], MP4)
         self.assertEqual(data["credit"], "Eric Holland")
         self.assertEqual(data["date"], "2026-10-16")
+
+
+class YouTubeVideoTests(unittest.TestCase):
+    def setUp(self):
+        self.plugin = _make_plugin()
+
+    def test_html_parser_collects_iframe_srcs(self):
+        parser = apod_main._HTMLAttrParser()
+        parser.feed(f'<iframe src="{YOUTUBE_EMBED}"></iframe>')
+        self.assertEqual(parser.iframe_srcs, [YOUTUBE_EMBED])
+
+    def test_youtube_urls_normalize_to_watch_link(self):
+        for url in (
+            YOUTUBE_EMBED,
+            "https://youtu.be/DzrCEm1ZBRY",
+            "https://www.youtube.com/watch?v=DzrCEm1ZBRY&t=30s",
+            "https://m.youtube.com/watch?v=DzrCEm1ZBRY",
+            "https://www.youtube.com/shorts/DzrCEm1ZBRY",
+            "https://www.youtube-nocookie.com/embed/DzrCEm1ZBRY",
+        ):
+            self.assertEqual(self.plugin._youtube_watch_url(url), YOUTUBE_WATCH, url)
+
+    def test_youtube_pattern_ignores_other_hosts(self):
+        self.assertEqual(self.plugin._youtube_watch_url(MP4), "")
+        self.assertEqual(
+            self.plugin._youtube_watch_url(
+                "https://example.com/?next=https://youtu.be/DzrCEm1ZBRY"
+            ),
+            "",
+        )
+
+    def test_feed_youtube_entry_becomes_video(self):
+        data = self.plugin._parse_feed(RSS_YOUTUBE)
+        self.assertIsNotNone(data)
+        self.assertEqual(data["media_type"], "video")
+        self.assertEqual(data["video_platform"], "youtube")
+        self.assertEqual(data["url"], YOUTUBE_WATCH)
+        self.assertEqual(data["date"], "2026-10-18")
+        self.assertEqual(data["link"], YOUTUBE_LINK)
+
+    def test_article_iframe_is_detected(self):
+        data = self.plugin._build_apod_data(
+            "APOD: 2026 October 18 \u2013 Sonified: Eagle Nebula Pillars",
+            YOUTUBE_LINK,
+            YOUTUBE_ARTICLE,
+        )
+        self.assertEqual(data["media_type"], "video")
+        self.assertEqual(data["video_platform"], "youtube")
+        self.assertEqual(data["url"], YOUTUBE_WATCH)
+
+    def test_direct_video_keeps_direct_platform(self):
+        data = self.plugin._build_apod_data("APOD: t", LINK, VIDEO_ARTICLE)
+        self.assertEqual(data["video_platform"], "direct")
+        self.assertEqual(data["url"], MP4)
+
+    def test_display_text_shows_youtube_link(self):
+        data = self.plugin._parse_feed(RSS_YOUTUBE)
+        text = self.plugin._build_display_text(data, None, None)
+        self.assertIn(f"▶ 本期为视频（YouTube）：{YOUTUBE_WATCH}", text)
+        self.assertIn(f"原文链接：{YOUTUBE_LINK}", text)
+        self.assertNotIn("⚠️", text)
+
+    def test_message_chain_skips_video_component(self):
+        data = self.plugin._parse_feed(RSS_YOUTUBE)
+        chain = asyncio.run(self.plugin._build_message_chain(data, None, None))
+        self.assertEqual(len(chain.chain), 1)
+        self.assertIsInstance(chain.chain[0], _COMP.Plain)
+
+    def test_reply_sends_text_only(self):
+        self.plugin.is_divided = False
+
+        async def translate(apod_data, umo=None):
+            return None, None
+
+        self.plugin._translate_fields = translate
+        event = SimpleNamespace(
+            unified_msg_origin="umo",
+            plain_result=lambda text: ("text", text),
+            image_result=lambda url: ("image", url),
+            chain_result=lambda chain: ("chain", chain),
+        )
+        data = self.plugin._parse_feed(RSS_YOUTUBE)
+
+        async def collect():
+            return [item async for item in self.plugin._reply_apod(event, data)]
+
+        results = asyncio.run(collect())
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0][0], "text")
 
 
 class RenderingTests(unittest.TestCase):
