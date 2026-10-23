@@ -1994,7 +1994,9 @@ class APOD(Star):
     @staticmethod
     def _youtube_watch_url(url: str) -> str:
         """把 YouTube 的 embed/shorts/youtu.be 链接还原成 watch 链接；其它返回空串。"""
-        if not url.startswith("http"):
+        if url.startswith("//"):
+            url = f"https:{url}"
+        if not url.startswith(("http://", "https://")):
             return ""
         matched = YOUTUBE_ID_PATTERN.search(url)
         return (
