@@ -2316,12 +2316,12 @@ class APOD(Star):
                             pass
                         return None
                     os.replace(tmp_path, path)
-                except Exception:
+                finally:
+                    # CancelledError 不走 except Exception；统一在 finally 清理临时文件。
                     try:
                         os.remove(tmp_path)
                     except OSError:
                         pass
-                    raise
             else:
                 try:
                     # 命中也要刷新 mtime：保护窗口从最近一次使用算起。

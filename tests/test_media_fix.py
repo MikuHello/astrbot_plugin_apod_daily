@@ -1590,6 +1590,56 @@ class ImageCacheTests(unittest.TestCase):
         self.assertIsNone(got)
         self.assertFalse(os.path.exists(path))
 
+    def test_cancel_during_download_removes_partial_file(self):
+        import unittest.mock as mock
+
+        plugin = self.plugin
+        url = "https://x/cancel.jpg"
+        path = plugin._image_cache_path(url)
+        directory = plugin._image_cache_dir()
+
+        class _Content:
+            def iter_chunked(self, size):
+                async def gen():
+                    yield b"data"
+                    raise asyncio.CancelledError()
+
+                return gen()
+
+        class _Resp:
+            status = 200
+            content = _Content()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        class _Session:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def get(self, url):
+                return _Resp()
+
+        with mock.patch.object(apod_main.aiohttp, "ClientSession", _Session):
+            with self.assertRaises(asyncio.CancelledError):
+                asyncio.run(plugin._localize_image(url))
+        prefix = os.path.basename(path) + "."
+        leftovers = [
+            name
+            for name in os.listdir(directory)
+            if name.startswith(prefix) and name.endswith(".part")
+        ]
+        self.assertEqual(leftovers, [])
+
     def test_localize_refreshes_mtime_on_hit(self):
         url = "https://x/hit.jpg"
         path = self.plugin._image_cache_path(url)
