@@ -489,16 +489,20 @@ class APOD(Star):
         )
         media_component = None
         media_path = None
-        if self.send_media and url and not is_youtube_video:
-            if media_type == "video":
+        media_source = url
+        if self.send_media:
+            if media_type == "video" and not is_youtube_video:
                 media_component = Comp.Video.fromURL(url)
             else:
-                media_path = await self._localize_image(url)
-                media_component = (
-                    Comp.Image.fromFileSystem(media_path)
-                    if media_path
-                    else Comp.Image.fromURL(url)
-                )
+                if is_youtube_video:
+                    media_source = str(apod_data.get("poster_url") or "").strip()
+                if media_source:
+                    media_path = await self._localize_image(media_source)
+                    media_component = (
+                        Comp.Image.fromFileSystem(media_path)
+                        if media_path
+                        else Comp.Image.fromURL(media_source)
+                    )
 
         # 图片可按配置合并；视频始终分开发送：平台发不了视频时，
         # 也不能把正文和原文链接一起拖下水。
@@ -507,10 +511,10 @@ class APOD(Star):
             has_output = False
             if media_component is not None:
                 has_output = True
-                if media_type == "video":
+                if media_type == "video" and not is_youtube_video:
                     yield event.chain_result([media_component])
                 else:
-                    yield event.image_result(media_path or url)
+                    yield event.image_result(media_path or media_source)
             if display_text:
                 has_output = True
                 yield event.plain_result(display_text)
@@ -1612,6 +1616,7 @@ class APOD(Star):
             content_html = ""
             pub_date_raw = ""
             enclosure_url = ""
+            poster_url = ""
             for child in item:
                 tag = child.tag.rsplit("}", 1)[-1]
                 if tag == "encoded":
@@ -1630,8 +1635,17 @@ class APOD(Star):
                     candidate = child.attrib.get("url", "")
                     if candidate and "video" in media_kind:
                         enclosure_url = candidate
+            thumbnail = item.find(".//{*}thumbnail")
+            if thumbnail is not None:
+                # media:thumbnail 嵌在 media:content 里，是视频条目的封面帧。
+                poster_url = thumbnail.attrib.get("url", "")
             return self._build_apod_data(
-                title_raw, link, content_html, pub_date_raw, video_url=enclosure_url
+                title_raw,
+                link,
+                content_html,
+                pub_date_raw,
+                video_url=enclosure_url,
+                poster_url=poster_url,
             )
         logger.warning("NASA feed 中未找到 APOD 条目。")
         return None
@@ -1751,6 +1765,7 @@ class APOD(Star):
         credit: Optional[str] = None,
         image_url: Optional[str] = None,
         video_url: Optional[str] = None,
+        poster_url: Optional[str] = None,
     ) -> Optional[dict]:
         plain_text = self._strip_html(META_ROW_PATTERN.sub(" ", content_html or ""))
         # 原文的撇号是 U+2019（’），标记匹配前统一映射为 ASCII 撇号；
@@ -1822,6 +1837,17 @@ class APOD(Star):
         else:
             media_type, media_url = "other", None
 
+        # 视频条目的封面帧：feed 的 media:thumbnail 优先，其次文章页 og:image；
+        # 图片条目的 url 本身就是图片，不需要额外的 poster。
+        if media_type == "video":
+            poster_url = (
+                html_lib.unescape(poster_url or "").strip() or image_url or ""
+            )
+            if poster_url and not self._is_usable_image(poster_url):
+                poster_url = ""
+        else:
+            poster_url = ""
+
         return {
             "date": date_str,
             "title": title,
@@ -1831,6 +1857,7 @@ class APOD(Star):
             "hdurl": media_url,
             "media_type": media_type,
             "video_platform": video_platform,
+            "poster_url": poster_url,
             "service_version": "science.nasa.gov",
             "link": link,
         }
@@ -2212,9 +2239,17 @@ class APOD(Star):
         if with_media and url:
             if media_type == "video":
                 # YouTube 只有网页地址，交给平台当视频发只会失败；
-                # 观看地址由正文字段展示。
+                # 观看地址由正文字段展示，封面帧代替视频组件。
                 if video_platform != VIDEO_PLATFORM_YOUTUBE:
                     chain.append(Comp.Video.fromURL(url))
+                else:
+                    poster_url = str(apod_data.get("poster_url") or "").strip()
+                    if poster_url:
+                        local_path = await self._localize_image(poster_url)
+                        if local_path:
+                            chain.append(Comp.Image.fromFileSystem(local_path))
+                        else:
+                            chain.append(Comp.Image.fromURL(poster_url))
             else:
                 local_path = await self._localize_image(url)
                 if local_path:
