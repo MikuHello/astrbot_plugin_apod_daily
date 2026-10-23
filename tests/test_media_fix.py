@@ -494,7 +494,7 @@ class YouTubeVideoTests(unittest.TestCase):
 
     def test_reply_sends_poster_then_text(self):
         async def translate(apod_data, umo=None):
-            return None, None
+            return None, None, None
 
         self.plugin._translate_fields = translate
         event = SimpleNamespace(
@@ -541,6 +541,32 @@ class TomorrowTitleTests(unittest.TestCase):
         self.plugin.send_explanation = False
         text = self.plugin._build_display_text(self._data(), None, None)
         self.assertNotIn("明日一图：", text)
+
+    def test_translated_tomorrow_line_prefers_translation(self):
+        text = self.plugin._build_display_text(
+            self._data(), None, None, tomorrow_zh="天空之眼"
+        )
+        self.assertIn("明日一图：天空之眼（eye in the sky）", text)
+
+    def test_reply_uses_translated_tomorrow(self):
+        async def translate(apod_data, umo=None):
+            return None, None, "天空之眼"
+
+        self.plugin._translate_fields = translate
+        event = SimpleNamespace(
+            unified_msg_origin="umo",
+            plain_result=lambda text: ("text", text),
+            image_result=lambda url: ("image", url),
+            chain_result=lambda chain: ("chain", chain),
+        )
+        data = self._data()
+
+        async def collect():
+            return [item async for item in self.plugin._reply_apod(event, data)]
+
+        texts = [r[1] for r in asyncio.run(collect()) if r[0] == "text"]
+        self.assertTrue(texts)
+        self.assertIn("明日一图：天空之眼（eye in the sky）", texts[0])
 
 
 class RenderingTests(unittest.TestCase):
@@ -691,13 +717,23 @@ class TranslationPromptTests(unittest.TestCase):
         self.assertIn("<title>3D 67P</title>", text)
         self.assertIn("<explanation>Explained here.</explanation>", text)
 
+    def test_tomorrow_prompt_and_input(self):
+        prompt = self.plugin._build_translation_system_prompt(False, True, True)
+        self.assertIn("<tomorrow>译好的明日一图预告</tomorrow>", prompt)
+        self.assertIn("明日一图：译成简短的中文短语", prompt)
+        text = self.plugin._build_translation_input(
+            None, "Explained here.", "eye in the sky"
+        )
+        self.assertIn("<tomorrow>eye in the sky</tomorrow>", text)
+        self.assertNotIn("<title>", text)
+
 
 class TranslationParseTests(unittest.TestCase):
     def setUp(self):
         self.plugin = _make_plugin()
 
     def test_parse_both_fields(self):
-        title, expl = self.plugin._parse_translation_response(
+        title, expl, _ = self.plugin._parse_translation_response(
             "<title>67P 彗星的三维图</title>\n<explanation>这是说明。</explanation>",
             True,
             True,
@@ -711,18 +747,18 @@ class TranslationParseTests(unittest.TestCase):
             "<title>67P 彗星的三维图</title>\n"
             "<explanation>这是说明。</explanation>\n```\n请查收。"
         )
-        title, expl = self.plugin._parse_translation_response(raw, True, True)
+        title, expl, _ = self.plugin._parse_translation_response(raw, True, True)
         self.assertEqual(title, "67P 彗星的三维图")
         self.assertEqual(expl, "这是说明。")
 
     def test_title_takes_first_line_and_drops_period(self):
-        title, _ = self.plugin._parse_translation_response(
+        title, _, _ = self.plugin._parse_translation_response(
             "<title>67P 彗星的三维图。\n多余第二行</title>", True, False
         )
         self.assertEqual(title, "67P 彗星的三维图")
 
     def test_single_field_falls_back_to_whole_text(self):
-        title, _ = self.plugin._parse_translation_response("3D 67P", True, False)
+        title, _, _ = self.plugin._parse_translation_response("3D 67P", True, False)
         self.assertEqual(title, "3D 67P")
 
     def test_single_field_essay_fallback_is_rejected(self):
@@ -730,34 +766,50 @@ class TranslationParseTests(unittest.TestCase):
             "3D 67P 是一个天文学术语的组合，需要更多上下文才能准确翻译。"
             "如果是指 67P/Churyumov-Gerasimenko，则可译为 67P彗星的三维图。"
         )
-        title, _ = self.plugin._parse_translation_response(essay, True, False)
+        title, _, _ = self.plugin._parse_translation_response(essay, True, False)
         self.assertIsNone(title)
 
     def test_unclosed_tag_is_a_failure(self):
-        title, expl = self.plugin._parse_translation_response(
+        title, expl, _ = self.plugin._parse_translation_response(
             "<title>67P 彗星的三维图</title><explanation>被截断的说明", True, True
         )
         self.assertEqual(title, "67P 彗星的三维图")
         self.assertIsNone(expl)
 
     def test_empty_title_tag_does_not_raise(self):
-        title, expl = self.plugin._parse_translation_response(
+        title, expl, _ = self.plugin._parse_translation_response(
             "<title></title><explanation>说明译文。</explanation>", True, True
         )
         self.assertIsNone(title)
         self.assertEqual(expl, "说明译文。")
 
     def test_partial_tag_is_not_fallbacked(self):
-        title, _ = self.plugin._parse_translation_response(
+        title, _, _ = self.plugin._parse_translation_response(
             "<title>三维 67P", True, False
         )
         self.assertIsNone(title)
 
     def test_partial_explanation_tag_is_not_fallbacked(self):
-        _, expl = self.plugin._parse_translation_response(
+        _, expl, _ = self.plugin._parse_translation_response(
             "<explanation>被截断的说明", False, True
         )
         self.assertIsNone(expl)
+
+    def test_parse_tomorrow_field(self):
+        title, expl, tomorrow = self.plugin._parse_translation_response(
+            "<title>标题</title><explanation>说明。</explanation>"
+            "<tomorrow>天空之眼</tomorrow>",
+            True,
+            True,
+            True,
+        )
+        self.assertEqual((title, expl, tomorrow), ("标题", "说明。", "天空之眼"))
+
+    def test_partial_tomorrow_tag_is_not_fallbacked(self):
+        _, _, tomorrow = self.plugin._parse_translation_response(
+            "<tomorrow>天空之眼", False, False, True
+        )
+        self.assertIsNone(tomorrow)
 
 
 class _FakeContext:
@@ -778,7 +830,7 @@ class TranslationFlowTests(unittest.TestCase):
         self.plugin.context = _FakeContext(
             ["<title>三维 67P</title><explanation>说明译文。</explanation>"]
         )
-        title, expl = asyncio.run(
+        title, expl, _ = asyncio.run(
             self.plugin._translate_uncached("3D 67P", "English text.", "prov")
         )
         self.assertEqual(title, "三维 67P")
@@ -793,7 +845,7 @@ class TranslationFlowTests(unittest.TestCase):
                 "<title>三维 67P</title><explanation>说明译文。</explanation>",
             ]
         )
-        title, expl = asyncio.run(
+        title, expl, _ = asyncio.run(
             self.plugin._translate_uncached("3D 67P", "English text.", "prov")
         )
         self.assertEqual((title, expl), ("三维 67P", "说明译文。"))
@@ -808,11 +860,30 @@ class TranslationFlowTests(unittest.TestCase):
     def test_no_retry_returns_partial(self):
         self.plugin.translate_parse_retry = 0
         self.plugin.context = _FakeContext(["<title>三维 67P</title>没有说明标签"])
-        title, expl = asyncio.run(
+        title, expl, _ = asyncio.run(
             self.plugin._translate_uncached("3D 67P", "English text.", "prov")
         )
         self.assertEqual(title, "三维 67P")
         self.assertIsNone(expl)
+
+    def test_tomorrow_translated_in_same_request(self):
+        self.plugin.context = _FakeContext(
+            [
+                "<title>三维 67P</title><explanation>说明译文。</explanation>"
+                "<tomorrow>天空之眼</tomorrow>"
+            ]
+        )
+        title, expl, tomorrow = asyncio.run(
+            self.plugin._translate_uncached(
+                "3D 67P", "English text.", "prov", "eye in the sky"
+            )
+        )
+        self.assertEqual((title, expl, tomorrow), ("三维 67P", "说明译文。", "天空之眼"))
+        self.assertEqual(len(self.plugin.context.calls), 1)
+        self.assertIn(
+            "<tomorrow>eye in the sky</tomorrow>",
+            self.plugin.context.calls[0]["prompt"],
+        )
 
 
 class TranslationFieldFlowTests(unittest.TestCase):
@@ -841,7 +912,7 @@ class TranslationFieldFlowTests(unittest.TestCase):
         )
 
     def test_translate_fields_uses_one_request_and_caches_per_field(self):
-        title, expl = asyncio.run(
+        title, expl, _ = asyncio.run(
             self.plugin._translate_fields(
                 {"title": "3D 67P", "explanation": "English text."}
             )
@@ -852,6 +923,25 @@ class TranslationFieldFlowTests(unittest.TestCase):
         key_expl = self.plugin._build_translation_cache_key("prov", "English text.")
         self.assertEqual(self.store[key_title], "三维 67P")
         self.assertEqual(self.store[key_expl], "说明译文。")
+
+    def test_translate_fields_caches_tomorrow(self):
+        self.plugin.context = _FakeContext(
+            [
+                "<title>三维 67P</title><explanation>说明译文。</explanation>"
+                "<tomorrow>天空之眼</tomorrow>"
+            ]
+        )
+        payload = {
+            "title": "3D 67P",
+            "explanation": "English text.",
+            "tomorrow_title": "eye in the sky",
+        }
+        title, expl, tomorrow = asyncio.run(self.plugin._translate_fields(payload))
+        self.assertEqual((title, expl, tomorrow), ("三维 67P", "说明译文。", "天空之眼"))
+        key = self.plugin._build_translation_cache_key("prov", "eye in the sky")
+        self.assertEqual(self.store[key], "天空之眼")
+        asyncio.run(self.plugin._translate_fields(payload))
+        self.assertEqual(len(self.plugin.context.calls), 1)
 
     def test_second_call_hits_field_cache(self):
         payload = {"title": "3D 67P", "explanation": "English text."}
@@ -870,7 +960,7 @@ class TranslationFieldFlowTests(unittest.TestCase):
 
     def test_only_title_is_requested_when_explanation_not_sent(self):
         self.plugin.send_explanation = False
-        title, expl = asyncio.run(
+        title, expl, _ = asyncio.run(
             self.plugin._translate_fields(
                 {"title": "3D 67P", "explanation": "English text."}
             )
@@ -1199,7 +1289,7 @@ class ReplyPathVariableTests(unittest.TestCase):
         plugin.is_divided = False
 
         async def translate(apod_data, umo=None):
-            return None, None
+            return None, None, None
 
         plugin._translate_fields = translate
         event = SimpleNamespace(
@@ -1566,7 +1656,7 @@ class PushPerSessionChainTests(unittest.TestCase):
             return None
 
         async def translate(*args, **kwargs):
-            return None, None
+            return None, None, None
 
         async def get_cache(key):
             return store.get(key)
