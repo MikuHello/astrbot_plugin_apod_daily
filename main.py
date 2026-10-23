@@ -1542,7 +1542,11 @@ class APOD(Star):
             return None
         title_match = re.search(r"<h1[^>]*>(.*?)</h1>", content_html, re.S)
         title = self._strip_html(title_match.group(1)) if title_match else ""
-        return self._build_apod_data(title, link, content_html)
+        data = self._build_apod_data(title, link, content_html)
+        if data is not None:
+            # 随机模式不展示「明日一图」。
+            data["tomorrow_title"] = ""
+        return data
 
     @staticmethod
     def _extract_nasa_latest_link(page_html: str) -> Optional[str]:
