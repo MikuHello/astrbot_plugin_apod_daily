@@ -559,13 +559,23 @@ class YouTubeVideoTests(unittest.TestCase):
         chains = asyncio.run(
             self.plugin._build_apod_chains(data, None, None)
         )
-        # YouTube 条目是 video 型：媒体链用封面帧，正文单独一条。
+        # 默认 is_divided=True：封面帧一条、正文一条。
         self.assertEqual(len(chains), 2)
         self.assertEqual(len(chains[0].chain), 1)
         self.assertNotIsInstance(chains[0].chain[0], _COMP.Video)
         self.assertIsInstance(chains[0].chain[0], _COMP.Image)
         self.assertEqual(chains[0].chain[0].file, POSTER)
         self.assertIsInstance(chains[1].chain[0], _COMP.Plain)
+
+    def test_youtube_poster_merges_when_not_divided(self):
+        # YouTube 条目的媒体链是封面帧（图片），关掉 is_divided 时应当
+        # 和普通图片期一样合并成一条，而不是因为 media_type=video 恒拆。
+        self.plugin.is_divided = False
+        data = self.plugin._parse_feed(RSS_YOUTUBE)
+        chains = asyncio.run(self.plugin._build_apod_chains(data, None, None))
+        self.assertEqual(len(chains), 1)
+        self.assertIsInstance(chains[0].chain[0], _COMP.Image)
+        self.assertIsInstance(chains[0].chain[-1], _COMP.Plain)
 
     def test_reply_sends_poster_then_text(self):
         async def translate(apod_data, umo=None):

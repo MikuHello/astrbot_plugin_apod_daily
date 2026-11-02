@@ -2305,15 +2305,20 @@ class APOD(Star):
             logger.warning(f"图片缓存失败，改用原始链接：{exc}")
             return None
 
-    def _split_media(self, apod_data: Dict[str, Any]) -> bool:
+    def _split_media(self, media_chain: MessageChain) -> bool:
         """媒体与正文是否分两条消息：图片跟随 is_divided，视频恒拆。
 
         视频必须恒拆：平台会把 [Video, Plain] 合成一条富媒体消息
         （msg_type=7 且 content=正文），视频气泡不渲染 content，
         正文会被平台静默丢弃，而发送层拿到的仍是成功。
+
+        判据看媒体链里实际有没有视频组件，而不是 media_type：YouTube 条目
+        的 media_type 也是 video，但媒体链里放的是封面帧（图片），不存在
+        富媒体吞正文的问题，不该被恒拆。
         """
-        media_type = str(apod_data.get("media_type") or "").strip().lower()
-        return self.is_divided or media_type == "video"
+        return self.is_divided or any(
+            isinstance(item, Comp.Video) for item in media_chain.chain
+        )
 
     async def _build_media_chain(self, apod_data: Dict[str, Any]) -> MessageChain:
         """只含媒体组件的消息链；未开启发送媒体或无可用媒体时为空链。"""
@@ -2378,7 +2383,7 @@ class APOD(Star):
             tomorrow_zh=tomorrow_zh,
             display_name=display_name,
         )
-        if not self._split_media(apod_data):
+        if not self._split_media(media_chain):
             merged = MessageChain(chain=[*media_chain.chain, *text_chain.chain])
             return [merged] if merged.chain else []
         chains = []
