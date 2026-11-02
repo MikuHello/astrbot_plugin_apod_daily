@@ -2414,7 +2414,7 @@ class APOD(Star):
     async def _send_apod_chains(
         self, umo: str, chains: list[MessageChain], label: str = "APOD"
     ) -> bool:
-        """逐条发送消息链；媒体那条失败时舍媒体保正文（文字+原文链接）。
+        """逐条发送消息链；媒体那条失败时舍媒体保正文。
 
         正文失败一律视为未送达：宁可下轮补发（可能重发一次视频），
         也不能让说明文本静默丢掉。
@@ -2434,7 +2434,7 @@ class APOD(Star):
                 continue
             return False
         if degraded:
-            logger.warning(f"{label} 推送到 {umo} 已降级为文字+链接。")
+            logger.warning(f"{label} 推送到 {umo} 已降级为纯文字。")
         return True
 
     async def terminate(self):
