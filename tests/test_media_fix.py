@@ -584,8 +584,12 @@ class YouTubeVideoTests(unittest.TestCase):
             return [item async for item in self.plugin._reply_apod(event, data)]
 
         results = asyncio.run(collect())
-        self.assertEqual([r[0] for r in results], ["image", "text"])
-        self.assertEqual(results[0][1], POSTER)
+        # 指令路径也走 _build_apod_chains：封面帧一条、正文一条。
+        self.assertEqual([r[0] for r in results], ["chain", "chain"])
+        self.assertEqual(len(results[0][1]), 1)
+        self.assertIsInstance(results[0][1][0], _COMP.Image)
+        self.assertEqual(results[0][1][0].file, POSTER)
+        self.assertIsInstance(results[1][1][0], _COMP.Plain)
 
 
 class TomorrowTitleTests(unittest.TestCase):
@@ -650,7 +654,12 @@ class TomorrowTitleTests(unittest.TestCase):
         async def collect():
             return [item async for item in self.plugin._reply_apod(event, data)]
 
-        texts = [r[1] for r in asyncio.run(collect()) if r[0] == "text"]
+        texts = [
+            component.text
+            for _, chain in asyncio.run(collect())
+            for component in chain
+            if isinstance(component, _COMP.Plain)
+        ]
         self.assertTrue(texts)
         self.assertIn("明日一图：天空之眼（eye in the sky）", texts[0])
 
@@ -1415,8 +1424,10 @@ class ReplyPathVariableTests(unittest.TestCase):
 
         results = asyncio.run(collect())
         self.assertEqual(len(results), 2)
-        self.assertEqual(results[0][0], "chain")
-        self.assertEqual(results[1][0], "text")
+        self.assertEqual([r[0] for r in results], ["chain", "chain"])
+        self.assertIsInstance(results[0][1][0], _COMP.Video)
+        self.assertEqual(results[0][1][0].file, MP4)
+        self.assertIsInstance(results[1][1][0], _COMP.Plain)
 
     def test_image_merged_when_not_divided(self):
         plugin = _make_plugin()
@@ -1440,6 +1451,32 @@ class ReplyPathVariableTests(unittest.TestCase):
         results = asyncio.run(collect())
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0][0], "chain")
+        self.assertIsInstance(results[0][1][0], _COMP.Image)
+        self.assertIsInstance(results[0][1][-1], _COMP.Plain)
+
+    def test_image_split_when_divided(self):
+        plugin = _make_plugin()
+        plugin.is_divided = True
+
+        async def translate(apod_data, umo=None):
+            return None, None, None
+
+        plugin._translate_fields = translate
+        event = SimpleNamespace(
+            unified_msg_origin="umo",
+            plain_result=lambda text: ("text", text),
+            image_result=lambda url: ("image", url),
+            chain_result=lambda chain: ("chain", chain),
+        )
+        data = plugin._build_apod_data("APOD: t", LINK, IMAGE_ARTICLE)
+
+        async def collect():
+            return [item async for item in plugin._reply_apod(event, data)]
+
+        results = asyncio.run(collect())
+        self.assertEqual(len(results), 2)
+        self.assertIsInstance(results[0][1][0], _COMP.Image)
+        self.assertIsInstance(results[1][1][0], _COMP.Plain)
 
 
 class NasaProbeTests(unittest.TestCase):

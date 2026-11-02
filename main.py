@@ -491,73 +491,25 @@ class APOD(Star):
         self, event: AstrMessageEvent, apod_data: dict, display_name: str = PLUGIN_DISPLAY_NAME
     ):
         """按展示配置渲染并发送某一期内容（apod 今日/随机、nasa 共用）。"""
-        media_type = str(apod_data.get("media_type") or "").strip().lower()
-        url = apod_data.get("hdurl") or apod_data.get("url")
-        # 图片/视频都可以直接作为媒体发送；没有可用媒体时降级为文字+链接，
-        # 不再把视频型条目当成错误回退。
         title_zh, explanation_zh, tomorrow_zh = await self._translate_fields(
             apod_data, umo=event.unified_msg_origin
         )
-        display_text = self._build_display_text(
+        # 翻译可能较慢；放在本地化之前，缩短“待发送文件被淘汰”的窗口。
+        # 组链与推送/工具路径共用 _build_apod_chains：视频恒拆两条，
+        # 图片跟随 is_divided，三处不再各自拼链。
+        chains = await self._build_apod_chains(
             apod_data,
             title_zh,
             explanation_zh,
             tomorrow_zh=tomorrow_zh,
+            with_media=self.send_media,
             display_name=display_name,
         )
-
-        # 翻译可能较慢；放在本地化之前，缩短“待发送文件被淘汰”的窗口。
-        video_platform = str(apod_data.get("video_platform") or "").strip().lower()
-        is_youtube_video = (
-            media_type == "video" and video_platform == VIDEO_PLATFORM_YOUTUBE
-        )
-        media_component = None
-        media_path = None
-        media_source = url
-        if self.send_media:
-            if media_type == "video" and not is_youtube_video:
-                media_component = Comp.Video.fromURL(url)
-            else:
-                if is_youtube_video:
-                    media_source = str(apod_data.get("poster_url") or "").strip()
-                if media_source:
-                    media_path = await self._localize_image(media_source)
-                    media_component = (
-                        Comp.Image.fromFileSystem(media_path)
-                        if media_path
-                        else Comp.Image.fromURL(media_source)
-                    )
-
-        # 图片可按配置合并；视频始终分开发送：平台发不了视频时，
-        # 也不能把正文和原文链接一起拖下水。拆分规则与推送路径共用
-        # _split_media，避免“指令正常、推送单链”的行为不一致。
-        if self._split_media(apod_data):
-            # 图片一条、文本一条。
-            has_output = False
-            if media_component is not None:
-                has_output = True
-                if media_type == "video" and not is_youtube_video:
-                    yield event.chain_result([media_component])
-                else:
-                    yield event.image_result(media_path or media_source)
-            if display_text:
-                has_output = True
-                yield event.plain_result(display_text)
-            if not has_output:
-                yield event.plain_result("当前配置未启用任何可返回的内容。")
-            return
-
-        # 图/视频 + 文聚合为一条消息链。
-        chain = []
-        if media_component is not None:
-            chain.append(media_component)
-        if display_text:
-            chain.append(Comp.Plain(display_text))
-        if not chain:
+        if not chains:
             yield event.plain_result("当前配置未启用任何可返回的内容。")
             return
-
-        yield event.chain_result(chain)
+        for chain in chains:
+            yield event.chain_result(chain.chain)
 
     @filter.command("apod管理")
     @filter.permission_type(PermissionType.GROUP_ADMIN)
