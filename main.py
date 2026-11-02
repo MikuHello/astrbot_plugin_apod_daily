@@ -811,6 +811,11 @@ class APOD(Star):
             and self.send_explanation
         )
         if not want_title and not want_explanation and not want_tomorrow:
+            logger.debug(
+                "翻译未启用："
+                f"title={self.translate_title}/send={self.send_title}，"
+                f"explanation={self.translate_explanation}/send={self.send_explanation}"
+            )
             return None, None, None
 
         provider_id = await self._resolve_chat_provider_id(umo)
@@ -846,6 +851,12 @@ class APOD(Star):
             tomorrow=tomorrow if need_tomorrow else None,
         )
         # 清理（_cache_epoch 变化）之后不再写回；校验在写入锁内进行。
+        if need_title and not got_title:
+            logger.warning("标题翻译未返回，本期展示原文。")
+        if need_explanation and not got_explanation:
+            logger.warning("说明翻译未返回，本期展示原文。")
+        if need_tomorrow and not got_tomorrow:
+            logger.warning("「明日一图」翻译未返回，本期展示原文。")
         if need_title and got_title:
             title_zh = got_title
             await self._cache_translation(
