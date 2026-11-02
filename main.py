@@ -5,8 +5,10 @@ import html as html_lib
 import os
 import re
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from functools import partial
 from html.parser import HTMLParser
 from typing import Any, Dict, NamedTuple, Optional
 from xml.etree import ElementTree
@@ -111,7 +113,7 @@ SEND_TIMEOUT_SECONDS = 60
 
 
 class ChainSendReport(NamedTuple):
-    """一次发送的结果：success=全部内容已送达，media_sent=媒体已送达。"""
+    """success=正文或仅媒体已送达（允许舍弃失败媒体），media_sent=媒体已送达。"""
 
     success: bool
     media_sent: bool
@@ -482,17 +484,6 @@ class APOD(Star):
         else:
             yield event.plain_result(APOD_HELP)
 
-    @staticmethod
-    def _reply_chain_with_quote(
-        event: AstrMessageEvent, chain: MessageChain
-    ) -> MessageChain:
-        message_id = str(
-            getattr(getattr(event, "message_obj", None), "message_id", "") or ""
-        )
-        if not message_id:
-            return chain
-        return MessageChain(chain=[Comp.Reply(id=message_id), *chain.chain])
-
     async def _send_reply_chains(
         self,
         event: AstrMessageEvent,
@@ -506,24 +497,22 @@ class APOD(Star):
         直接调用 event.send 走 msg_id 被动回复，引用改由 quote_reply 控制。
         代价是同时跳过 reply_prefix、TTS、内容安全与 on_decorating_result 钩子。
         """
-        if not chains:
-            return False
         sent_any = False
-        for index, chain in enumerate(chains):
-            out_chain = (
-                self._reply_chain_with_quote(event, chain)
-                if self.quote_reply and index == 0
-                else chain
-            )
-            try:
-                await event.send(out_chain)
-            except Exception as exc:
-                logger.error(f"{label} 指令回复第 {index + 1} 条发送失败：{exc}")
-                continue
-            sent_any = True
-        if not sent_any:
-            logger.error(f"{label} 指令回复全部发送失败。")
-        return sent_any
+        message_id = getattr(getattr(event, "message_obj", None), "message_id", None)
+
+        async def send(chain: MessageChain):
+            nonlocal sent_any
+            if self.quote_reply and not sent_any and message_id:
+                chain = MessageChain(
+                    chain=[Comp.Reply(id=str(message_id)), *chain.chain]
+                )
+            result = await event.send(chain)
+            if result is not False:
+                sent_any = True
+            return result
+
+        report = await self._send_chains(chains, send, f"{label} 指令回复")
+        return report.success
 
     async def _reply_text(
         self,
@@ -694,12 +683,13 @@ class APOD(Star):
             tomorrow_zh=tomorrow_zh,
             display_name=display_name,
         )
-        sent = await self._send_apod_chains(
-            event.unified_msg_origin, chains, label=label
+        sent = await self._send_chains(
+            chains,
+            partial(self.context.send_message, event.unified_msg_origin),
+            label=f"{label}发送",
         )
         if not sent.success:
-            logger.warning(f"发送{label}：未匹配到消息平台。")
-            return f"{label}发送失败：未找到可用的消息平台。"
+            return f"{label}发送失败：请检查平台连接或发送日志后重试。"
         title = (title_zh or apod_data.get("title") or "").strip()
         return (
             f"已向当前会话发送{label}："
@@ -743,11 +733,6 @@ class APOD(Star):
             await self.put_kv_data("pushed_by_session", pushed)
         except Exception as exc:
             raise RuntimeError(f"写入推送检查点失败：{exc}") from exc
-
-    @staticmethod
-    def _checkpoint_done(entry: Any, link: str) -> bool:
-        """检查点值是否表示该期已完整送达；字符串是整期完成的旧格式。"""
-        return isinstance(entry, str) and entry == link
 
     @staticmethod
     def _checkpoint_media_sent(entry: Any, link: str) -> bool:
@@ -2227,9 +2212,7 @@ class APOD(Star):
             return False
         # 检查点值：字符串 = 整期送达；{"link": ..., "media_sent": True} =
         # 媒体已送达、正文待补发（下轮只补正文，不重发视频）。
-        pending = [
-            umo for umo in sessions if not self._checkpoint_done(pushed.get(umo), link)
-        ]
+        pending = [umo for umo in sessions if pushed.get(umo) != link]
 
         last = await self.get_cache("last_pushed_apod")
         last_link = str(last.get("link") or "") if isinstance(last, dict) else ""
@@ -2258,44 +2241,33 @@ class APOD(Star):
         for umo in pending:
             # 每个会话发送前重建消息链：本地图片可能已被其他请求淘汰，
             # 重建会命中缓存并刷新保护时间（必要时重新下载）。
-            chains = await self._build_apod_chains(
-                apod_data,
-                title_zh,
-                explanation_zh,
-                tomorrow_zh=tomorrow_zh,
-            )
             if self._checkpoint_media_sent(pushed.get(umo), link):
-                # 媒体上一轮已送达：本轮只补正文，避免让用户看两遍同一个视频。
-                # 合并链要拆出 Plain，不能整条丢掉。
-                chains = [
-                    self._plain_only_chain(chain)
-                    if self._chain_has_media(chain)
-                    else chain
-                    for chain in chains
-                ]
-                chains = [chain for chain in chains if chain.chain]
-            report = await self._send_apod_chains(umo, chains)
-            if not report.success:
-                if report.media_sent:
-                    # 媒体已送达、正文失败：记下进度，下一轮只补正文。
-                    logger.warning(
-                        f"APOD 推送到 {umo} 媒体已送达但正文失败，下轮只补正文。"
-                    )
-                    pushed[umo] = {"link": link, "media_sent": True}
-                    try:
-                        await self._save_push_checkpoint(pushed)
-                    except RuntimeError as exc:
-                        logger.error(f"{exc}：本轮推送中止。")
-                        return False
+                # 直接构建待补正文，不下载或刷新已经送达的媒体。
+                text = self._build_text_chain(
+                    apod_data, title_zh, explanation_zh, tomorrow_zh
+                )
+                chains = [text] if text.chain else []
+            else:
+                chains = await self._build_apod_chains(
+                    apod_data, title_zh, explanation_zh, tomorrow_zh
+                )
+            report = await self._send_chains(
+                chains, partial(self.context.send_message, umo), f"APOD 推送到 {umo}"
+            )
+            if report.success:
+                pushed[umo] = link
+                delivered += 1
+            elif report.media_sent:
+                logger.warning(f"APOD 推送到 {umo} 媒体已送达但正文失败，下轮只补正文。")
+                pushed[umo] = {"link": link, "media_sent": True}
+            else:
                 continue
-            pushed[umo] = link
             try:
                 await self._save_push_checkpoint(pushed)
             except RuntimeError as exc:
                 # 进度落盘失败立即中止本轮：未确认会话留待下轮补发，避免盲目重发。
                 logger.error(f"{exc}：本轮推送中止。")
                 return False
-            delivered += 1
         await self.put_cache(
             "last_pushed_apod", {"date": date, "link": link, "delivered": True}
         )
@@ -2539,32 +2511,24 @@ class APOD(Star):
         return chains
 
     @staticmethod
-    def _chain_has_media(chain: MessageChain) -> bool:
-        return any(isinstance(item, (Comp.Image, Comp.Video)) for item in chain.chain)
-
-    @staticmethod
-    def _plain_only_chain(chain: MessageChain) -> MessageChain:
-        """摘出链里的纯文本组件，供合并链失败时补发正文。"""
-        return MessageChain(
-            chain=[item for item in chain.chain if isinstance(item, Comp.Plain)]
-        )
-
-    async def _send_chain(self, umo: str, chain: MessageChain, label: str) -> bool:
+    async def _send_chain(
+        send: Callable[[MessageChain], Awaitable[Any]], chain: MessageChain, label: str
+    ) -> bool:
         try:
-            sent = await asyncio.wait_for(
-                self.context.send_message(umo, chain),
-                timeout=SEND_TIMEOUT_SECONDS,
-            )
+            sent = await asyncio.wait_for(send(chain), timeout=SEND_TIMEOUT_SECONDS)
         except Exception as exc:
-            logger.error(f"{label} 推送到 {umo} 失败：{exc}")
+            logger.error(f"{label}失败：{exc!r}")
             return False
         if sent is False:
-            logger.error(f"{label} 推送到 {umo} 失败：未匹配到消息平台。")
+            logger.error(f"{label}失败：发送接口返回 False。")
             return False
         return True
 
-    async def _send_apod_chains(
-        self, umo: str, chains: list[MessageChain], label: str = "APOD"
+    async def _send_chains(
+        self,
+        chains: list[MessageChain],
+        send: Callable[[MessageChain], Awaitable[Any]],
+        label: str = "APOD",
     ) -> ChainSendReport:
         """逐条发送消息链；媒体那条失败时舍媒体保正文（合并链补发纯文字）。
 
@@ -2575,31 +2539,26 @@ class APOD(Star):
             return ChainSendReport(False, False)
         degraded = False
         media_sent = False
-        last_index = len(chains) - 1
         for index, chain in enumerate(chains):
-            has_media = self._chain_has_media(chain)
-            if await self._send_chain(umo, chain, label):
+            has_media = any(
+                isinstance(item, (Comp.Image, Comp.Video)) for item in chain.chain
+            )
+            if await self._send_chain(send, chain, label):
                 media_sent = media_sent or has_media
                 continue
             if not has_media:
                 return ChainSendReport(False, media_sent)
-            if index < last_index:
-                degraded = True
-                logger.warning(
-                    f"{label} 推送到 {umo} 的媒体发送失败，继续发送正文。"
-                )
-                continue
-            # 合并链失败时正文跟媒体一起丢了：摘出纯文本再发一次，成本很低。
-            fallback = self._plain_only_chain(chain)
-            if fallback.chain and await self._send_chain(umo, fallback, label):
-                degraded = True
-                logger.warning(
-                    f"{label} 推送到 {umo} 的媒体发送失败，已改发纯文字正文。"
-                )
-                continue
-            return ChainSendReport(False, media_sent)
+            fallback = MessageChain(
+                chain=[item for item in chain.chain if isinstance(item, Comp.Plain)]
+            )
+            if fallback.chain:
+                if not await self._send_chain(send, fallback, label):
+                    return ChainSendReport(False, media_sent)
+            elif index == len(chains) - 1:
+                return ChainSendReport(False, media_sent)
+            degraded = True
         if degraded:
-            logger.warning(f"{label} 推送到 {umo} 已降级为纯文字。")
+            logger.warning(f"{label}已降级为纯文字。")
         return ChainSendReport(True, media_sent)
 
     async def terminate(self):

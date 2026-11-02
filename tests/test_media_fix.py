@@ -16,6 +16,7 @@ import zoneinfo
 from datetime import timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 REPO_DIR = Path(__file__).resolve().parent.parent
 MAIN_PATH = REPO_DIR / "main.py"
@@ -771,70 +772,45 @@ class RenderingTests(unittest.TestCase):
         self.assertEqual(len(chains[0].chain), 1)
         self.assertIsInstance(chains[0].chain[0], _COMP.Plain)
 
-    def test_merged_chain_failure_resends_text_only(self):
-        self.plugin.is_divided = False
-        data = self.plugin._build_apod_data("APOD: t", LINK, IMAGE_ARTICLE)
-        chains = asyncio.run(self.plugin._build_apod_chains(data, None, None))
-        self.assertEqual(len(chains), 1)
-        attempts = []
+    def test_delivery_failure_matrix(self):
+        image, text = _COMP.Image.fromURL(POSTER), _COMP.Plain("body")
+        # 检查真实发送边界，覆盖 None 成功、False、异常和媒体/正文分别失败。
+        cases = [
+            ("merged fallback", [[image, text]], [False, None], (True, False),
+             [["Image", "Plain"], ["Plain"]]),
+            ("fallback failure", [[image, text]], [RuntimeError("media"), False],
+             (False, False), [["Image", "Plain"], ["Plain"]]),
+            ("split media failure", [[image], [text]], [False, None], (True, False),
+             [["Image"], ["Plain"]]),
+            ("split text failure", [[image], [text]], [None, False], (False, True),
+             [["Image"], ["Plain"]]),
+            ("media only failure", [[image]], [False], (False, False), [["Image"]]),
+            ("empty", [], [], (False, False), []),
+        ]
+        for name, components, outcomes, expected, attempts in cases:
+            with self.subTest(name=name):
+                send = AsyncMock(side_effect=outcomes)
+                chains = [apod_main.MessageChain(chain=c) for c in components]
+                report = asyncio.run(self.plugin._send_chains(chains, send))
+                self.assertEqual(report, expected)
+                self.assertEqual([
+                    [type(item).__name__ for item in call.args[0].chain]
+                    for call in send.await_args_list
+                ], attempts)
 
-        async def send_chain(umo, chain, label="APOD"):
-            attempts.append([type(item).__name__ for item in chain.chain])
-            return len(attempts) > 1
+    def test_delivery_timeout_and_cancellation(self):
+        chain = apod_main.MessageChain(chain=[_COMP.Plain("body")])
 
-        self.plugin._send_chain = send_chain
-        self.assertTrue(
-            asyncio.run(self.plugin._send_apod_chains("umo", chains)).success
-        )
-        self.assertEqual(attempts, [["Image", "Plain"], ["Plain"]])
+        async def blocked_send(chain):
+            await asyncio.Event().wait()
 
-    def test_merged_chain_failure_returns_false_when_fallback_fails(self):
-        self.plugin.is_divided = False
-        data = self.plugin._build_apod_data("APOD: t", LINK, IMAGE_ARTICLE)
-        chains = asyncio.run(self.plugin._build_apod_chains(data, None, None))
-        attempts = []
-
-        async def send_chain(umo, chain, label="APOD"):
-            attempts.append([type(item).__name__ for item in chain.chain])
-            return False
-
-        self.plugin._send_chain = send_chain
-        self.assertFalse(
-            asyncio.run(self.plugin._send_apod_chains("umo", chains)).success
-        )
-        self.assertEqual(attempts, [["Image", "Plain"], ["Plain"]])
-
-    def test_split_media_failure_still_sends_text(self):
-        # 重构拆分判据后，媒体先发、正文后发的降级不能退化成整体失败。
-        self.plugin.is_divided = True
-        data = self.plugin._build_apod_data("APOD: t", LINK, IMAGE_ARTICLE)
-        chains = asyncio.run(self.plugin._build_apod_chains(data, None, None))
-        attempts = []
-
-        async def send_chain(umo, chain, label="APOD"):
-            kinds = [type(item).__name__ for item in chain.chain]
-            attempts.append(kinds)
-            return "Image" not in kinds
-
-        self.plugin._send_chain = send_chain
-        self.assertTrue(
-            asyncio.run(self.plugin._send_apod_chains("umo", chains)).success
-        )
-        self.assertEqual(attempts, [["Image"], ["Plain"]])
-
-    def test_split_media_failure_reports_media_sent(self):
-        # 媒体成功、正文失败时要把 media_sent 报给推送层，供下轮只补正文。
-        self.plugin.is_divided = True
-        data = self.plugin._build_apod_data("APOD: t", LINK, IMAGE_ARTICLE)
-        chains = asyncio.run(self.plugin._build_apod_chains(data, None, None))
-
-        async def send_chain(umo, chain, label="APOD"):
-            return all(isinstance(item, _COMP.Image) for item in chain.chain)
-
-        self.plugin._send_chain = send_chain
-        report = asyncio.run(self.plugin._send_apod_chains("umo", chains))
-        self.assertFalse(report.success)
-        self.assertTrue(report.media_sent)
+        with patch.object(apod_main, "SEND_TIMEOUT_SECONDS", 0.001):
+            self.assertFalse(asyncio.run(self.plugin._send_chains([chain], blocked_send)).success)
+        # 卸载取消必须向上传播，不能被当作发送失败吞掉。
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(self.plugin._send_chains(
+                [chain], AsyncMock(side_effect=asyncio.CancelledError)
+            ))
 
 
 class FeedSourceTests(unittest.TestCase):
@@ -1502,16 +1478,13 @@ class ApodCachePolicyTests(unittest.TestCase):
 
 
 class ReplyPathVariableTests(unittest.TestCase):
-    """指令路径的拆分形态：三组场景共用一套插件与事件桩。"""
+    """验证指令传输与引用；媒体拆分矩阵由 RenderingTests 覆盖。"""
 
     def setUp(self):
         self.plugin = _make_plugin()
         self.event = _make_reply_event()
 
-        async def translate(apod_data, umo=None):
-            return None, None, None
-
-        self.plugin._translate_fields = translate
+        self.plugin._translate_fields = AsyncMock(return_value=(None, None, None))
 
     def _reply(self, article, *, is_divided):
         self.plugin.is_divided = is_divided
@@ -1519,31 +1492,13 @@ class ReplyPathVariableTests(unittest.TestCase):
         asyncio.run(self.plugin._reply_apod(self.event, data))
         return self.event.sent
 
-    def test_video_always_sent_separately(self):
-        results = self._reply(VIDEO_ARTICLE, is_divided=False)
-        self.assertEqual(len(results), 2)
-        self.assertIsInstance(results[0].chain[0], _COMP.Video)
-        self.assertEqual(results[0].chain[0].file, MP4)
-        self.assertIsInstance(results[1].chain[0], _COMP.Plain)
-
-    def test_image_merged_when_not_divided(self):
-        results = self._reply(IMAGE_ARTICLE, is_divided=False)
-        self.assertEqual(len(results), 1)
-        self.assertIsInstance(results[0].chain[0], _COMP.Image)
-        self.assertIsInstance(results[0].chain[-1], _COMP.Plain)
-
-    def test_image_split_when_divided(self):
-        results = self._reply(IMAGE_ARTICLE, is_divided=True)
-        self.assertEqual(len(results), 2)
-        self.assertIsInstance(results[0].chain[0], _COMP.Image)
-        self.assertIsInstance(results[1].chain[0], _COMP.Plain)
-
-    def test_reply_is_sent_directly_and_stops_event(self):
-        self._reply(IMAGE_ARTICLE, is_divided=True)
-        self.assertTrue(self.event.stopped)
-        self.assertEqual(len(self.event.sent), 2)
-
     def test_quote_reply_disabled_by_default(self):
+        # 走真实配置初始化，不能让夹具写死的 False 掩盖默认值回归。
+        self.plugin.config["cache_images"] = False
+        with patch.object(self.plugin, "_migrate_config", new=AsyncMock()), \
+             patch.object(self.plugin, "_migrate_cache_limit", new=AsyncMock()), \
+             patch.object(self.plugin, "get_cache", new=AsyncMock(return_value=None)):
+            asyncio.run(self.plugin.initialize())
         results = self._reply(IMAGE_ARTICLE, is_divided=True)
         self.assertFalse(any(
             isinstance(component, _COMP.Reply)
@@ -1558,6 +1513,35 @@ class ReplyPathVariableTests(unittest.TestCase):
         self.assertIsInstance(results[0].chain[0], _COMP.Reply)
         self.assertEqual(results[0].chain[0].id, "msg-1")
         self.assertNotIsInstance(results[1].chain[0], _COMP.Reply)
+
+    def test_failed_media_falls_back_to_quoted_text_and_stops_event(self):
+        self.plugin.quote_reply = True
+        self.event.send = AsyncMock(side_effect=[RuntimeError("media failed"), None])
+        self._reply(IMAGE_ARTICLE, is_divided=False)
+        calls = self.event.send.await_args_list
+        self.assertEqual([
+            [type(item).__name__ for item in call.args[0].chain] for call in calls
+        ], [["Reply", "Image", "Plain"], ["Reply", "Plain"]])
+        self.assertTrue(self.event.stopped)
+
+    def test_missing_message_id_does_not_add_quote(self):
+        self.plugin.quote_reply = True
+        self.event.message_obj.message_id = ""
+        results = self._reply(IMAGE_ARTICLE, is_divided=False)
+        self.assertIsInstance(results[0].chain[0], _COMP.Image)
+
+    def test_tool_delivery_uses_active_transport_and_reports_generic_failure(self):
+        data = self.plugin._build_apod_data("APOD: t", LINK, IMAGE_ARTICLE)
+        send = AsyncMock(return_value=None)
+        self.plugin.context = SimpleNamespace(send_message=send)
+        result = asyncio.run(self.plugin._deliver_apod(self.event, data, "今日APOD"))
+        self.assertIn("已向当前会话发送", result)
+        self.assertEqual([c.args[0] for c in send.await_args_list], ["umo", "umo"])
+        self.assertFalse(self.event.sent)
+        send.side_effect = RuntimeError("upload failed")
+        result = asyncio.run(self.plugin._deliver_apod(self.event, data, "今日APOD"))
+        self.assertIn("发送失败", result)
+        self.assertNotIn("未找到可用的消息平台", result)
 
 
 class NasaArticleParsingTests(unittest.TestCase):
@@ -1993,198 +1977,65 @@ class ImageCacheTests(unittest.TestCase):
 
 
 class PushPerSessionChainTests(unittest.TestCase):
+    def setUp(self):
+        self.plugin = _make_plugin(_FakeConfig({"push": {"sessions": ["a"]}}))
+        self.plugin.push_mode = "scheduled"
+        self.plugin.is_divided = False
+        self.data = self.plugin._build_apod_data("APOD: t", LINK, VIDEO_ARTICLE)
+        self.store = {}
+
+        async def put(key, value):
+            self.store[key] = value
+
+        self.plugin.get_kv_data = AsyncMock(side_effect=lambda k, default=None: self.store.get(k, default))
+        self.plugin.put_kv_data = AsyncMock(side_effect=put)
+        self.plugin._get_cached_data = AsyncMock(return_value=self.data)
+        self.plugin._translate_fields = AsyncMock(return_value=(None, None, None))
+        self.send = AsyncMock(return_value=None)
+        self.plugin.context = SimpleNamespace(send_message=self.send)
+
     def test_chain_rebuilt_per_session(self):
-        config = _FakeConfig({"push": {"sessions": ["a", "b", "c", "d"]}})
-        plugin = _make_plugin(config)
-        plugin.push_mode = "scheduled"
-        plugin.send_media = True
-        apod_data = {
-            "date": "2026-10-18",
-            "title": "t",
-            "explanation": "e",
-            "media_type": "image",
-            "url": "https://x/a.jpg",
-            "hdurl": "https://x/a.jpg",
-            "link": "https://x/article/",
-        }
-        store = {}
-        calls = {"n": 0}
+        self.plugin.config["push"]["sessions"] = ["a", "b", "c", "d"]
+        with patch.object(self.plugin, "_build_apod_chains", wraps=self.plugin._build_apod_chains) as build:
+            self.assertTrue(asyncio.run(self.plugin._push_check()))
+        self.assertEqual(build.await_count, 4)
+        # 四个会话分别送达视频与正文，且写入各自检查点。
+        self.assertEqual([c.args[0] for c in self.send.await_args_list], list("aabbccdd"))
+        self.assertEqual(self.store["pushed_by_session"], dict.fromkeys("abcd", LINK))
 
-        async def get_cached_data(*args, **kwargs):
-            return apod_data
+    def test_partial_delivery_retries_only_text_without_building_media(self):
+        self.send.side_effect = [None, RuntimeError("text failed"), False, None]
+        self.assertFalse(asyncio.run(self.plugin._push_check()))
+        partial = {"a": {"link": LINK, "media_sent": True}}
+        self.assertEqual(self.store["pushed_by_session"], partial)
+        # 连续两轮正文失败也必须保留媒体进度；重试不能重新构建或下载媒体。
+        with patch.object(self.plugin, "_build_media_chain", side_effect=AssertionError("media rebuilt")):
+            self.assertFalse(asyncio.run(self.plugin._push_check()))
+            self.assertEqual(self.store["pushed_by_session"], partial)
+            self.assertTrue(asyncio.run(self.plugin._push_check()))
+        self.assertEqual([
+            [type(item).__name__ for item in call.args[1].chain]
+            for call in self.send.await_args_list
+        ], [["Video"], ["Plain"], ["Plain"], ["Plain"]])
+        self.assertEqual(self.store["pushed_by_session"], {"a": LINK})
+        # 完整送达的旧格式字符串仍然生效。
+        self.assertTrue(asyncio.run(self.plugin._push_check()))
+        self.assertEqual(self.send.await_count, 4)
 
-        async def load_ck():
-            return {}
+    def test_other_issue_partial_checkpoint_does_not_skip_new_media(self):
+        self.store["pushed_by_session"] = {"a": {"link": "old", "media_sent": True}}
+        self.assertTrue(asyncio.run(self.plugin._push_check()))
+        self.assertIsInstance(self.send.await_args_list[0].args[1].chain[0], _COMP.Video)
 
-        async def save_ck(pushed):
-            return None
-
-        async def translate(*args, **kwargs):
-            return None, None, None
-
-        async def get_cache(key):
-            return store.get(key)
-
-        async def put_cache(key, value):
-            store[key] = value
-
-        async def build(*args, **kwargs):
-            calls["n"] += 1
-            return []
-
-        async def send(umo, chains, label="APOD"):
-            return apod_main.ChainSendReport(True, False)
-
-        plugin._get_cached_data = get_cached_data
-        plugin._load_push_checkpoint = load_ck
-        plugin._save_push_checkpoint = save_ck
-        plugin._translate_fields = translate
-        plugin.get_cache = get_cache
-        plugin.put_cache = put_cache
-        plugin._build_apod_chains = build
-        plugin._send_apod_chains = send
-
-        ok = asyncio.run(plugin._push_check())
-        self.assertTrue(ok)
-        # 4 个会话各重建一次，避免复用同一个可能失效的本地路径
-        self.assertEqual(calls["n"], 4)
-
-    def test_video_push_builds_media_and_text_chains(self):
-        config = _FakeConfig({"push": {"sessions": ["a"]}})
-        plugin = _make_plugin(config)
-        plugin.push_mode = "scheduled"
-        plugin.is_divided = False
-        apod_data = {
-            "date": "2026-10-28",
-            "title": "t",
-            "explanation": "e",
-            "media_type": "video",
-            "url": MP4,
-            "hdurl": MP4,
-            "link": "https://x/article/",
-        }
-        store = {}
-        recorded = []
-
-        async def get_cached_data(*args, **kwargs):
-            return apod_data
-
-        async def load_ck():
-            return {}
-
-        async def save_ck(pushed):
-            return None
-
-        async def translate(*args, **kwargs):
-            return None, None, None
-
-        async def get_cache(key):
-            return store.get(key)
-
-        async def put_cache(key, value):
-            store[key] = value
-
-        async def send(umo, chains, label="APOD"):
-            recorded.append(chains)
-            return apod_main.ChainSendReport(True, False)
-
-        plugin._get_cached_data = get_cached_data
-        plugin._load_push_checkpoint = load_ck
-        plugin._save_push_checkpoint = save_ck
-        plugin._translate_fields = translate
-        plugin.get_cache = get_cache
-        plugin.put_cache = put_cache
-        plugin._send_apod_chains = send
-
-        self.assertTrue(asyncio.run(plugin._push_check()))
-        self.assertEqual(len(recorded), 1)
-        chains = recorded[0]
-        # 图片期可将 is_divided 关掉，视频期必须恒拆，否则正文被气泡吞掉。
-        self.assertEqual(len(chains), 2)
-        self.assertIsInstance(chains[0].chain[0], _COMP.Video)
-        self.assertEqual(chains[0].chain[0].file, MP4)
-        self.assertIsInstance(chains[1].chain[0], _COMP.Plain)
-
-    def test_partial_media_failure_retries_text_only(self):
-        config = _FakeConfig({"push": {"sessions": ["a"]}})
-        plugin = _make_plugin(config)
-        plugin.push_mode = "scheduled"
-        plugin.is_divided = False
-        apod_data = {
-            "date": "2026-10-28",
-            "title": "t",
-            "explanation": "e",
-            "media_type": "video",
-            "url": MP4,
-            "hdurl": MP4,
-            "link": "https://x/article/",
-        }
-        store = {}
-        saved = {}
-        recorded = []
-
-        async def get_cached_data(*args, **kwargs):
-            return apod_data
-
-        async def load_ck():
-            return dict(saved.get("ck", {}))
-
-        async def save_ck(pushed):
-            saved["ck"] = dict(pushed)
-
-        async def translate(*args, **kwargs):
-            return None, None, None
-
-        async def get_cache(key):
-            return store.get(key)
-
-        async def put_cache(key, value):
-            store[key] = value
-
-        async def send(umo, chains, label="APOD"):
-            recorded.append([[type(i).__name__ for i in c.chain] for c in chains])
-            if len(recorded) == 1:
-                # 视频已发出，正文失败。
-                return apod_main.ChainSendReport(False, True)
-            return apod_main.ChainSendReport(True, False)
-
-        plugin._get_cached_data = get_cached_data
-        plugin._load_push_checkpoint = load_ck
-        plugin._save_push_checkpoint = save_ck
-        plugin._translate_fields = translate
-        plugin.get_cache = get_cache
-        plugin.put_cache = put_cache
-        plugin._send_apod_chains = send
-
-        self.assertFalse(asyncio.run(plugin._push_check()))
-        self.assertEqual(
-            saved["ck"], {"a": {"link": "https://x/article/", "media_sent": True}}
-        )
-
-        # 第二轮应只补正文，不能再把视频发一遍。
-        self.assertTrue(asyncio.run(plugin._push_check()))
-        self.assertEqual(recorded[0], [["Video"], ["Plain"]])
-        self.assertEqual(recorded[1], [["Plain"]])
-        self.assertEqual(saved["ck"], {"a": "https://x/article/"})
-
-    def test_checkpoint_helpers_handle_legacy_and_partial(self):
-        # 旧格式字符串仍应视为整期已送达，新的部分送达结构必须继续补发。
-        self.assertTrue(
-            apod_main.APOD._checkpoint_done("https://x/old", "https://x/old")
-        )
-        self.assertFalse(
-            apod_main.APOD._checkpoint_done(
-                {"link": "https://x/old", "media_sent": True}, "https://x/old"
-            )
-        )
-        self.assertTrue(
-            apod_main.APOD._checkpoint_media_sent(
-                {"link": "https://x/old", "media_sent": True}, "https://x/old"
-            )
-        )
-        self.assertFalse(
-            apod_main.APOD._checkpoint_media_sent("https://x/old", "https://x/old")
-        )
+    def test_checkpoint_storage_failure_aborts_remaining_sessions(self):
+        self.plugin.config["push"]["sessions"] = ["a", "b"]
+        for fail_read in (True, False):
+            with self.subTest(fail_read=fail_read):
+                self.send.reset_mock()
+                target = "get_kv_data" if fail_read else "put_kv_data"
+                with patch.object(self.plugin, target, side_effect=RuntimeError("storage down")):
+                    self.assertFalse(asyncio.run(self.plugin._push_check()))
+                self.assertEqual(self.send.await_count, 0 if fail_read else 2)
 
 
 if __name__ == "__main__":
