@@ -347,54 +347,26 @@ class TitlePrefixTests(unittest.TestCase):
     def setUp(self):
         self.plugin = _make_plugin()
 
-    def test_year_first_date_is_stripped(self):
-        data = self.plugin._build_apod_data(
-            "APOD: 2026 October 16 \u2013 Chasing the International Space Station",
-            LINK,
-            IMAGE_ARTICLE,
-        )
-        self.assertEqual(data["title"], "Chasing the International Space Station")
-        self.assertEqual(data["date"], "2026-10-16")
-
-    def test_day_first_date_is_stripped(self):
-        # 2026-10-29 那期的 feed 标题是 "29 October 2026"，与常态相反。
-        data = self.plugin._build_apod_data(
-            "APOD: 29 October 2026 \u2013 The Horns of Venus", LINK, IMAGE_ARTICLE
-        )
-        self.assertEqual(data["title"], "The Horns of Venus")
-        self.assertNotIn("APOD", data["title"])
-        self.assertEqual(data["date"], "2026-10-29")
-
-    def test_unusual_date_shape_falls_back_to_separator(self):
-        data = self.plugin._build_apod_data(
-            "APOD: 29 Oct 2026 \u2013 The Horns of Venus", LINK, IMAGE_ARTICLE
-        )
-        self.assertEqual(data["title"], "The Horns of Venus")
-
-    def test_month_first_date_falls_back_to_separator(self):
-        data = self.plugin._build_apod_data(
-            "APOD: May 5, 2026 \u2013 The Horns of Venus", LINK, IMAGE_ARTICLE
-        )
-        self.assertEqual(data["title"], "The Horns of Venus")
-
-    def test_month_word_in_title_is_not_treated_as_date(self):
-        # “May” 既是月份名也是普通单词：后面没跟日号时不能截断标题。
-        data = self.plugin._build_apod_data(
-            "APOD: May Sky Wonders \u2013 Part II", LINK, IMAGE_ARTICLE
-        )
-        self.assertEqual(data["title"], "May Sky Wonders \u2013 Part II")
-
-    def test_title_without_prefix_is_kept(self):
-        data = self.plugin._build_apod_data(
-            "The Horns of Venus", LINK, IMAGE_ARTICLE
-        )
-        self.assertEqual(data["title"], "The Horns of Venus")
-
-    def test_prefix_only_title_is_kept(self):
-        data = self.plugin._build_apod_data(
-            "APOD: 2026 October 29", LINK, IMAGE_ARTICLE
-        )
-        self.assertEqual(data["title"], "APOD: 2026 October 29")
+    def test_title_prefix_and_date_formats(self):
+        cases = [
+            ("APOD: 2026 October 16 – Stars", "Stars", "2026-10-16"),
+            ("APOD: 29 October 2026 – Stars", "Stars", "2026-10-29"),
+            ("APOD: 29 Oct 2026 – Stars", "Stars", "2026-10-29"),
+            ("APOD: 2026 Oct 29 – Stars", "Stars", "2026-10-29"),
+            ("APOD: May 5, 2026 – Stars", "Stars", "2026-05-05"),
+            ("APOD: Nov 3, 2026 – Stars", "Stars", "2026-11-03"),
+            ("APOD: May Sky Wonders – Part II", "May Sky Wonders – Part II", None),
+            ("APOD: 3D 67P – Part II", "3D 67P – Part II", None),
+            ("APOD: May 5 Missions – Part II", "May 5 Missions – Part II", None),
+            ("The Horns of Venus", "The Horns of Venus", None),
+            ("APOD: 2026 October 29", "APOD: 2026 October 29", "2026-10-29"),
+        ]
+        for raw, title, date in cases:
+            with self.subTest(raw=raw):
+                data = self.plugin._build_apod_data(raw, LINK, IMAGE_ARTICLE)
+                self.assertEqual(data["title"], title)
+                if date:
+                    self.assertEqual(data["date"], date)
 
     def test_feed_entry_with_day_first_date(self):
         rss = RSS_VIDEO.replace(

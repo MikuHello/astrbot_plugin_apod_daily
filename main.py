@@ -40,19 +40,19 @@ MONTH_NAMES = {
     "January": 1, "February": 2, "March": 3, "April": 4, "May": 5, "June": 6,
     "July": 7, "August": 8, "September": 9, "October": 10, "November": 11, "December": 12,
 }
-# 月份名只写一份，日期正则从它生成。必须整体成组，否则组内的 “|” 会把
-# 外层分组拆散。
+# 全称与三字母缩写共用同一张月份表、日期解析与标题剥离规则。
+MONTH_NAMES.update({name[:3]: number for name, number in MONTH_NAMES.items()})
 _MONTHS = "(?:" + "|".join(MONTH_NAMES) + ")"
 # feed 标题里的日期实测有两种顺序：NASA 正常输出 “2026 October 29”，
 # 但 2026-10-29 那期写成了 “29 October 2026”。两种都得认，否则前缀剥不掉
 # （标题带着 “APOD: 日期 –” 进译文）、日期也解析不出（只能靠 meta/slug 兜底）。
 FEED_TITLE_DATE_PATTERN = re.compile(
+    rf"\b(?:"
     rf"(?P<ymd_year>\d{{4}})\s+(?P<ymd_month>{_MONTHS})\s+(?P<ymd_day>\d{{1,2}})"
     rf"|(?P<dmy_day>\d{{1,2}})\s+(?P<dmy_month>{_MONTHS})\s+(?P<dmy_year>\d{{4}})"
+    rf"|(?P<mdy_month>{_MONTHS})\s+(?P<mdy_day>\d{{1,2}}),?\s+(?P<mdy_year>\d{{4}})"
+    rf")\b"
 )
-# 兜底识别“月份在前”的日期（如 “May 5, 2026”）。月份名后必须跟日号，
-# 否则 “May Sky Wonders” 这类标题会被当成日期截断。
-FEED_TITLE_MONTH_DAY_PATTERN = re.compile(rf"{_MONTHS}\s+\d{{1,2}}")
 FEED_TITLE_APOD_PREFIX_PATTERN = re.compile(r"^APOD:\s*")
 FEED_TITLE_SEPARATOR_PATTERN = re.compile(r"^[–—-]\s*")
 # 官网 Random APOD 的随机即由该接口在后端完成（randomizePost=True）。
@@ -1833,7 +1833,7 @@ class APOD(Star):
 
     @staticmethod
     def _date_from_title(title_raw: str) -> str:
-        """从标题里解析日期，兼容 “2026 October 29” 与 “29 October 2026”。"""
+        """解析年/月/日、日/月/年、月/日/年三种顺序，支持月份缩写。"""
         matched = FEED_TITLE_DATE_PATTERN.search(title_raw or "")
         if not matched:
             return ""
@@ -1843,11 +1843,17 @@ class APOD(Star):
                 matched.group("ymd_month"),
                 matched.group("ymd_day"),
             )
-        else:
+        elif matched.group("dmy_year"):
             year, month_name, day = (
                 matched.group("dmy_year"),
                 matched.group("dmy_month"),
                 matched.group("dmy_day"),
+            )
+        else:
+            year, month_name, day = (
+                matched.group("mdy_year"),
+                matched.group("mdy_month"),
+                matched.group("mdy_day"),
             )
         month_number = MONTH_NAMES.get(month_name or "")
         if not month_number:
@@ -1856,12 +1862,7 @@ class APOD(Star):
 
     @staticmethod
     def _strip_title_prefix(title_raw: str) -> str:
-        """剥掉 feed 标题的 “APOD: <日期> – ” 前缀，两种日期顺序都认。
-
-        站点改版后 feed 标题仍沿用它，但日期顺序并不稳定；形状异常时走
-        保守规则（去掉 “APOD:”、开头的日期与分隔符），宁可多剥一点，
-        也不让 “APOD: 日期 –” 混进译文和正文。
-        """
+        """剥掉 “APOD: <完整日期> – ”，保留数字或月份词开头的真实标题。"""
         text = (title_raw or "").strip()
         prefix = FEED_TITLE_APOD_PREFIX_PATTERN.match(text)
         if not prefix:
@@ -1874,11 +1875,6 @@ class APOD(Star):
         separator = FEED_TITLE_SEPARATOR_PATTERN.match(body)
         if separator:
             body = body[separator.end() :].strip()
-        elif body[:1].isdigit() or FEED_TITLE_MONTH_DAY_PATTERN.match(body):
-            # 日期形状异常（缩写月份/月在前）：仍按 “日期 – 标题” 的约定取分隔符后一段。
-            parts = re.split(r"\s*[–—-]\s*", body, maxsplit=1)
-            if len(parts) == 2 and parts[1].strip():
-                body = parts[1].strip()
         # 整串只有前缀（如 “APOD: 2026 October 29”）时保留原样，避免空标题。
         return body or text
 
