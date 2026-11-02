@@ -34,14 +34,27 @@ FEED_URLS = (
     "https://science.nasa.gov/feed/?post_type=image-article",
 )
 FEED_XML_FIX_PATTERN = re.compile(r'"(?=xmlns:)')
-FEED_TITLE_DATE_PATTERN = re.compile(
-    r"(\d{4})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})"
-)
-FEED_TITLE_PREFIX_PATTERN = re.compile(r"APOD:\s*\d{4}\s+\S+\s+\d{1,2}\s*[–—-]\s*(.+)")
 MONTH_NAMES = {
     "January": 1, "February": 2, "March": 3, "April": 4, "May": 5, "June": 6,
     "July": 7, "August": 8, "September": 9, "October": 10, "November": 11, "December": 12,
 }
+# 月份名只写一份，日期正则从它生成。必须整体成组，否则组内的 “|” 会把
+# 外层分组拆散。
+_MONTHS = "(?:" + "|".join(MONTH_NAMES) + ")"
+# feed 标题里的日期实测有两种顺序：NASA 正常输出 “2026 October 29”，
+# 但 2026-10-29 那期写成了 “29 October 2026”。两种都得认，否则前缀剥不掉
+# （标题带着 “APOD: 日期 –” 进译文）、日期也解析不出（只能靠 meta/slug 兜底）。
+FEED_TITLE_DATE_PATTERN = re.compile(
+    rf"(?P<ymd_year>\d{{4}})\s+(?P<ymd_month>{_MONTHS})\s+(?P<ymd_day>\d{{1,2}})"
+    rf"|(?P<dmy_day>\d{{1,2}})\s+(?P<dmy_month>{_MONTHS})\s+(?P<dmy_year>\d{{4}})"
+)
+FEED_TITLE_APOD_PREFIX_PATTERN = re.compile(r"^APOD:\s*")
+# 紧跟在 “APOD:” 之后的日期片段；剥前缀时先吃日期，再吃分隔符。
+FEED_TITLE_LEAD_DATE_PATTERN = re.compile(
+    rf"^(?:\d{{4}}\s+{_MONTHS}\s+\d{{1,2}}"
+    rf"|\d{{1,2}}\s+{_MONTHS}\s+\d{{4}})\s*"
+)
+FEED_TITLE_SEPARATOR_PATTERN = re.compile(r"^[–—-]\s*")
 # 官网 Random APOD 的随机即由该接口在后端完成（randomizePost=True）。
 RANDOM_EMBED_URL = "https://science.nasa.gov/wp-json/smd/v1/embed-post"
 RANDOM_EMBED_ATTRIBUTES = {
@@ -1790,14 +1803,60 @@ class APOD(Star):
     def _month_number(month_name: str) -> Optional[int]:
         return MONTH_NAMES.get(month_name.capitalize())
 
+    @staticmethod
+    def _date_from_title(title_raw: str) -> str:
+        """从标题里解析日期，兼容 “2026 October 29” 与 “29 October 2026”。"""
+        matched = FEED_TITLE_DATE_PATTERN.search(title_raw or "")
+        if not matched:
+            return ""
+        if matched.group("ymd_year"):
+            year, month_name, day = (
+                matched.group("ymd_year"),
+                matched.group("ymd_month"),
+                matched.group("ymd_day"),
+            )
+        else:
+            year, month_name, day = (
+                matched.group("dmy_year"),
+                matched.group("dmy_month"),
+                matched.group("dmy_day"),
+            )
+        month_number = MONTH_NAMES.get(month_name or "")
+        if not month_number:
+            return ""
+        return f"{int(year):04d}-{month_number:02d}-{int(day):02d}"
+
+    @staticmethod
+    def _strip_title_prefix(title_raw: str) -> str:
+        """剥掉 feed 标题的 “APOD: <日期> – ” 前缀，两种日期顺序都认。
+
+        站点改版后 feed 标题仍沿用它，但日期顺序并不稳定；形状异常时走
+        保守规则（去掉 “APOD:”、开头的日期与分隔符），宁可多剥一点，
+        也不让 “APOD: 日期 –” 混进译文和正文。
+        """
+        text = (title_raw or "").strip()
+        prefix = FEED_TITLE_APOD_PREFIX_PATTERN.match(text)
+        if not prefix:
+            return text
+        body = FEED_TITLE_LEAD_DATE_PATTERN.sub("", text[prefix.end() :]).strip()
+        separator = FEED_TITLE_SEPARATOR_PATTERN.match(body)
+        if separator:
+            body = body[separator.end() :].strip()
+        elif body[:1].isdigit() or body.split(" ", 1)[0] in MONTH_NAMES:
+            # 日期形状异常（如缩写月份）：仍按 “日期 – 标题” 的约定取分隔符后一段。
+            parts = re.split(r"\s*[–—-]\s*", body, maxsplit=1)
+            if len(parts) == 2 and parts[1].strip():
+                body = parts[1].strip()
+        # 整串只有前缀（如 “APOD: 2026 October 29”）时保留原样，避免空标题。
+        return body or text
+
     def _resolve_apod_date(
         self, title_raw: str, link: str, content_html: str, pub_date_raw: str
     ) -> str:
         """日期解析优先级：标题 → meta 表格 → 链接 slug → pubDate。"""
-        matched = FEED_TITLE_DATE_PATTERN.search(title_raw or "")
-        if matched:
-            year, month_name, day = matched.groups()
-            return f"{int(year):04d}-{MONTH_NAMES[month_name]:02d}-{int(day):02d}"
+        title_date = self._date_from_title(title_raw)
+        if title_date:
+            return title_date
 
         for label, value in self._parse_meta_rows(content_html or ""):
             if label.lower() != "date":
@@ -1918,12 +1977,7 @@ class APOD(Star):
             if video_url:
                 break
 
-        title_matched = FEED_TITLE_PREFIX_PATTERN.match(title_raw or "")
-        title = (
-            title_matched.group(1).strip()
-            if title_matched
-            else (title_raw or "").strip()
-        )
+        title = self._strip_title_prefix(title_raw)
         date_str = date_str or self._resolve_apod_date(
             title_raw, link, content_html, pub_date_raw
         )
