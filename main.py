@@ -85,6 +85,10 @@ NASA_PROBE_TIMEOUT_SECONDS = 15
 NASA_POST_LINK_PATTERN = re.compile(
     r"https://www\.nasa\.gov/image-article/[^\s\"'<>]+"
 )
+# NASA 新版文章页把阅读时长、作者也放在 <p> 里，解析正文时必须按 class 排除。
+NASA_AUTHOR_CLASSES = ("article-author-name", "article-author-title")
+NASA_MIN_READ_PATTERN = re.compile(r"\d+\s*min\s*read", re.IGNORECASE)
+NASA_CREDIT_PREFIXES = ("image credit:", "video credit:", "photo credit:")
 # 视频型条目（如 2026-10-16 的猎鹰9号延时摄影）：science.nasa.gov 不给海报帧，
 # og:image 会退化成 NASA logo，真正的媒体是 og:video / <video><source src> 直链。
 # 注意 logo 的 URL 实际是 NASA_logo-1.png（下划线），两种写法都要拦截。
@@ -124,6 +128,7 @@ class _HTMLAttrParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.og_image = ""
         self.og_video = ""
+        self.og_description = ""
         self.published_meta = ""
         self.img_srcs = []
         self.video_srcs = []
@@ -136,6 +141,8 @@ class _HTMLAttrParser(HTMLParser):
             key = key.lower() if key else ""
             if key == "og:image" and not self.og_image:
                 self.og_image = attrs_map.get("content", "")
+            elif key == "og:description" and not self.og_description:
+                self.og_description = attrs_map.get("content", "")
             elif key in OG_VIDEO_META_KEYS and not self.og_video:
                 self.og_video = attrs_map.get("content", "")
             elif key in PUBLISHED_META_KEYS and not self.published_meta:
@@ -1601,19 +1608,38 @@ class APOD(Star):
                     image_url = candidate
                     break
         # 说明与版权只在文章主内容容器里找，按原文顺序保留全部段落；
-        # 页眉导航与页脚在容器之外，不参与拼接，也不做长度过滤。
+        # 页眉导航与页脚在容器之外，不参与拼接。
+        # 正则必须限定标签名后是空白或 '>'，否则 <p[^>]*> 会误匹配
+        # <path ...>（SVG 图标），把后续正文整块吞进同一个匹配。
         explanation_parts = []
         credit = ""
-        for p in re.findall(r"<p[^>]*>(.*?)</p>", region, re.S):
-            text = self._strip_html(p)
+        for match in re.finditer(r"<p(\s[^>]*)?>(.*?)</p>", region, re.S):
+            attrs = (match.group(1) or "").lower()
+            text = self._strip_html(match.group(2))
             lowered = text.lower()
-            if not credit and lowered.startswith(("image credit:", "video credit:")):
-                credit = text.split(":", 1)[1].strip()
+            if any(name in attrs for name in NASA_AUTHOR_CLASSES):
                 continue
-            if lowered.startswith(("learn more", "image article")):
+            if NASA_MIN_READ_PATTERN.fullmatch(lowered):
+                continue
+            if lowered.startswith(NASA_CREDIT_PREFIXES):
+                if not credit:
+                    credit = text.split(":", 1)[1].strip()
+                continue
+            if lowered.startswith("learn more") or lowered == "image article":
                 continue
             explanation_parts.append(text)
         explanation = " ".join(part for part in explanation_parts if part)
+        if not explanation:
+            fallback = self._strip_html(
+                html_lib.unescape(page_parser.og_description)
+            )
+            if fallback:
+                logger.warning(
+                    f"NASA 每日一图正文解析为空，回退 og:description：{link}"
+                )
+                explanation = fallback
+            else:
+                logger.warning(f"NASA 每日一图正文解析为空且无摘要：{link}")
         # 发布时间与 og:image 同源：meta 由同一解析器按属性解析收集
         # （顺序/引号/大小写无关）；只认发布时间，不拿更新时间冒充。
         published_raw = html_lib.unescape(page_parser.published_meta)

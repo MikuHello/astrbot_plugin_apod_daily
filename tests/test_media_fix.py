@@ -1538,6 +1538,69 @@ class ReplyPathVariableTests(unittest.TestCase):
         self.assertIsInstance(results[1][1][0], _COMP.Plain)
 
 
+class NasaArticleParsingTests(unittest.TestCase):
+    def setUp(self):
+        self.plugin = _make_plugin()
+
+    @staticmethod
+    def _page(body, *, description="", date="2026-10-30T15:56:26Z"):
+        head = (
+            "<html><head>"
+            '<meta property="og:image" '
+            'content="https://www.nasa.gov/wp-content/uploads/2026/10/x.png"/>'
+            f'<meta property="parsely-pub-date" content="{date}"/>'
+        )
+        if description:
+            head += f'<meta property="og:description" content="{description}"/>'
+        return f"{head}</head><body><article><h1>Test Title</h1>{body}</article></body></html>"
+
+    def test_path_tag_does_not_swallow_body(self):
+        # <p[^>]*> 会把 <path .../> 当段落开头，吞掉后面的正文并因
+        # “Image Article” 前缀被过滤；收紧标签名后必须拿到真正文。
+        page = self._page(
+            '<p class="label">1 min read</p>'
+            '<p class="article-author-name">HQ Web Team</p>'
+            '<div class="icon"><svg><path d="M1 1"/></svg>'
+            '<span>Image Article</span></div>'
+            '<p class="wp-block-paragraph">Real body text.</p>'
+            '<p><em>Image credit: NASA</em></p>'
+        )
+        data = self.plugin._build_nasa_data(page, LINK)
+        self.assertIsNotNone(data)
+        self.assertEqual(data["explanation"], "Real body text.")
+        self.assertEqual(data["credit"], "NASA")
+
+    def test_byline_classes_are_skipped(self):
+        page = self._page(
+            '<p class="article-author-name">HQ Web Team</p>'
+            '<p class="article-author-title">Goddard Space Flight Center</p>'
+            '<p class="wp-block-paragraph">Body.</p>'
+        )
+        data = self.plugin._build_nasa_data(page, LINK)
+        self.assertEqual(data["explanation"], "Body.")
+
+    def test_photo_credit_is_extracted(self):
+        page = self._page(
+            '<p class="wp-block-paragraph">Body.</p>'
+            '<p>Photo credit: NASA/Someone</p>'
+        )
+        data = self.plugin._build_nasa_data(page, LINK)
+        self.assertEqual(data["explanation"], "Body.")
+        self.assertEqual(data["credit"], "NASA/Someone")
+
+    def test_og_description_fallback(self):
+        page = self._page(
+            '<p class="article-author-name">HQ Web Team</p>',
+            description="Fallback summary.",
+        )
+        data = self.plugin._build_nasa_data(page, LINK)
+        self.assertEqual(data["explanation"], "Fallback summary.")
+
+    def test_empty_body_without_summary_is_invalid(self):
+        page = self._page('<p class="label">1 min read</p>')
+        self.assertIsNone(self.plugin._build_nasa_data(page, LINK))
+
+
 class NasaProbeTests(unittest.TestCase):
     def test_extract_latest_link_after_h1(self):
         page = (
