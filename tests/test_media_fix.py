@@ -345,6 +345,19 @@ class TitlePrefixTests(unittest.TestCase):
         )
         self.assertEqual(data["title"], "The Horns of Venus")
 
+    def test_month_first_date_falls_back_to_separator(self):
+        data = self.plugin._build_apod_data(
+            "APOD: May 5, 2026 \u2013 The Horns of Venus", LINK, IMAGE_ARTICLE
+        )
+        self.assertEqual(data["title"], "The Horns of Venus")
+
+    def test_month_word_in_title_is_not_treated_as_date(self):
+        # “May” 既是月份名也是普通单词：后面没跟日号时不能截断标题。
+        data = self.plugin._build_apod_data(
+            "APOD: May Sky Wonders \u2013 Part II", LINK, IMAGE_ARTICLE
+        )
+        self.assertEqual(data["title"], "May Sky Wonders \u2013 Part II")
+
     def test_title_without_prefix_is_kept(self):
         data = self.plugin._build_apod_data(
             "The Horns of Venus", LINK, IMAGE_ARTICLE

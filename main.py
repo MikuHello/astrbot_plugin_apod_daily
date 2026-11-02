@@ -48,6 +48,9 @@ FEED_TITLE_DATE_PATTERN = re.compile(
     rf"(?P<ymd_year>\d{{4}})\s+(?P<ymd_month>{_MONTHS})\s+(?P<ymd_day>\d{{1,2}})"
     rf"|(?P<dmy_day>\d{{1,2}})\s+(?P<dmy_month>{_MONTHS})\s+(?P<dmy_year>\d{{4}})"
 )
+# 兜底识别“月份在前”的日期（如 “May 5, 2026”）。月份名后必须跟日号，
+# 否则 “May Sky Wonders” 这类标题会被当成日期截断。
+FEED_TITLE_MONTH_DAY_PATTERN = re.compile(rf"{_MONTHS}\s+\d{{1,2}}")
 FEED_TITLE_APOD_PREFIX_PATTERN = re.compile(r"^APOD:\s*")
 FEED_TITLE_SEPARATOR_PATTERN = re.compile(r"^[–—-]\s*")
 # 官网 Random APOD 的随机即由该接口在后端完成（randomizePost=True）。
@@ -1791,8 +1794,8 @@ class APOD(Star):
         separator = FEED_TITLE_SEPARATOR_PATTERN.match(body)
         if separator:
             body = body[separator.end() :].strip()
-        elif body[:1].isdigit() or body.split(" ", 1)[0] in MONTH_NAMES:
-            # 日期形状异常（如缩写月份）：仍按 “日期 – 标题” 的约定取分隔符后一段。
+        elif body[:1].isdigit() or FEED_TITLE_MONTH_DAY_PATTERN.match(body):
+            # 日期形状异常（缩写月份/月在前）：仍按 “日期 – 标题” 的约定取分隔符后一段。
             parts = re.split(r"\s*[–—-]\s*", body, maxsplit=1)
             if len(parts) == 2 and parts[1].strip():
                 body = parts[1].strip()
