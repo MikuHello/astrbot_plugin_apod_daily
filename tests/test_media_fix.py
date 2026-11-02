@@ -554,14 +554,18 @@ class YouTubeVideoTests(unittest.TestCase):
         self.assertEqual(data["media_type"], "image")
         self.assertEqual(data["poster_url"], "")
 
-    def test_message_chain_uses_poster_instead_of_video(self):
+    def test_message_chains_use_poster_instead_of_video(self):
         data = self.plugin._parse_feed(RSS_YOUTUBE)
-        chain = asyncio.run(self.plugin._build_message_chain(data, None, None))
-        self.assertEqual(len(chain.chain), 2)
-        self.assertNotIsInstance(chain.chain[0], _COMP.Video)
-        self.assertIsInstance(chain.chain[0], _COMP.Image)
-        self.assertEqual(chain.chain[0].file, POSTER)
-        self.assertIsInstance(chain.chain[1], _COMP.Plain)
+        chains = asyncio.run(
+            self.plugin._build_apod_chains(data, None, None)
+        )
+        # YouTube 条目是 video 型：媒体链用封面帧，正文单独一条。
+        self.assertEqual(len(chains), 2)
+        self.assertEqual(len(chains[0].chain), 1)
+        self.assertNotIsInstance(chains[0].chain[0], _COMP.Video)
+        self.assertIsInstance(chains[0].chain[0], _COMP.Image)
+        self.assertEqual(chains[0].chain[0].file, POSTER)
+        self.assertIsInstance(chains[1].chain[0], _COMP.Plain)
 
     def test_reply_sends_poster_then_text(self):
         async def translate(apod_data, umo=None):
@@ -683,22 +687,46 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("⚠️", text)
         self.assertIn(f"原文链接：{LINK}", text)
 
-    def test_message_chain_uses_video_component(self):
-        chain = asyncio.run(
-            self.plugin._build_message_chain(self._video_data(), None, None)
+    def test_video_entry_splits_media_and_text(self):
+        # 视频期必须拆两条：[Video] + [Plain]。单链会让平台把正文
+        # 塞进富媒体消息的 content，视频气泡不渲染，正文静默丢失。
+        self.plugin.is_divided = False
+        chains = asyncio.run(
+            self.plugin._build_apod_chains(self._video_data(), None, None)
         )
-        self.assertIsInstance(chain.chain[0], _COMP.Video)
-        self.assertIsInstance(chain.chain[-1], _COMP.Plain)
-        self.assertEqual(chain.chain[0].file, MP4)
+        self.assertEqual(len(chains), 2)
+        self.assertEqual(len(chains[0].chain), 1)
+        self.assertIsInstance(chains[0].chain[0], _COMP.Video)
+        self.assertEqual(chains[0].chain[0].file, MP4)
+        self.assertEqual(len(chains[1].chain), 1)
+        self.assertIsInstance(chains[1].chain[0], _COMP.Plain)
+        self.assertIn("▶ 本期为视频", chains[1].chain[0].text)
 
-    def test_message_chain_with_media_false_is_text_only(self):
-        chain = asyncio.run(
-            self.plugin._build_message_chain(
+    def test_image_entry_merges_when_not_divided(self):
+        self.plugin.is_divided = False
+        data = self.plugin._build_apod_data("APOD: t", LINK, IMAGE_ARTICLE)
+        chains = asyncio.run(self.plugin._build_apod_chains(data, None, None))
+        self.assertEqual(len(chains), 1)
+        self.assertIsInstance(chains[0].chain[0], _COMP.Image)
+        self.assertIsInstance(chains[0].chain[-1], _COMP.Plain)
+
+    def test_image_entry_splits_when_divided(self):
+        self.plugin.is_divided = True
+        data = self.plugin._build_apod_data("APOD: t", LINK, IMAGE_ARTICLE)
+        chains = asyncio.run(self.plugin._build_apod_chains(data, None, None))
+        self.assertEqual(len(chains), 2)
+        self.assertIsInstance(chains[0].chain[0], _COMP.Image)
+        self.assertIsInstance(chains[1].chain[0], _COMP.Plain)
+
+    def test_chains_with_media_false_is_text_only(self):
+        chains = asyncio.run(
+            self.plugin._build_apod_chains(
                 self._video_data(), None, None, with_media=False
             )
         )
-        self.assertEqual(len(chain.chain), 1)
-        self.assertIsInstance(chain.chain[0], _COMP.Plain)
+        self.assertEqual(len(chains), 1)
+        self.assertEqual(len(chains[0].chain), 1)
+        self.assertIsInstance(chains[0].chain[0], _COMP.Plain)
 
 
 class FeedSourceTests(unittest.TestCase):
@@ -1390,6 +1418,29 @@ class ReplyPathVariableTests(unittest.TestCase):
         self.assertEqual(results[0][0], "chain")
         self.assertEqual(results[1][0], "text")
 
+    def test_image_merged_when_not_divided(self):
+        plugin = _make_plugin()
+        plugin.is_divided = False
+
+        async def translate(apod_data, umo=None):
+            return None, None, None
+
+        plugin._translate_fields = translate
+        event = SimpleNamespace(
+            unified_msg_origin="umo",
+            plain_result=lambda text: ("text", text),
+            image_result=lambda url: ("image", url),
+            chain_result=lambda chain: ("chain", chain),
+        )
+        data = plugin._build_apod_data("APOD: t", LINK, IMAGE_ARTICLE)
+
+        async def collect():
+            return [item async for item in plugin._reply_apod(event, data)]
+
+        results = asyncio.run(collect())
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0][0], "chain")
+
 
 class NasaProbeTests(unittest.TestCase):
     def test_extract_latest_link_after_h1(self):
@@ -1798,9 +1849,9 @@ class PushPerSessionChainTests(unittest.TestCase):
 
         async def build(*args, **kwargs):
             calls["n"] += 1
-            return apod_main.MessageChain(chain=[])
+            return []
 
-        async def send(umo, chain, fallback):
+        async def send(umo, chains, label="APOD"):
             return True
 
         plugin._get_cached_data = get_cached_data
@@ -1809,13 +1860,69 @@ class PushPerSessionChainTests(unittest.TestCase):
         plugin._translate_fields = translate
         plugin.get_cache = get_cache
         plugin.put_cache = put_cache
-        plugin._build_message_chain = build
-        plugin._send_chain_with_fallback = send
+        plugin._build_apod_chains = build
+        plugin._send_apod_chains = send
 
         ok = asyncio.run(plugin._push_check())
         self.assertTrue(ok)
         # 4 个会话各重建一次，避免复用同一个可能失效的本地路径
         self.assertEqual(calls["n"], 4)
+
+    def test_video_push_builds_media_and_text_chains(self):
+        config = _FakeConfig({"push": {"sessions": ["a"]}})
+        plugin = _make_plugin(config)
+        plugin.push_mode = "scheduled"
+        plugin.is_divided = False
+        apod_data = {
+            "date": "2026-10-28",
+            "title": "t",
+            "explanation": "e",
+            "media_type": "video",
+            "url": MP4,
+            "hdurl": MP4,
+            "link": "https://x/article/",
+        }
+        store = {}
+        recorded = []
+
+        async def get_cached_data(*args, **kwargs):
+            return apod_data
+
+        async def load_ck():
+            return {}
+
+        async def save_ck(pushed):
+            return None
+
+        async def translate(*args, **kwargs):
+            return None, None, None
+
+        async def get_cache(key):
+            return store.get(key)
+
+        async def put_cache(key, value):
+            store[key] = value
+
+        async def send(umo, chains, label="APOD"):
+            recorded.append(chains)
+            return True
+
+        plugin._get_cached_data = get_cached_data
+        plugin._load_push_checkpoint = load_ck
+        plugin._save_push_checkpoint = save_ck
+        plugin._translate_fields = translate
+        plugin.get_cache = get_cache
+        plugin.put_cache = put_cache
+        plugin._send_apod_chains = send
+
+        self.assertTrue(asyncio.run(plugin._push_check()))
+        self.assertEqual(len(recorded), 1)
+        chains = recorded[0]
+        # 图片期可将 is_divided 关掉，视频期必须恒拆，否则正文被气泡吞掉。
+        self.assertEqual(len(chains), 2)
+        self.assertIsInstance(chains[0].chain[0], _COMP.Video)
+        self.assertEqual(chains[0].chain[0].file, MP4)
+        self.assertIsInstance(chains[1].chain[0], _COMP.Plain)
 
 
 if __name__ == "__main__":

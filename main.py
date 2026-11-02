@@ -104,6 +104,8 @@ APOD_STALE_RETRY_MINUTES = 5
 APOD_PREFETCH_RETRY_ATTEMPTS = 3
 # 图片缓存淘汰前的最小存活时间：待发送的消息可能还引用着刚写入的文件。
 IMAGE_CACHE_MIN_AGE_SECONDS = 120
+# 单条消息发送超时：视频上传慢，给足时间，但不能无限挂住推送循环。
+SEND_TIMEOUT_SECONDS = 60
 
 
 # 文章发布时间只认这两种 meta 名，不拿更新时间冒充。
@@ -532,8 +534,9 @@ class APOD(Star):
                     )
 
         # 图片可按配置合并；视频始终分开发送：平台发不了视频时，
-        # 也不能把正文和原文链接一起拖下水。
-        if self.is_divided or media_type == "video":
+        # 也不能把正文和原文链接一起拖下水。拆分规则与推送路径共用
+        # _split_media，避免“指令正常、推送单链”的行为不一致。
+        if self._split_media(apod_data):
             # 图片一条、文本一条。
             has_output = False
             if media_component is not None:
@@ -661,7 +664,9 @@ class APOD(Star):
         display_name = (
             NASA_DISPLAY_NAME if label.startswith("NASA") else PLUGIN_DISPLAY_NAME
         )
-        message = await self._build_message_chain(
+        # 推送/工具路径与指令路径共用同一套拆分规则：
+        # 视频恒拆两条，图片跟随 is_divided，避免正文被富媒体气泡吞掉。
+        chains = await self._build_apod_chains(
             apod_data,
             title_zh,
             explanation_zh,
@@ -669,35 +674,9 @@ class APOD(Star):
             with_media=self.send_media,
             display_name=display_name,
         )
-        sent = False
-        try:
-            sent = await self.context.send_message(
-                event.unified_msg_origin, message
-            )
-        except Exception as exc:
-            logger.error(f"发送{label}消息链失败：{exc}")
-        if (
-            sent is False
-            and self.send_media
-            and str(apod_data.get("media_type") or "").lower() == "video"
-        ):
-            # 视频组件不受平台支持时，降级为“文字+原文链接”。
-            fallback = await self._build_message_chain(
-                apod_data,
-                title_zh,
-                explanation_zh,
-                tomorrow_zh=tomorrow_zh,
-                with_media=False,
-                display_name=display_name,
-            )
-            try:
-                sent = await self.context.send_message(
-                    event.unified_msg_origin, fallback
-                )
-                logger.info(f"{label}视频发送失败，已降级为文字+链接。")
-            except Exception as exc:
-                logger.error(f"发送{label}降级消息链失败：{exc}")
-                sent = False
+        sent = await self._send_apod_chains(
+            event.unified_msg_origin, chains, label=label
+        )
         if sent is False:
             logger.warning(f"发送{label}：未匹配到消息平台。")
             return f"{label}发送失败：未找到可用的消息平台。"
@@ -2207,27 +2186,14 @@ class APOD(Star):
         for umo in pending:
             # 每个会话发送前重建消息链：本地图片可能已被其他请求淘汰，
             # 重建会命中缓存并刷新保护时间（必要时重新下载）。
-            chain = await self._build_message_chain(
+            chains = await self._build_apod_chains(
                 apod_data,
                 title_zh,
                 explanation_zh,
                 tomorrow_zh=tomorrow_zh,
                 with_media=self.send_media,
             )
-            fallback = None
-            if (
-                self.send_media
-                and str(apod_data.get("media_type") or "").lower() == "video"
-            ):
-                # 视频组件发送不成功时降级为“文字+原文链接”，保证推送不丢消息。
-                fallback = await self._build_message_chain(
-                    apod_data,
-                    title_zh,
-                    explanation_zh,
-                    tomorrow_zh=tomorrow_zh,
-                    with_media=False,
-                )
-            if not await self._send_chain_with_fallback(umo, chain, fallback):
+            if not await self._send_apod_chains(umo, chains):
                 continue
             pushed[umo] = link
             try:
@@ -2391,15 +2357,20 @@ class APOD(Star):
             logger.warning(f"图片缓存失败，改用原始链接：{exc}")
             return None
 
-    async def _build_message_chain(
-        self,
-        apod_data: Dict[str, Any],
-        title_zh: Optional[str],
-        explanation_zh: Optional[str],
-        tomorrow_zh: Optional[str] = None,
-        with_media: bool = True,
-        display_name: str = PLUGIN_DISPLAY_NAME,
+    def _split_media(self, apod_data: Dict[str, Any]) -> bool:
+        """媒体与正文是否分两条消息：图片跟随 is_divided，视频恒拆。
+
+        视频必须恒拆：平台会把 [Video, Plain] 合成一条富媒体消息
+        （msg_type=7 且 content=正文），视频气泡不渲染 content，
+        正文会被平台静默丢弃，而发送层拿到的仍是成功。
+        """
+        media_type = str(apod_data.get("media_type") or "").strip().lower()
+        return self.is_divided or media_type == "video"
+
+    async def _build_media_chain(
+        self, apod_data: Dict[str, Any], with_media: bool = True
     ) -> MessageChain:
+        """只含媒体组件的消息链；无可用媒体时为空链。"""
         chain = []
         url = apod_data.get("hdurl") or apod_data.get("url")
         media_type = str(apod_data.get("media_type") or "").strip().lower()
@@ -2424,6 +2395,17 @@ class APOD(Star):
                     chain.append(Comp.Image.fromFileSystem(local_path))
                 else:
                     chain.append(Comp.Image.fromURL(url))
+        return MessageChain(chain=chain)
+
+    def _build_text_chain(
+        self,
+        apod_data: Dict[str, Any],
+        title_zh: Optional[str],
+        explanation_zh: Optional[str],
+        tomorrow_zh: Optional[str] = None,
+        display_name: str = PLUGIN_DISPLAY_NAME,
+    ) -> MessageChain:
+        """只含正文的消息链；正文全关时为空链。"""
         text = self._build_display_text(
             apod_data,
             title_zh,
@@ -2431,34 +2413,81 @@ class APOD(Star):
             tomorrow_zh=tomorrow_zh,
             display_name=display_name,
         )
-        if text:
-            chain.append(Comp.Plain(text))
-        return MessageChain(chain=chain)
+        return MessageChain(chain=[Comp.Plain(text)] if text else [])
 
-    async def _send_chain_with_fallback(
-        self, umo: str, chain: MessageChain, fallback: Optional[MessageChain]
-    ) -> bool:
-        """发送消息链并返回是否成功；发送异常或返回 False 时，
-        若提供了降级链（视频→文字+链接）则再试一次。"""
+    async def _build_apod_chains(
+        self,
+        apod_data: Dict[str, Any],
+        title_zh: Optional[str],
+        explanation_zh: Optional[str],
+        tomorrow_zh: Optional[str] = None,
+        with_media: bool = True,
+        display_name: str = PLUGIN_DISPLAY_NAME,
+    ) -> list[MessageChain]:
+        """按 _split_media 返回要发送的消息链：1 条=合并，2 条=媒体+正文。
+
+        with_media=False 时只返回正文链，即“视频发不出去”的降级形态。
+        """
+        media_chain = await self._build_media_chain(apod_data, with_media=with_media)
+        text_chain = self._build_text_chain(
+            apod_data,
+            title_zh,
+            explanation_zh,
+            tomorrow_zh=tomorrow_zh,
+            display_name=display_name,
+        )
+        if not self._split_media(apod_data):
+            merged = MessageChain(chain=[*media_chain.chain, *text_chain.chain])
+            return [merged] if merged.chain else []
+        chains = []
+        if media_chain.chain:
+            chains.append(media_chain)
+        if text_chain.chain:
+            chains.append(text_chain)
+        return chains
+
+    @staticmethod
+    def _chain_has_media(chain: MessageChain) -> bool:
+        return any(isinstance(item, (Comp.Image, Comp.Video)) for item in chain.chain)
+
+    async def _send_chain(self, umo: str, chain: MessageChain, label: str) -> bool:
         try:
             sent = await asyncio.wait_for(
-                self.context.send_message(umo, chain), timeout=60
+                self.context.send_message(umo, chain),
+                timeout=SEND_TIMEOUT_SECONDS,
             )
         except Exception as exc:
-            logger.error(f"APOD 推送到 {umo} 失败：{exc}")
-            sent = False
-        if sent is False and fallback is not None:
-            logger.warning(f"APOD 推送到 {umo} 的视频消息失败，降级为文字+链接。")
-            try:
-                sent = await asyncio.wait_for(
-                    self.context.send_message(umo, fallback), timeout=60
-                )
-            except Exception as exc:
-                logger.error(f"APOD 推送降级到 {umo} 失败：{exc}")
-                sent = False
-        if sent is False:
-            logger.error(f"APOD 推送到 {umo} 失败：未匹配到消息平台。")
+            logger.error(f"{label} 推送到 {umo} 失败：{exc}")
             return False
+        if sent is False:
+            logger.error(f"{label} 推送到 {umo} 失败：未匹配到消息平台。")
+            return False
+        return True
+
+    async def _send_apod_chains(
+        self, umo: str, chains: list[MessageChain], label: str = "APOD"
+    ) -> bool:
+        """逐条发送消息链；媒体那条失败时舍媒体保正文（文字+原文链接）。
+
+        正文失败一律视为未送达：宁可下轮补发（可能重发一次视频），
+        也不能让说明文本静默丢掉。
+        """
+        if not chains:
+            return False
+        degraded = False
+        last_index = len(chains) - 1
+        for index, chain in enumerate(chains):
+            if await self._send_chain(umo, chain, label):
+                continue
+            if self._chain_has_media(chain) and index < last_index:
+                degraded = True
+                logger.warning(
+                    f"{label} 推送到 {umo} 的媒体发送失败，继续发送正文。"
+                )
+                continue
+            return False
+        if degraded:
+            logger.warning(f"{label} 推送到 {umo} 已降级为文字+链接。")
         return True
 
     async def terminate(self):
