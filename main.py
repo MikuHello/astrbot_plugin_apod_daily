@@ -49,11 +49,6 @@ FEED_TITLE_DATE_PATTERN = re.compile(
     rf"|(?P<dmy_day>\d{{1,2}})\s+(?P<dmy_month>{_MONTHS})\s+(?P<dmy_year>\d{{4}})"
 )
 FEED_TITLE_APOD_PREFIX_PATTERN = re.compile(r"^APOD:\s*")
-# 紧跟在 “APOD:” 之后的日期片段；剥前缀时先吃日期，再吃分隔符。
-FEED_TITLE_LEAD_DATE_PATTERN = re.compile(
-    rf"^(?:\d{{4}}\s+{_MONTHS}\s+\d{{1,2}}"
-    rf"|\d{{1,2}}\s+{_MONTHS}\s+\d{{4}})\s*"
-)
 FEED_TITLE_SEPARATOR_PATTERN = re.compile(r"^[–—-]\s*")
 # 官网 Random APOD 的随机即由该接口在后端完成（randomizePost=True）。
 RANDOM_EMBED_URL = "https://science.nasa.gov/wp-json/smd/v1/embed-post"
@@ -1817,7 +1812,11 @@ class APOD(Star):
         prefix = FEED_TITLE_APOD_PREFIX_PATTERN.match(text)
         if not prefix:
             return text
-        body = FEED_TITLE_LEAD_DATE_PATTERN.sub("", text[prefix.end() :]).strip()
+        body = text[prefix.end() :].strip()
+        # 开头的日期用同一个日期规则匹配（match 锚定在开头），再按结束位置裁掉。
+        lead_date = FEED_TITLE_DATE_PATTERN.match(body)
+        if lead_date:
+            body = body[lead_date.end() :].strip()
         separator = FEED_TITLE_SEPARATOR_PATTERN.match(body)
         if separator:
             body = body[separator.end() :].strip()
