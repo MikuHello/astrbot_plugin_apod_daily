@@ -727,11 +727,11 @@ class RenderingTests(unittest.TestCase):
         self.assertIsInstance(chains[0].chain[0], _COMP.Image)
         self.assertIsInstance(chains[1].chain[0], _COMP.Plain)
 
-    def test_chains_with_media_false_is_text_only(self):
+    def test_text_only_when_media_disabled(self):
+        # 关掉“发送媒体”开关后应当只剩正文链（降级本来就靠这个开关）。
+        self.plugin.send_media = False
         chains = asyncio.run(
-            self.plugin._build_apod_chains(
-                self._video_data(), None, None, with_media=False
-            )
+            self.plugin._build_apod_chains(self._video_data(), None, None)
         )
         self.assertEqual(len(chains), 1)
         self.assertEqual(len(chains[0].chain), 1)
@@ -1403,26 +1403,33 @@ class ApodCachePolicyTests(unittest.TestCase):
 
 
 class ReplyPathVariableTests(unittest.TestCase):
-    def test_video_always_sent_separately(self):
-        plugin = _make_plugin()
-        plugin.is_divided = False
+    """指令路径的拆分形态：三组场景共用一套插件与事件桩。"""
 
-        async def translate(apod_data, umo=None):
-            return None, None, None
-
-        plugin._translate_fields = translate
-        event = SimpleNamespace(
+    def setUp(self):
+        self.plugin = _make_plugin()
+        self.event = SimpleNamespace(
             unified_msg_origin="umo",
             plain_result=lambda text: ("text", text),
             image_result=lambda url: ("image", url),
             chain_result=lambda chain: ("chain", chain),
         )
-        data = plugin._build_apod_data("APOD: t", LINK, VIDEO_ARTICLE)
+
+        async def translate(apod_data, umo=None):
+            return None, None, None
+
+        self.plugin._translate_fields = translate
+
+    def _reply(self, article, *, is_divided):
+        self.plugin.is_divided = is_divided
+        data = self.plugin._build_apod_data("APOD: t", LINK, article)
 
         async def collect():
-            return [item async for item in plugin._reply_apod(event, data)]
+            return [item async for item in self.plugin._reply_apod(self.event, data)]
 
-        results = asyncio.run(collect())
+        return asyncio.run(collect())
+
+    def test_video_always_sent_separately(self):
+        results = self._reply(VIDEO_ARTICLE, is_divided=False)
         self.assertEqual(len(results), 2)
         self.assertEqual([r[0] for r in results], ["chain", "chain"])
         self.assertIsInstance(results[0][1][0], _COMP.Video)
@@ -1430,50 +1437,14 @@ class ReplyPathVariableTests(unittest.TestCase):
         self.assertIsInstance(results[1][1][0], _COMP.Plain)
 
     def test_image_merged_when_not_divided(self):
-        plugin = _make_plugin()
-        plugin.is_divided = False
-
-        async def translate(apod_data, umo=None):
-            return None, None, None
-
-        plugin._translate_fields = translate
-        event = SimpleNamespace(
-            unified_msg_origin="umo",
-            plain_result=lambda text: ("text", text),
-            image_result=lambda url: ("image", url),
-            chain_result=lambda chain: ("chain", chain),
-        )
-        data = plugin._build_apod_data("APOD: t", LINK, IMAGE_ARTICLE)
-
-        async def collect():
-            return [item async for item in plugin._reply_apod(event, data)]
-
-        results = asyncio.run(collect())
+        results = self._reply(IMAGE_ARTICLE, is_divided=False)
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0][0], "chain")
         self.assertIsInstance(results[0][1][0], _COMP.Image)
         self.assertIsInstance(results[0][1][-1], _COMP.Plain)
 
     def test_image_split_when_divided(self):
-        plugin = _make_plugin()
-        plugin.is_divided = True
-
-        async def translate(apod_data, umo=None):
-            return None, None, None
-
-        plugin._translate_fields = translate
-        event = SimpleNamespace(
-            unified_msg_origin="umo",
-            plain_result=lambda text: ("text", text),
-            image_result=lambda url: ("image", url),
-            chain_result=lambda chain: ("chain", chain),
-        )
-        data = plugin._build_apod_data("APOD: t", LINK, IMAGE_ARTICLE)
-
-        async def collect():
-            return [item async for item in plugin._reply_apod(event, data)]
-
-        results = asyncio.run(collect())
+        results = self._reply(IMAGE_ARTICLE, is_divided=True)
         self.assertEqual(len(results), 2)
         self.assertIsInstance(results[0][1][0], _COMP.Image)
         self.assertIsInstance(results[1][1][0], _COMP.Plain)
