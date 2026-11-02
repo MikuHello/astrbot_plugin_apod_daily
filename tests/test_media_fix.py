@@ -747,6 +747,51 @@ class RenderingTests(unittest.TestCase):
         self.assertEqual(len(chains[0].chain), 1)
         self.assertIsInstance(chains[0].chain[0], _COMP.Plain)
 
+    def test_merged_chain_failure_resends_text_only(self):
+        self.plugin.is_divided = False
+        data = self.plugin._build_apod_data("APOD: t", LINK, IMAGE_ARTICLE)
+        chains = asyncio.run(self.plugin._build_apod_chains(data, None, None))
+        self.assertEqual(len(chains), 1)
+        attempts = []
+
+        async def send_chain(umo, chain, label="APOD"):
+            attempts.append([type(item).__name__ for item in chain.chain])
+            return len(attempts) > 1
+
+        self.plugin._send_chain = send_chain
+        self.assertTrue(asyncio.run(self.plugin._send_apod_chains("umo", chains)))
+        self.assertEqual(attempts, [["Image", "Plain"], ["Plain"]])
+
+    def test_merged_chain_failure_returns_false_when_fallback_fails(self):
+        self.plugin.is_divided = False
+        data = self.plugin._build_apod_data("APOD: t", LINK, IMAGE_ARTICLE)
+        chains = asyncio.run(self.plugin._build_apod_chains(data, None, None))
+        attempts = []
+
+        async def send_chain(umo, chain, label="APOD"):
+            attempts.append([type(item).__name__ for item in chain.chain])
+            return False
+
+        self.plugin._send_chain = send_chain
+        self.assertFalse(asyncio.run(self.plugin._send_apod_chains("umo", chains)))
+        self.assertEqual(attempts, [["Image", "Plain"], ["Plain"]])
+
+    def test_split_media_failure_still_sends_text(self):
+        # 重构拆分判据后，媒体先发、正文后发的降级不能退化成整体失败。
+        self.plugin.is_divided = True
+        data = self.plugin._build_apod_data("APOD: t", LINK, IMAGE_ARTICLE)
+        chains = asyncio.run(self.plugin._build_apod_chains(data, None, None))
+        attempts = []
+
+        async def send_chain(umo, chain, label="APOD"):
+            kinds = [type(item).__name__ for item in chain.chain]
+            attempts.append(kinds)
+            return "Image" not in kinds
+
+        self.plugin._send_chain = send_chain
+        self.assertTrue(asyncio.run(self.plugin._send_apod_chains("umo", chains)))
+        self.assertEqual(attempts, [["Image"], ["Plain"]])
+
 
 class FeedSourceTests(unittest.TestCase):
     NEWS_ONLY = (

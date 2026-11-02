@@ -2397,6 +2397,13 @@ class APOD(Star):
     def _chain_has_media(chain: MessageChain) -> bool:
         return any(isinstance(item, (Comp.Image, Comp.Video)) for item in chain.chain)
 
+    @staticmethod
+    def _plain_only_chain(chain: MessageChain) -> MessageChain:
+        """摘出链里的纯文本组件，供合并链失败时补发正文。"""
+        return MessageChain(
+            chain=[item for item in chain.chain if isinstance(item, Comp.Plain)]
+        )
+
     async def _send_chain(self, umo: str, chain: MessageChain, label: str) -> bool:
         try:
             sent = await asyncio.wait_for(
@@ -2414,7 +2421,7 @@ class APOD(Star):
     async def _send_apod_chains(
         self, umo: str, chains: list[MessageChain], label: str = "APOD"
     ) -> bool:
-        """逐条发送消息链；媒体那条失败时舍媒体保正文。
+        """逐条发送消息链；媒体那条失败时舍媒体保正文（合并链补发纯文字）。
 
         正文失败一律视为未送达：宁可下轮补发（可能重发一次视频），
         也不能让说明文本静默丢掉。
@@ -2426,10 +2433,20 @@ class APOD(Star):
         for index, chain in enumerate(chains):
             if await self._send_chain(umo, chain, label):
                 continue
-            if self._chain_has_media(chain) and index < last_index:
+            if not self._chain_has_media(chain):
+                return False
+            if index < last_index:
                 degraded = True
                 logger.warning(
                     f"{label} 推送到 {umo} 的媒体发送失败，继续发送正文。"
+                )
+                continue
+            # 合并链失败时正文跟媒体一起丢了：摘出纯文本再发一次，成本很低。
+            fallback = self._plain_only_chain(chain)
+            if fallback.chain and await self._send_chain(umo, fallback, label):
+                degraded = True
+                logger.warning(
+                    f"{label} 推送到 {umo} 的媒体发送失败，已改发纯文字正文。"
                 )
                 continue
             return False
