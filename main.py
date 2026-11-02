@@ -416,6 +416,8 @@ class APOD(Star):
         )
 
         self.is_divided = bool(self.config.get("is_divided", True))
+        # 指令回复的引用气泡：默认关；开启时只在本次回复首条消息上引用。
+        self.quote_reply = bool(self.config.get("quote_reply", False))
         self.timeout = max(1, int(self.config.get("timeout", 120)))
         self.retry_count = max(0, int(self.config.get("retry_count", 3)))
         # 统一条数上限：翻译缓存与图片缓存各自按它淘汰最旧。
@@ -474,58 +476,115 @@ class APOD(Star):
         sub = tokens[0].lower() if tokens else ""
 
         if sub in ("今日", "today", "latest", "最新"):
-            async for result in self._reply_latest_apod(event):
-                yield result
+            await self._reply_latest_apod(event)
         elif sub in ("随机", "random"):
-            async for result in self._reply_random_apod(event):
-                yield result
+            await self._reply_random_apod(event)
         else:
             yield event.plain_result(APOD_HELP)
+
+    @staticmethod
+    def _reply_chain_with_quote(
+        event: AstrMessageEvent, chain: MessageChain
+    ) -> MessageChain:
+        message_id = str(
+            getattr(getattr(event, "message_obj", None), "message_id", "") or ""
+        )
+        if not message_id:
+            return chain
+        return MessageChain(chain=[Comp.Reply(id=message_id), *chain.chain])
+
+    async def _send_reply_chains(
+        self,
+        event: AstrMessageEvent,
+        chains: list[MessageChain],
+        label: str = PLUGIN_DISPLAY_NAME,
+    ) -> bool:
+        """指令回复直接发送，绕开 result_decorate 的 At/引用/t2i/合并转发。
+
+        result_decorate 会在 Plain/Image 链首插 At（QQ 官方会把它序列化成
+        content 里的 <qqbot-at-user> 字面量），并按平台设置加引用气泡。
+        直接调用 event.send 走 msg_id 被动回复，引用改由 quote_reply 控制。
+        代价是同时跳过 reply_prefix、TTS、内容安全与 on_decorating_result 钩子。
+        """
+        if not chains:
+            return False
+        sent_any = False
+        for index, chain in enumerate(chains):
+            out_chain = (
+                self._reply_chain_with_quote(event, chain)
+                if self.quote_reply and index == 0
+                else chain
+            )
+            try:
+                await event.send(out_chain)
+            except Exception as exc:
+                logger.error(f"{label} 指令回复第 {index + 1} 条发送失败：{exc}")
+                continue
+            sent_any = True
+        if not sent_any:
+            logger.error(f"{label} 指令回复全部发送失败。")
+        return sent_any
+
+    async def _reply_text(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        label: str = PLUGIN_DISPLAY_NAME,
+    ) -> None:
+        await self._send_reply_chains(
+            event, [MessageChain(chain=[Comp.Plain(text)])], label
+        )
+        event.stop_event()
 
     async def _reply_latest_apod(self, event: AstrMessageEvent):
         logger.info("正在获取最新 APOD ...")
         apod_data = await self._get_latest_apod()
         if apod_data is None:
-            yield event.plain_result(
-                self.last_apod_error or "获取 APOD 数据失败，请稍后重试。"
+            await self._reply_text(
+                event, self.last_apod_error or "获取 APOD 数据失败，请稍后重试。"
             )
             return
-        async for result in self._reply_apod(event, apod_data):
-            yield result
+        await self._reply_apod(event, apod_data)
 
     async def _reply_random_apod(self, event: AstrMessageEvent):
         logger.info("正在获取随机 APOD ...")
         apod_data = await self._fetch_random_apod()
         if apod_data is None:
-            yield event.plain_result(
-                self.last_apod_error or "获取随机 APOD 失败，请稍后重试。"
+            await self._reply_text(
+                event, self.last_apod_error or "获取随机 APOD 失败，请稍后重试。"
             )
             return
-        async for result in self._reply_apod(event, apod_data):
-            yield result
+        await self._reply_apod(event, apod_data)
 
     async def _reply_apod(
-        self, event: AstrMessageEvent, apod_data: dict, display_name: str = PLUGIN_DISPLAY_NAME
-    ):
-        """按展示配置渲染并发送某一期内容（apod 今日/随机、nasa 共用）。"""
-        title_zh, explanation_zh, tomorrow_zh = await self._translate_fields(
-            apod_data, umo=event.unified_msg_origin
-        )
-        # 翻译可能较慢；放在本地化之前，缩短“待发送文件被淘汰”的窗口。
-        # 组链与推送/工具路径共用 _build_apod_chains：视频恒拆两条，
-        # 图片跟随 is_divided，三处不再各自拼链。
-        chains = await self._build_apod_chains(
-            apod_data,
-            title_zh,
-            explanation_zh,
-            tomorrow_zh=tomorrow_zh,
-            display_name=display_name,
-        )
-        if not chains:
-            yield event.plain_result("当前配置未启用任何可返回的内容。")
-            return
-        for chain in chains:
-            yield event.chain_result(chain.chain)
+        self,
+        event: AstrMessageEvent,
+        apod_data: dict,
+        display_name: str = PLUGIN_DISPLAY_NAME,
+    ) -> None:
+        """按展示配置渲染并直接发送某一期内容（apod 今日/随机、nasa 共用）。"""
+        try:
+            title_zh, explanation_zh, tomorrow_zh = await self._translate_fields(
+                apod_data, umo=event.unified_msg_origin
+            )
+            # 翻译可能较慢；放在本地化之前，缩短“待发送文件被淘汰”的窗口。
+            # 组链与推送/工具路径共用 _build_apod_chains：视频恒拆两条，
+            # 图片跟随 is_divided，三处不再各自拼链。
+            chains = await self._build_apod_chains(
+                apod_data,
+                title_zh,
+                explanation_zh,
+                tomorrow_zh=tomorrow_zh,
+                display_name=display_name,
+            )
+            if not chains:
+                await self._reply_text(
+                    event, "当前配置未启用任何可返回的内容。", display_name
+                )
+                return
+            await self._send_reply_chains(event, chains, display_name)
+        finally:
+            event.stop_event()
 
     @filter.command("apod管理")
     @filter.permission_type(PermissionType.GROUP_ADMIN)
@@ -587,14 +646,13 @@ class APOD(Star):
         logger.info("正在获取 NASA 每日一图 ...")
         nasa_data = await self._get_nasa()
         if nasa_data is None:
-            yield event.plain_result(
-                self.last_apod_error or "获取 NASA 每日一图失败，请稍后重试。"
+            await self._reply_text(
+                event,
+                self.last_apod_error or "获取 NASA 每日一图失败，请稍后重试。",
+                NASA_DISPLAY_NAME,
             )
             return
-        async for result in self._reply_apod(
-            event, nasa_data, display_name=NASA_DISPLAY_NAME
-        ):
-            yield result
+        await self._reply_apod(event, nasa_data, display_name=NASA_DISPLAY_NAME)
 
     # ---------- LLM 函数工具 ----------
 

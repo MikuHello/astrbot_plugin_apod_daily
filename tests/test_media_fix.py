@@ -180,8 +180,13 @@ def _install_astrbot_stubs():
         def fromURL(url):
             return Video(file=url)
 
+    class Reply(_Component):
+        def __init__(self, id=None):
+            super().__init__(id=id)
+
     comp = mod("astrbot.api.message_components")
     comp.Plain, comp.Image, comp.Video = Plain, Image, Video
+    comp.Reply = Reply
     api.message_components = comp
 
     class AstrBotConfig(dict):
@@ -311,8 +316,28 @@ def _make_plugin(config=None):
     plugin.cache_limit = 1000
     plugin.cache_images = False
     plugin.is_divided = True
+    plugin.quote_reply = False
     plugin.timeout = 30
     return plugin
+
+
+def _make_reply_event(message_id="msg-1"):
+    event = SimpleNamespace(
+        unified_msg_origin="umo",
+        message_obj=SimpleNamespace(message_id=message_id),
+        sent=[],
+        stopped=False,
+    )
+
+    async def send(chain):
+        event.sent.append(chain)
+
+    def stop_event():
+        event.stopped = True
+
+    event.send = send
+    event.stop_event = stop_event
+    return event
 
 
 class TitlePrefixTests(unittest.TestCase):
@@ -595,24 +620,17 @@ class YouTubeVideoTests(unittest.TestCase):
             return None, None, None
 
         self.plugin._translate_fields = translate
-        event = SimpleNamespace(
-            unified_msg_origin="umo",
-            plain_result=lambda text: ("text", text),
-            image_result=lambda url: ("image", url),
-            chain_result=lambda chain: ("chain", chain),
-        )
+        event = _make_reply_event()
         data = self.plugin._parse_feed(RSS_YOUTUBE)
 
-        async def collect():
-            return [item async for item in self.plugin._reply_apod(event, data)]
-
-        results = asyncio.run(collect())
+        asyncio.run(self.plugin._reply_apod(event, data))
         # 指令路径也走 _build_apod_chains：封面帧一条、正文一条。
-        self.assertEqual([r[0] for r in results], ["chain", "chain"])
-        self.assertEqual(len(results[0][1]), 1)
-        self.assertIsInstance(results[0][1][0], _COMP.Image)
-        self.assertEqual(results[0][1][0].file, POSTER)
-        self.assertIsInstance(results[1][1][0], _COMP.Plain)
+        self.assertTrue(event.stopped)
+        self.assertEqual(len(event.sent), 2)
+        self.assertEqual(len(event.sent[0].chain), 1)
+        self.assertIsInstance(event.sent[0].chain[0], _COMP.Image)
+        self.assertEqual(event.sent[0].chain[0].file, POSTER)
+        self.assertIsInstance(event.sent[1].chain[0], _COMP.Plain)
 
 
 class TomorrowTitleTests(unittest.TestCase):
@@ -666,21 +684,14 @@ class TomorrowTitleTests(unittest.TestCase):
             return None, None, "天空之眼"
 
         self.plugin._translate_fields = translate
-        event = SimpleNamespace(
-            unified_msg_origin="umo",
-            plain_result=lambda text: ("text", text),
-            image_result=lambda url: ("image", url),
-            chain_result=lambda chain: ("chain", chain),
-        )
+        event = _make_reply_event()
         data = self._data()
 
-        async def collect():
-            return [item async for item in self.plugin._reply_apod(event, data)]
-
+        asyncio.run(self.plugin._reply_apod(event, data))
         texts = [
             component.text
-            for _, chain in asyncio.run(collect())
-            for component in chain
+            for chain in event.sent
+            for component in chain.chain
             if isinstance(component, _COMP.Plain)
         ]
         self.assertTrue(texts)
@@ -1495,12 +1506,7 @@ class ReplyPathVariableTests(unittest.TestCase):
 
     def setUp(self):
         self.plugin = _make_plugin()
-        self.event = SimpleNamespace(
-            unified_msg_origin="umo",
-            plain_result=lambda text: ("text", text),
-            image_result=lambda url: ("image", url),
-            chain_result=lambda chain: ("chain", chain),
-        )
+        self.event = _make_reply_event()
 
         async def translate(apod_data, umo=None):
             return None, None, None
@@ -1510,32 +1516,48 @@ class ReplyPathVariableTests(unittest.TestCase):
     def _reply(self, article, *, is_divided):
         self.plugin.is_divided = is_divided
         data = self.plugin._build_apod_data("APOD: t", LINK, article)
-
-        async def collect():
-            return [item async for item in self.plugin._reply_apod(self.event, data)]
-
-        return asyncio.run(collect())
+        asyncio.run(self.plugin._reply_apod(self.event, data))
+        return self.event.sent
 
     def test_video_always_sent_separately(self):
         results = self._reply(VIDEO_ARTICLE, is_divided=False)
         self.assertEqual(len(results), 2)
-        self.assertEqual([r[0] for r in results], ["chain", "chain"])
-        self.assertIsInstance(results[0][1][0], _COMP.Video)
-        self.assertEqual(results[0][1][0].file, MP4)
-        self.assertIsInstance(results[1][1][0], _COMP.Plain)
+        self.assertIsInstance(results[0].chain[0], _COMP.Video)
+        self.assertEqual(results[0].chain[0].file, MP4)
+        self.assertIsInstance(results[1].chain[0], _COMP.Plain)
 
     def test_image_merged_when_not_divided(self):
         results = self._reply(IMAGE_ARTICLE, is_divided=False)
         self.assertEqual(len(results), 1)
-        self.assertEqual(results[0][0], "chain")
-        self.assertIsInstance(results[0][1][0], _COMP.Image)
-        self.assertIsInstance(results[0][1][-1], _COMP.Plain)
+        self.assertIsInstance(results[0].chain[0], _COMP.Image)
+        self.assertIsInstance(results[0].chain[-1], _COMP.Plain)
 
     def test_image_split_when_divided(self):
         results = self._reply(IMAGE_ARTICLE, is_divided=True)
         self.assertEqual(len(results), 2)
-        self.assertIsInstance(results[0][1][0], _COMP.Image)
-        self.assertIsInstance(results[1][1][0], _COMP.Plain)
+        self.assertIsInstance(results[0].chain[0], _COMP.Image)
+        self.assertIsInstance(results[1].chain[0], _COMP.Plain)
+
+    def test_reply_is_sent_directly_and_stops_event(self):
+        self._reply(IMAGE_ARTICLE, is_divided=True)
+        self.assertTrue(self.event.stopped)
+        self.assertEqual(len(self.event.sent), 2)
+
+    def test_quote_reply_disabled_by_default(self):
+        results = self._reply(IMAGE_ARTICLE, is_divided=True)
+        self.assertFalse(any(
+            isinstance(component, _COMP.Reply)
+            for chain in results
+            for component in chain.chain
+        ))
+
+    def test_quote_reply_only_marks_first_chain(self):
+        self.plugin.quote_reply = True
+        results = self._reply(IMAGE_ARTICLE, is_divided=True)
+        self.assertEqual(len(results), 2)
+        self.assertIsInstance(results[0].chain[0], _COMP.Reply)
+        self.assertEqual(results[0].chain[0].id, "msg-1")
+        self.assertNotIsInstance(results[1].chain[0], _COMP.Reply)
 
 
 class NasaArticleParsingTests(unittest.TestCase):

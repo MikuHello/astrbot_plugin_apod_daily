@@ -35,6 +35,12 @@
         "type": "bool",
         "default": true
     },
+    "quote_reply": {
+        "description": "引用回复指令",
+        "hint": "指令回复时引用发送者的消息；多条消息仅首条带引用气泡",
+        "type": "bool",
+        "default": false
+    },
     "translate": {
         "description": "翻译配置",
         "type": "object",
