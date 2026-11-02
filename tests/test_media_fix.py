@@ -315,6 +315,59 @@ def _make_plugin(config=None):
     return plugin
 
 
+class TitlePrefixTests(unittest.TestCase):
+    """feed 标题前缀剥离：两种日期顺序都要处理干净。"""
+
+    def setUp(self):
+        self.plugin = _make_plugin()
+
+    def test_year_first_date_is_stripped(self):
+        data = self.plugin._build_apod_data(
+            "APOD: 2026 October 16 \u2013 Chasing the International Space Station",
+            LINK,
+            IMAGE_ARTICLE,
+        )
+        self.assertEqual(data["title"], "Chasing the International Space Station")
+        self.assertEqual(data["date"], "2026-10-16")
+
+    def test_day_first_date_is_stripped(self):
+        # 2026-10-29 那期的 feed 标题是 "29 October 2026"，与常态相反。
+        data = self.plugin._build_apod_data(
+            "APOD: 29 October 2026 \u2013 The Horns of Venus", LINK, IMAGE_ARTICLE
+        )
+        self.assertEqual(data["title"], "The Horns of Venus")
+        self.assertNotIn("APOD", data["title"])
+        self.assertEqual(data["date"], "2026-10-29")
+
+    def test_unusual_date_shape_falls_back_to_separator(self):
+        data = self.plugin._build_apod_data(
+            "APOD: 29 Oct 2026 \u2013 The Horns of Venus", LINK, IMAGE_ARTICLE
+        )
+        self.assertEqual(data["title"], "The Horns of Venus")
+
+    def test_title_without_prefix_is_kept(self):
+        data = self.plugin._build_apod_data(
+            "The Horns of Venus", LINK, IMAGE_ARTICLE
+        )
+        self.assertEqual(data["title"], "The Horns of Venus")
+
+    def test_prefix_only_title_is_kept(self):
+        data = self.plugin._build_apod_data(
+            "APOD: 2026 October 29", LINK, IMAGE_ARTICLE
+        )
+        self.assertEqual(data["title"], "APOD: 2026 October 29")
+
+    def test_feed_entry_with_day_first_date(self):
+        rss = RSS_VIDEO.replace(
+            "APOD: 2026 October 16 &#8211; Chasing the International Space Station",
+            "APOD: 16 October 2026 &#8211; Chasing the International Space Station",
+        )
+        data = self.plugin._parse_feed(rss)
+        self.assertIsNotNone(data)
+        self.assertEqual(data["title"], "Chasing the International Space Station")
+        self.assertEqual(data["date"], "2026-10-16")
+
+
 class VideoParsingTests(unittest.TestCase):
     def setUp(self):
         self.plugin = _make_plugin()
