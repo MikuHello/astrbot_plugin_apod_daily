@@ -502,7 +502,6 @@ class APOD(Star):
             title_zh,
             explanation_zh,
             tomorrow_zh=tomorrow_zh,
-            with_media=self.send_media,
             display_name=display_name,
         )
         if not chains:
@@ -618,7 +617,6 @@ class APOD(Star):
             title_zh,
             explanation_zh,
             tomorrow_zh=tomorrow_zh,
-            with_media=self.send_media,
             display_name=display_name,
         )
         sent = await self._send_apod_chains(
@@ -2142,7 +2140,6 @@ class APOD(Star):
                 title_zh,
                 explanation_zh,
                 tomorrow_zh=tomorrow_zh,
-                with_media=self.send_media,
             )
             if not await self._send_apod_chains(umo, chains):
                 continue
@@ -2318,15 +2315,13 @@ class APOD(Star):
         media_type = str(apod_data.get("media_type") or "").strip().lower()
         return self.is_divided or media_type == "video"
 
-    async def _build_media_chain(
-        self, apod_data: Dict[str, Any], with_media: bool = True
-    ) -> MessageChain:
-        """只含媒体组件的消息链；无可用媒体时为空链。"""
+    async def _build_media_chain(self, apod_data: Dict[str, Any]) -> MessageChain:
+        """只含媒体组件的消息链；未开启发送媒体或无可用媒体时为空链。"""
         chain = []
         url = apod_data.get("hdurl") or apod_data.get("url")
         media_type = str(apod_data.get("media_type") or "").strip().lower()
         video_platform = str(apod_data.get("video_platform") or "").strip().lower()
-        if with_media and url:
+        if self.send_media and url:
             if media_type == "video":
                 # YouTube 只有网页地址，交给平台当视频发只会失败；
                 # 观看地址由正文字段展示，封面帧代替视频组件。
@@ -2372,14 +2367,10 @@ class APOD(Star):
         title_zh: Optional[str],
         explanation_zh: Optional[str],
         tomorrow_zh: Optional[str] = None,
-        with_media: bool = True,
         display_name: str = PLUGIN_DISPLAY_NAME,
     ) -> list[MessageChain]:
-        """按 _split_media 返回要发送的消息链：1 条=合并，2 条=媒体+正文。
-
-        with_media=False 时只返回正文链，即“视频发不出去”的降级形态。
-        """
-        media_chain = await self._build_media_chain(apod_data, with_media=with_media)
+        """按 _split_media 返回要发送的消息链：1 条=合并，2 条=媒体+正文。"""
+        media_chain = await self._build_media_chain(apod_data)
         text_chain = self._build_text_chain(
             apod_data,
             title_zh,
