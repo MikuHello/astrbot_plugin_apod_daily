@@ -5,10 +5,12 @@ import html as html_lib
 import os
 import re
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from functools import partial
 from html.parser import HTMLParser
-from typing import Any, Dict, Optional
+from typing import Any, Dict, NamedTuple, Optional
 from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
 
@@ -38,15 +40,18 @@ MONTH_NAMES = {
     "January": 1, "February": 2, "March": 3, "April": 4, "May": 5, "June": 6,
     "July": 7, "August": 8, "September": 9, "October": 10, "November": 11, "December": 12,
 }
-# 月份名只写一份，日期正则从它生成。必须整体成组，否则组内的 “|” 会把
-# 外层分组拆散。
+# 全称与三字母缩写共用同一张月份表、日期解析与标题剥离规则。
+MONTH_NAMES.update({name[:3]: number for name, number in MONTH_NAMES.items()})
 _MONTHS = "(?:" + "|".join(MONTH_NAMES) + ")"
 # feed 标题里的日期实测有两种顺序：NASA 正常输出 “2026 October 29”，
 # 但 2026-10-29 那期写成了 “29 October 2026”。两种都得认，否则前缀剥不掉
 # （标题带着 “APOD: 日期 –” 进译文）、日期也解析不出（只能靠 meta/slug 兜底）。
 FEED_TITLE_DATE_PATTERN = re.compile(
+    rf"\b(?:"
     rf"(?P<ymd_year>\d{{4}})\s+(?P<ymd_month>{_MONTHS})\s+(?P<ymd_day>\d{{1,2}})"
     rf"|(?P<dmy_day>\d{{1,2}})\s+(?P<dmy_month>{_MONTHS})\s+(?P<dmy_year>\d{{4}})"
+    rf"|(?P<mdy_month>{_MONTHS})\s+(?P<mdy_day>\d{{1,2}}),?\s+(?P<mdy_year>\d{{4}})"
+    rf")\b"
 )
 FEED_TITLE_APOD_PREFIX_PATTERN = re.compile(r"^APOD:\s*")
 FEED_TITLE_SEPARATOR_PATTERN = re.compile(r"^[–—-]\s*")
@@ -67,10 +72,6 @@ APOD_SLUG_DATE_PATTERN = re.compile(
     r"apod-(\d{4})-(january|february|march|april|may|june|july|august|september|october|november|december)-(\d{1,2})",
     re.IGNORECASE,
 )
-# 随机内容中文档顺序的第一个 image-article 链接即主帖（实测确认）。
-RANDOM_POST_LINK_PATTERN = re.compile(
-    r"https://science\.nasa\.gov/image-article/[^\s\"'<>]+"
-)
 CREDIT_PREFIX_PATTERN = re.compile(
     r"^(?:(?:Image|Video)\s+)?Credit(?:\s*&\s*Copyright)?\s*:\s*", re.IGNORECASE
 )
@@ -82,6 +83,10 @@ NASA_PROBE_TIMEOUT_SECONDS = 15
 NASA_POST_LINK_PATTERN = re.compile(
     r"https://www\.nasa\.gov/image-article/[^\s\"'<>]+"
 )
+# NASA 新版文章页把阅读时长、作者也放在 <p> 里，解析正文时必须按 class 排除。
+NASA_AUTHOR_CLASSES = ("article-author-name", "article-author-title")
+NASA_MIN_READ_PATTERN = re.compile(r"\d+\s*min\s*read", re.IGNORECASE)
+NASA_CREDIT_PREFIXES = ("image credit:", "video credit:", "photo credit:")
 # 视频型条目（如 2026-10-16 的猎鹰9号延时摄影）：science.nasa.gov 不给海报帧，
 # og:image 会退化成 NASA logo，真正的媒体是 og:video / <video><source src> 直链。
 # 注意 logo 的 URL 实际是 NASA_logo-1.png（下划线），两种写法都要拦截。
@@ -103,6 +108,13 @@ IMAGE_CACHE_MIN_AGE_SECONDS = 120
 SEND_TIMEOUT_SECONDS = 60
 
 
+class ChainSendReport(NamedTuple):
+    """success=正文或仅媒体已送达（允许舍弃失败媒体），media_sent=媒体已送达。"""
+
+    success: bool
+    media_sent: bool
+
+
 # 文章发布时间只认这两种 meta 名，不拿更新时间冒充。
 PUBLISHED_META_KEYS = ("parsely-pub-date", "article:published_time")
 
@@ -114,7 +126,9 @@ class _HTMLAttrParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.og_image = ""
         self.og_video = ""
+        self.og_description = ""
         self.published_meta = ""
+        self.embed_post_id = ""
         self.img_srcs = []
         self.video_srcs = []
         self.iframe_srcs = []
@@ -126,10 +140,14 @@ class _HTMLAttrParser(HTMLParser):
             key = key.lower() if key else ""
             if key == "og:image" and not self.og_image:
                 self.og_image = attrs_map.get("content", "")
+            elif key == "og:description" and not self.og_description:
+                self.og_description = attrs_map.get("content", "")
             elif key in OG_VIDEO_META_KEYS and not self.og_video:
                 self.og_video = attrs_map.get("content", "")
             elif key in PUBLISHED_META_KEYS and not self.published_meta:
                 self.published_meta = attrs_map.get("content", "")
+        elif tag == "article" and not self.embed_post_id:
+            self.embed_post_id = attrs_map.get("data-smd-embed-post-id", "")
         elif tag == "img" and attrs_map.get("src"):
             self.img_srcs.append(attrs_map["src"])
         elif tag in ("video", "source") and attrs_map.get("src"):
@@ -200,7 +218,7 @@ APOD_HELP = chr(10).join(
 )
 
 
-@register("apod", "Cysheper", "天文每日一图插件：APOD + NASA 每日一图，订阅推送、随机、LLM 翻译与函数工具。", "1.2.1")
+@register("apod", "Cysheper", "天文每日一图插件：APOD + NASA 每日一图，订阅推送、随机、LLM 翻译与函数工具。", "1.2.2")
 class APOD(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context, config)
@@ -399,6 +417,8 @@ class APOD(Star):
         )
 
         self.is_divided = bool(self.config.get("is_divided", True))
+        # 指令回复的引用气泡：默认关；开启时只在本次回复首条消息上引用。
+        self.quote_reply = bool(self.config.get("quote_reply", False))
         self.timeout = max(1, int(self.config.get("timeout", 120)))
         self.retry_count = max(0, int(self.config.get("retry_count", 3)))
         # 统一条数上限：翻译缓存与图片缓存各自按它淘汰最旧。
@@ -457,58 +477,102 @@ class APOD(Star):
         sub = tokens[0].lower() if tokens else ""
 
         if sub in ("今日", "today", "latest", "最新"):
-            async for result in self._reply_latest_apod(event):
-                yield result
+            await self._reply_latest_apod(event)
         elif sub in ("随机", "random"):
-            async for result in self._reply_random_apod(event):
-                yield result
+            await self._reply_random_apod(event)
         else:
             yield event.plain_result(APOD_HELP)
+
+    async def _send_reply_chains(
+        self,
+        event: AstrMessageEvent,
+        chains: list[MessageChain],
+        label: str = PLUGIN_DISPLAY_NAME,
+    ) -> bool:
+        """指令回复直接发送，绕开 result_decorate 的 At/引用/t2i/合并转发。
+
+        result_decorate 会在 Plain/Image 链首插 At（QQ 官方会把它序列化成
+        content 里的 <qqbot-at-user> 字面量），并按平台设置加引用气泡。
+        直接调用 event.send 走 msg_id 被动回复，引用改由 quote_reply 控制。
+        代价是同时跳过 reply_prefix、TTS、内容安全与 on_decorating_result 钩子。
+        """
+        sent_any = False
+        message_id = getattr(getattr(event, "message_obj", None), "message_id", None)
+
+        async def send(chain: MessageChain):
+            nonlocal sent_any
+            if self.quote_reply and not sent_any and message_id:
+                chain = MessageChain(
+                    chain=[Comp.Reply(id=str(message_id)), *chain.chain]
+                )
+            result = await event.send(chain)
+            if result is not False:
+                sent_any = True
+            return result
+
+        report = await self._send_chains(chains, send, f"{label} 指令回复")
+        return report.success
+
+    async def _reply_text(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        label: str = PLUGIN_DISPLAY_NAME,
+    ) -> None:
+        await self._send_reply_chains(
+            event, [MessageChain(chain=[Comp.Plain(text)])], label
+        )
+        event.stop_event()
 
     async def _reply_latest_apod(self, event: AstrMessageEvent):
         logger.info("正在获取最新 APOD ...")
         apod_data = await self._get_latest_apod()
         if apod_data is None:
-            yield event.plain_result(
-                self.last_apod_error or "获取 APOD 数据失败，请稍后重试。"
+            await self._reply_text(
+                event, self.last_apod_error or "获取 APOD 数据失败，请稍后重试。"
             )
             return
-        async for result in self._reply_apod(event, apod_data):
-            yield result
+        await self._reply_apod(event, apod_data)
 
     async def _reply_random_apod(self, event: AstrMessageEvent):
         logger.info("正在获取随机 APOD ...")
         apod_data = await self._fetch_random_apod()
         if apod_data is None:
-            yield event.plain_result(
-                self.last_apod_error or "获取随机 APOD 失败，请稍后重试。"
+            await self._reply_text(
+                event, self.last_apod_error or "获取随机 APOD 失败，请稍后重试。"
             )
             return
-        async for result in self._reply_apod(event, apod_data):
-            yield result
+        await self._reply_apod(event, apod_data)
 
     async def _reply_apod(
-        self, event: AstrMessageEvent, apod_data: dict, display_name: str = PLUGIN_DISPLAY_NAME
-    ):
-        """按展示配置渲染并发送某一期内容（apod 今日/随机、nasa 共用）。"""
-        title_zh, explanation_zh, tomorrow_zh = await self._translate_fields(
-            apod_data, umo=event.unified_msg_origin
-        )
-        # 翻译可能较慢；放在本地化之前，缩短“待发送文件被淘汰”的窗口。
-        # 组链与推送/工具路径共用 _build_apod_chains：视频恒拆两条，
-        # 图片跟随 is_divided，三处不再各自拼链。
-        chains = await self._build_apod_chains(
-            apod_data,
-            title_zh,
-            explanation_zh,
-            tomorrow_zh=tomorrow_zh,
-            display_name=display_name,
-        )
-        if not chains:
-            yield event.plain_result("当前配置未启用任何可返回的内容。")
-            return
-        for chain in chains:
-            yield event.chain_result(chain.chain)
+        self,
+        event: AstrMessageEvent,
+        apod_data: dict,
+        display_name: str = PLUGIN_DISPLAY_NAME,
+    ) -> None:
+        """按展示配置渲染并直接发送某一期内容（apod 今日/随机、nasa 共用）。"""
+        try:
+            title_zh, explanation_zh, tomorrow_zh = await self._translate_fields(
+                apod_data, umo=event.unified_msg_origin
+            )
+            # 翻译可能较慢；放在本地化之前，缩短“待发送文件被淘汰”的窗口。
+            # 组链与推送/工具路径共用 _build_apod_chains：视频恒拆两条，
+            # 图片跟随 is_divided，三处不再各自拼链。
+            chains = await self._build_apod_chains(
+                apod_data,
+                title_zh,
+                explanation_zh,
+                tomorrow_zh=tomorrow_zh,
+                display_name=display_name,
+            )
+            if not chains:
+                await self._reply_text(
+                    event, "当前配置未启用任何可返回的内容。", display_name
+                )
+                return
+            await self._send_reply_chains(event, chains, display_name)
+        finally:
+            event.stop_event()
 
     @filter.command("apod管理")
     @filter.permission_type(PermissionType.GROUP_ADMIN)
@@ -570,14 +634,13 @@ class APOD(Star):
         logger.info("正在获取 NASA 每日一图 ...")
         nasa_data = await self._get_nasa()
         if nasa_data is None:
-            yield event.plain_result(
-                self.last_apod_error or "获取 NASA 每日一图失败，请稍后重试。"
+            await self._reply_text(
+                event,
+                self.last_apod_error or "获取 NASA 每日一图失败，请稍后重试。",
+                NASA_DISPLAY_NAME,
             )
             return
-        async for result in self._reply_apod(
-            event, nasa_data, display_name=NASA_DISPLAY_NAME
-        ):
-            yield result
+        await self._reply_apod(event, nasa_data, display_name=NASA_DISPLAY_NAME)
 
     # ---------- LLM 函数工具 ----------
 
@@ -619,12 +682,13 @@ class APOD(Star):
             tomorrow_zh=tomorrow_zh,
             display_name=display_name,
         )
-        sent = await self._send_apod_chains(
-            event.unified_msg_origin, chains, label=label
+        sent = await self._send_chains(
+            chains,
+            partial(self.context.send_message, event.unified_msg_origin),
+            label=f"{label}发送",
         )
-        if sent is False:
-            logger.warning(f"发送{label}：未匹配到消息平台。")
-            return f"{label}发送失败：未找到可用的消息平台。"
+        if not sent.success:
+            return f"{label}发送失败：请检查平台连接或发送日志后重试。"
         title = (title_zh or apod_data.get("title") or "").strip()
         return (
             f"已向当前会话发送{label}："
@@ -668,6 +732,15 @@ class APOD(Star):
             await self.put_kv_data("pushed_by_session", pushed)
         except Exception as exc:
             raise RuntimeError(f"写入推送检查点失败：{exc}") from exc
+
+    @staticmethod
+    def _checkpoint_media_sent(entry: Any, link: str) -> bool:
+        """检查点是否记录“该期媒体已送达、正文待补发”。"""
+        return (
+            isinstance(entry, dict)
+            and str(entry.get("link") or "") == link
+            and bool(entry.get("media_sent"))
+        )
 
     async def _cache_translation(
         self, key: str, value: str, epoch: Optional[int] = None
@@ -722,6 +795,11 @@ class APOD(Star):
             and self.send_explanation
         )
         if not want_title and not want_explanation and not want_tomorrow:
+            logger.debug(
+                "翻译未启用："
+                f"title={self.translate_title}/send={self.send_title}，"
+                f"explanation={self.translate_explanation}/send={self.send_explanation}"
+            )
             return None, None, None
 
         provider_id = await self._resolve_chat_provider_id(umo)
@@ -757,6 +835,12 @@ class APOD(Star):
             tomorrow=tomorrow if need_tomorrow else None,
         )
         # 清理（_cache_epoch 变化）之后不再写回；校验在写入锁内进行。
+        if need_title and not got_title:
+            logger.warning("标题翻译未返回，本期展示原文。")
+        if need_explanation and not got_explanation:
+            logger.warning("说明翻译未返回，本期展示原文。")
+        if need_tomorrow and not got_tomorrow:
+            logger.warning("「明日一图」翻译未返回，本期展示原文。")
         if need_title and got_title:
             title_zh = got_title
             await self._cache_translation(
@@ -1471,14 +1555,17 @@ class APOD(Star):
         return None
 
     def _build_random_apod(self, content_html: str) -> Optional[dict]:
-        match = RANDOM_POST_LINK_PATTERN.search(content_html or "")
-        if not match:
+        parser = _HTMLAttrParser()
+        parser.feed(content_html or "")
+        # embed 底部链接是前后两期；用本期文章 ID 生成 WordPress 稳定链接，
+        # 官网会重定向到正确的文章地址，避免把相邻条目当成本期。
+        if not re.fullmatch(r"[1-9][0-9]*", parser.embed_post_id):
             return None
-        link = html_lib.unescape(match.group(0))
-        if "apod-" not in link.lower():
+        link = f"https://science.nasa.gov/?p={parser.embed_post_id}"
+        title_match = re.search(r"<h([12])\b[^>]*>(.*?)</h\1>", content_html, re.S | re.I)
+        title = self._strip_html(title_match.group(2)) if title_match else ""
+        if not title:
             return None
-        title_match = re.search(r"<h1[^>]*>(.*?)</h1>", content_html, re.S)
-        title = self._strip_html(title_match.group(1)) if title_match else ""
         data = self._build_apod_data(title, link, content_html)
         if data is not None:
             # 随机模式不展示「明日一图」。
@@ -1577,19 +1664,38 @@ class APOD(Star):
                     image_url = candidate
                     break
         # 说明与版权只在文章主内容容器里找，按原文顺序保留全部段落；
-        # 页眉导航与页脚在容器之外，不参与拼接，也不做长度过滤。
+        # 页眉导航与页脚在容器之外，不参与拼接。
+        # 正则必须限定标签名后是空白或 '>'，否则 <p[^>]*> 会误匹配
+        # <path ...>（SVG 图标），把后续正文整块吞进同一个匹配。
         explanation_parts = []
         credit = ""
-        for p in re.findall(r"<p[^>]*>(.*?)</p>", region, re.S):
-            text = self._strip_html(p)
+        for match in re.finditer(r"<p(\s[^>]*)?>(.*?)</p>", region, re.S):
+            attrs = (match.group(1) or "").lower()
+            text = self._strip_html(match.group(2))
             lowered = text.lower()
-            if not credit and lowered.startswith(("image credit:", "video credit:")):
-                credit = text.split(":", 1)[1].strip()
+            if any(name in attrs for name in NASA_AUTHOR_CLASSES):
                 continue
-            if lowered.startswith(("learn more", "image article")):
+            if NASA_MIN_READ_PATTERN.fullmatch(lowered):
+                continue
+            if lowered.startswith(NASA_CREDIT_PREFIXES):
+                if not credit:
+                    credit = text.split(":", 1)[1].strip()
+                continue
+            if lowered.startswith("learn more") or lowered == "image article":
                 continue
             explanation_parts.append(text)
         explanation = " ".join(part for part in explanation_parts if part)
+        if not explanation:
+            fallback = self._strip_html(
+                html_lib.unescape(page_parser.og_description)
+            )
+            if fallback:
+                logger.warning(
+                    f"NASA 每日一图正文解析为空，回退 og:description：{link}"
+                )
+                explanation = fallback
+            else:
+                logger.warning(f"NASA 每日一图正文解析为空且无摘要：{link}")
         # 发布时间与 og:image 同源：meta 由同一解析器按属性解析收集
         # （顺序/引号/大小写无关）；只认发布时间，不拿更新时间冒充。
         published_raw = html_lib.unescape(page_parser.published_meta)
@@ -1729,7 +1835,7 @@ class APOD(Star):
 
     @staticmethod
     def _date_from_title(title_raw: str) -> str:
-        """从标题里解析日期，兼容 “2026 October 29” 与 “29 October 2026”。"""
+        """解析年/月/日、日/月/年、月/日/年三种顺序，支持月份缩写。"""
         matched = FEED_TITLE_DATE_PATTERN.search(title_raw or "")
         if not matched:
             return ""
@@ -1739,11 +1845,17 @@ class APOD(Star):
                 matched.group("ymd_month"),
                 matched.group("ymd_day"),
             )
-        else:
+        elif matched.group("dmy_year"):
             year, month_name, day = (
                 matched.group("dmy_year"),
                 matched.group("dmy_month"),
                 matched.group("dmy_day"),
+            )
+        else:
+            year, month_name, day = (
+                matched.group("mdy_year"),
+                matched.group("mdy_month"),
+                matched.group("mdy_day"),
             )
         month_number = MONTH_NAMES.get(month_name or "")
         if not month_number:
@@ -1752,12 +1864,7 @@ class APOD(Star):
 
     @staticmethod
     def _strip_title_prefix(title_raw: str) -> str:
-        """剥掉 feed 标题的 “APOD: <日期> – ” 前缀，两种日期顺序都认。
-
-        站点改版后 feed 标题仍沿用它，但日期顺序并不稳定；形状异常时走
-        保守规则（去掉 “APOD:”、开头的日期与分隔符），宁可多剥一点，
-        也不让 “APOD: 日期 –” 混进译文和正文。
-        """
+        """剥掉 “APOD: <完整日期> – ”，保留数字或月份词开头的真实标题。"""
         text = (title_raw or "").strip()
         prefix = FEED_TITLE_APOD_PREFIX_PATTERN.match(text)
         if not prefix:
@@ -1770,11 +1877,6 @@ class APOD(Star):
         separator = FEED_TITLE_SEPARATOR_PATTERN.match(body)
         if separator:
             body = body[separator.end() :].strip()
-        elif body[:1].isdigit() or body.split(" ", 1)[0] in MONTH_NAMES:
-            # 日期形状异常（如缩写月份）：仍按 “日期 – 标题” 的约定取分隔符后一段。
-            parts = re.split(r"\s*[–—-]\s*", body, maxsplit=1)
-            if len(parts) == 2 and parts[1].strip():
-                body = parts[1].strip()
         # 整串只有前缀（如 “APOD: 2026 October 29”）时保留原样，避免空标题。
         return body or text
 
@@ -2106,6 +2208,8 @@ class APOD(Star):
         except RuntimeError as exc:
             logger.error(f"{exc}：为避免重复群发，本轮跳过推送检查。")
             return False
+        # 检查点值：字符串 = 整期送达；{"link": ..., "media_sent": True} =
+        # 媒体已送达、正文待补发（下轮只补正文，不重发视频）。
         pending = [umo for umo in sessions if pushed.get(umo) != link]
 
         last = await self.get_cache("last_pushed_apod")
@@ -2135,22 +2239,33 @@ class APOD(Star):
         for umo in pending:
             # 每个会话发送前重建消息链：本地图片可能已被其他请求淘汰，
             # 重建会命中缓存并刷新保护时间（必要时重新下载）。
-            chains = await self._build_apod_chains(
-                apod_data,
-                title_zh,
-                explanation_zh,
-                tomorrow_zh=tomorrow_zh,
+            if self._checkpoint_media_sent(pushed.get(umo), link):
+                # 直接构建待补正文，不下载或刷新已经送达的媒体。
+                text = self._build_text_chain(
+                    apod_data, title_zh, explanation_zh, tomorrow_zh
+                )
+                chains = [text] if text.chain else []
+            else:
+                chains = await self._build_apod_chains(
+                    apod_data, title_zh, explanation_zh, tomorrow_zh
+                )
+            report = await self._send_chains(
+                chains, partial(self.context.send_message, umo), f"APOD 推送到 {umo}"
             )
-            if not await self._send_apod_chains(umo, chains):
+            if report.success:
+                pushed[umo] = link
+                delivered += 1
+            elif report.media_sent:
+                logger.warning(f"APOD 推送到 {umo} 媒体已送达但正文失败，下轮只补正文。")
+                pushed[umo] = {"link": link, "media_sent": True}
+            else:
                 continue
-            pushed[umo] = link
             try:
                 await self._save_push_checkpoint(pushed)
             except RuntimeError as exc:
                 # 进度落盘失败立即中止本轮：未确认会话留待下轮补发，避免盲目重发。
                 logger.error(f"{exc}：本轮推送中止。")
                 return False
-            delivered += 1
         await self.put_cache(
             "last_pushed_apod", {"date": date, "link": link, "delivered": True}
         )
@@ -2305,15 +2420,20 @@ class APOD(Star):
             logger.warning(f"图片缓存失败，改用原始链接：{exc}")
             return None
 
-    def _split_media(self, apod_data: Dict[str, Any]) -> bool:
+    def _split_media(self, media_chain: MessageChain) -> bool:
         """媒体与正文是否分两条消息：图片跟随 is_divided，视频恒拆。
 
         视频必须恒拆：平台会把 [Video, Plain] 合成一条富媒体消息
         （msg_type=7 且 content=正文），视频气泡不渲染 content，
         正文会被平台静默丢弃，而发送层拿到的仍是成功。
+
+        判据看媒体链里实际有没有视频组件，而不是 media_type：YouTube 条目
+        的 media_type 也是 video，但媒体链里放的是封面帧（图片），不存在
+        富媒体吞正文的问题，不该被恒拆。
         """
-        media_type = str(apod_data.get("media_type") or "").strip().lower()
-        return self.is_divided or media_type == "video"
+        return self.is_divided or any(
+            isinstance(item, Comp.Video) for item in media_chain.chain
+        )
 
     async def _build_media_chain(self, apod_data: Dict[str, Any]) -> MessageChain:
         """只含媒体组件的消息链；未开启发送媒体或无可用媒体时为空链。"""
@@ -2378,7 +2498,7 @@ class APOD(Star):
             tomorrow_zh=tomorrow_zh,
             display_name=display_name,
         )
-        if not self._split_media(apod_data):
+        if not self._split_media(media_chain):
             merged = MessageChain(chain=[*media_chain.chain, *text_chain.chain])
             return [merged] if merged.chain else []
         chains = []
@@ -2389,48 +2509,55 @@ class APOD(Star):
         return chains
 
     @staticmethod
-    def _chain_has_media(chain: MessageChain) -> bool:
-        return any(isinstance(item, (Comp.Image, Comp.Video)) for item in chain.chain)
-
-    async def _send_chain(self, umo: str, chain: MessageChain, label: str) -> bool:
+    async def _send_chain(
+        send: Callable[[MessageChain], Awaitable[Any]], chain: MessageChain, label: str
+    ) -> bool:
         try:
-            sent = await asyncio.wait_for(
-                self.context.send_message(umo, chain),
-                timeout=SEND_TIMEOUT_SECONDS,
-            )
+            sent = await asyncio.wait_for(send(chain), timeout=SEND_TIMEOUT_SECONDS)
         except Exception as exc:
-            logger.error(f"{label} 推送到 {umo} 失败：{exc}")
+            logger.error(f"{label}失败：{exc!r}")
             return False
         if sent is False:
-            logger.error(f"{label} 推送到 {umo} 失败：未匹配到消息平台。")
+            logger.error(f"{label}失败：发送接口返回 False。")
             return False
         return True
 
-    async def _send_apod_chains(
-        self, umo: str, chains: list[MessageChain], label: str = "APOD"
-    ) -> bool:
-        """逐条发送消息链；媒体那条失败时舍媒体保正文（文字+原文链接）。
+    async def _send_chains(
+        self,
+        chains: list[MessageChain],
+        send: Callable[[MessageChain], Awaitable[Any]],
+        label: str = "APOD",
+    ) -> ChainSendReport:
+        """逐条发送消息链；媒体那条失败时舍媒体保正文（合并链补发纯文字）。
 
-        正文失败一律视为未送达：宁可下轮补发（可能重发一次视频），
+        正文失败一律视为未送达：宁可下轮补发（媒体已送达时只补正文），
         也不能让说明文本静默丢掉。
         """
         if not chains:
-            return False
+            return ChainSendReport(False, False)
         degraded = False
-        last_index = len(chains) - 1
+        media_sent = False
         for index, chain in enumerate(chains):
-            if await self._send_chain(umo, chain, label):
+            has_media = any(
+                isinstance(item, (Comp.Image, Comp.Video)) for item in chain.chain
+            )
+            if await self._send_chain(send, chain, label):
+                media_sent = media_sent or has_media
                 continue
-            if self._chain_has_media(chain) and index < last_index:
-                degraded = True
-                logger.warning(
-                    f"{label} 推送到 {umo} 的媒体发送失败，继续发送正文。"
-                )
-                continue
-            return False
+            if not has_media:
+                return ChainSendReport(False, media_sent)
+            fallback = MessageChain(
+                chain=[item for item in chain.chain if isinstance(item, Comp.Plain)]
+            )
+            if fallback.chain:
+                if not await self._send_chain(send, fallback, label):
+                    return ChainSendReport(False, media_sent)
+            elif index == len(chains) - 1:
+                return ChainSendReport(False, media_sent)
+            degraded = True
         if degraded:
-            logger.warning(f"{label} 推送到 {umo} 已降级为文字+链接。")
-        return True
+            logger.warning(f"{label}已降级为纯文字。")
+        return ChainSendReport(True, media_sent)
 
     async def terminate(self):
         logger.info("正在终止 NASA APOD 插件...")

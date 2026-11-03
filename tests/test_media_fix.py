@@ -16,6 +16,7 @@ import zoneinfo
 from datetime import timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 REPO_DIR = Path(__file__).resolve().parent.parent
 MAIN_PATH = REPO_DIR / "main.py"
@@ -180,8 +181,13 @@ def _install_astrbot_stubs():
         def fromURL(url):
             return Video(file=url)
 
+    class Reply(_Component):
+        def __init__(self, id=None):
+            super().__init__(id=id)
+
     comp = mod("astrbot.api.message_components")
     comp.Plain, comp.Image, comp.Video = Plain, Image, Video
+    comp.Reply = Reply
     api.message_components = comp
 
     class AstrBotConfig(dict):
@@ -311,8 +317,28 @@ def _make_plugin(config=None):
     plugin.cache_limit = 1000
     plugin.cache_images = False
     plugin.is_divided = True
+    plugin.quote_reply = False
     plugin.timeout = 30
     return plugin
+
+
+def _make_reply_event(message_id="msg-1"):
+    event = SimpleNamespace(
+        unified_msg_origin="umo",
+        message_obj=SimpleNamespace(message_id=message_id),
+        sent=[],
+        stopped=False,
+    )
+
+    async def send(chain):
+        event.sent.append(chain)
+
+    def stop_event():
+        event.stopped = True
+
+    event.send = send
+    event.stop_event = stop_event
+    return event
 
 
 class TitlePrefixTests(unittest.TestCase):
@@ -321,41 +347,26 @@ class TitlePrefixTests(unittest.TestCase):
     def setUp(self):
         self.plugin = _make_plugin()
 
-    def test_year_first_date_is_stripped(self):
-        data = self.plugin._build_apod_data(
-            "APOD: 2026 October 16 \u2013 Chasing the International Space Station",
-            LINK,
-            IMAGE_ARTICLE,
-        )
-        self.assertEqual(data["title"], "Chasing the International Space Station")
-        self.assertEqual(data["date"], "2026-10-16")
-
-    def test_day_first_date_is_stripped(self):
-        # 2026-10-29 那期的 feed 标题是 "29 October 2026"，与常态相反。
-        data = self.plugin._build_apod_data(
-            "APOD: 29 October 2026 \u2013 The Horns of Venus", LINK, IMAGE_ARTICLE
-        )
-        self.assertEqual(data["title"], "The Horns of Venus")
-        self.assertNotIn("APOD", data["title"])
-        self.assertEqual(data["date"], "2026-10-29")
-
-    def test_unusual_date_shape_falls_back_to_separator(self):
-        data = self.plugin._build_apod_data(
-            "APOD: 29 Oct 2026 \u2013 The Horns of Venus", LINK, IMAGE_ARTICLE
-        )
-        self.assertEqual(data["title"], "The Horns of Venus")
-
-    def test_title_without_prefix_is_kept(self):
-        data = self.plugin._build_apod_data(
-            "The Horns of Venus", LINK, IMAGE_ARTICLE
-        )
-        self.assertEqual(data["title"], "The Horns of Venus")
-
-    def test_prefix_only_title_is_kept(self):
-        data = self.plugin._build_apod_data(
-            "APOD: 2026 October 29", LINK, IMAGE_ARTICLE
-        )
-        self.assertEqual(data["title"], "APOD: 2026 October 29")
+    def test_title_prefix_and_date_formats(self):
+        cases = [
+            ("APOD: 2026 October 16 – Stars", "Stars", "2026-10-16"),
+            ("APOD: 29 October 2026 – Stars", "Stars", "2026-10-29"),
+            ("APOD: 29 Oct 2026 – Stars", "Stars", "2026-10-29"),
+            ("APOD: 2026 Oct 29 – Stars", "Stars", "2026-10-29"),
+            ("APOD: May 5, 2026 – Stars", "Stars", "2026-05-05"),
+            ("APOD: Nov 3, 2026 – Stars", "Stars", "2026-11-03"),
+            ("APOD: May Sky Wonders – Part II", "May Sky Wonders – Part II", None),
+            ("APOD: 3D 67P – Part II", "3D 67P – Part II", None),
+            ("APOD: May 5 Missions – Part II", "May 5 Missions – Part II", None),
+            ("The Horns of Venus", "The Horns of Venus", None),
+            ("APOD: 2026 October 29", "APOD: 2026 October 29", "2026-10-29"),
+        ]
+        for raw, title, date in cases:
+            with self.subTest(raw=raw):
+                data = self.plugin._build_apod_data(raw, LINK, IMAGE_ARTICLE)
+                self.assertEqual(data["title"], title)
+                if date:
+                    self.assertEqual(data["date"], date)
 
     def test_feed_entry_with_day_first_date(self):
         rss = RSS_VIDEO.replace(
@@ -559,7 +570,7 @@ class YouTubeVideoTests(unittest.TestCase):
         chains = asyncio.run(
             self.plugin._build_apod_chains(data, None, None)
         )
-        # YouTube 条目是 video 型：媒体链用封面帧，正文单独一条。
+        # 默认 is_divided=True：封面帧一条、正文一条。
         self.assertEqual(len(chains), 2)
         self.assertEqual(len(chains[0].chain), 1)
         self.assertNotIsInstance(chains[0].chain[0], _COMP.Video)
@@ -567,29 +578,32 @@ class YouTubeVideoTests(unittest.TestCase):
         self.assertEqual(chains[0].chain[0].file, POSTER)
         self.assertIsInstance(chains[1].chain[0], _COMP.Plain)
 
+    def test_youtube_poster_merges_when_not_divided(self):
+        # YouTube 条目的媒体链是封面帧（图片），关掉 is_divided 时应当
+        # 和普通图片期一样合并成一条，而不是因为 media_type=video 恒拆。
+        self.plugin.is_divided = False
+        data = self.plugin._parse_feed(RSS_YOUTUBE)
+        chains = asyncio.run(self.plugin._build_apod_chains(data, None, None))
+        self.assertEqual(len(chains), 1)
+        self.assertIsInstance(chains[0].chain[0], _COMP.Image)
+        self.assertIsInstance(chains[0].chain[-1], _COMP.Plain)
+
     def test_reply_sends_poster_then_text(self):
         async def translate(apod_data, umo=None):
             return None, None, None
 
         self.plugin._translate_fields = translate
-        event = SimpleNamespace(
-            unified_msg_origin="umo",
-            plain_result=lambda text: ("text", text),
-            image_result=lambda url: ("image", url),
-            chain_result=lambda chain: ("chain", chain),
-        )
+        event = _make_reply_event()
         data = self.plugin._parse_feed(RSS_YOUTUBE)
 
-        async def collect():
-            return [item async for item in self.plugin._reply_apod(event, data)]
-
-        results = asyncio.run(collect())
+        asyncio.run(self.plugin._reply_apod(event, data))
         # 指令路径也走 _build_apod_chains：封面帧一条、正文一条。
-        self.assertEqual([r[0] for r in results], ["chain", "chain"])
-        self.assertEqual(len(results[0][1]), 1)
-        self.assertIsInstance(results[0][1][0], _COMP.Image)
-        self.assertEqual(results[0][1][0].file, POSTER)
-        self.assertIsInstance(results[1][1][0], _COMP.Plain)
+        self.assertTrue(event.stopped)
+        self.assertEqual(len(event.sent), 2)
+        self.assertEqual(len(event.sent[0].chain), 1)
+        self.assertIsInstance(event.sent[0].chain[0], _COMP.Image)
+        self.assertEqual(event.sent[0].chain[0].file, POSTER)
+        self.assertIsInstance(event.sent[1].chain[0], _COMP.Plain)
 
 
 class TomorrowTitleTests(unittest.TestCase):
@@ -612,15 +626,34 @@ class TomorrowTitleTests(unittest.TestCase):
         self.assertEqual(data["tomorrow_title"], "")
 
     def test_random_entry_has_no_tomorrow_line(self):
-        html = (
-            f'<h1>Random</h1><a href="{LINK}">x</a>'
-            "<p>Explanation: Some astronomy text."
-            "<br><strong>Tomorrow&#8217;s picture:</strong> eye in the sky</p>"
-        )
-        data = self.plugin._build_random_apod(html)
-        self.assertIsNotNone(data)
-        self.assertEqual(data["tomorrow_title"], "")
-        self.assertIn("Some astronomy text", data["explanation"])
+        # 官网 embed 使用 h2，底部 image-article 链接指向相邻两期而非本期。
+        for heading in ("h1", "h2", "H2"):
+            with self.subTest(heading=heading):
+                html = (
+                    '<article data-smd-embed-post-id="1230624">'
+                    f'<{heading} class="display-48">A <em>Comet</em> &amp; Two Dippers</{heading}>'
+                    '<p>Explanation: Some astronomy text.'
+                    '<br><strong>Tomorrow&#8217;s picture:</strong> eye in the sky</p>'
+                    '<table><tr><th>Date</th><td>February 7, 2023</td></tr></table>'
+                    f'<a class="smd-next-prev__prev" href="{LINK}">Yesterday</a>'
+                    '</article>'
+                )
+                data = self.plugin._build_random_apod(html)
+                self.assertIsNotNone(data)
+                self.assertEqual(data["title"], "A Comet & Two Dippers")
+                self.assertEqual(data["link"], "https://science.nasa.gov/?p=1230624")
+                self.assertEqual(data["date"], "2023-02-07")
+                self.assertEqual(data["tomorrow_title"], "")
+                self.assertEqual(data["explanation"], "Some astronomy text.")
+
+    def test_random_entry_without_post_identity_does_not_use_neighbor_link(self):
+        for post_id in ("", "wrong", "0"):
+            with self.subTest(post_id=post_id):
+                html = (
+                    f'<article data-smd-embed-post-id="{post_id}"><h2>Random</h2>'
+                    f'<p>Explanation: Text.</p><a href="{LINK}">Yesterday</a></article>'
+                )
+                self.assertIsNone(self.plugin._build_random_apod(html))
 
     def test_tomorrow_line_rendered_after_explanation(self):
         text = self.plugin._build_display_text(self._data(), None, None)
@@ -643,21 +676,14 @@ class TomorrowTitleTests(unittest.TestCase):
             return None, None, "天空之眼"
 
         self.plugin._translate_fields = translate
-        event = SimpleNamespace(
-            unified_msg_origin="umo",
-            plain_result=lambda text: ("text", text),
-            image_result=lambda url: ("image", url),
-            chain_result=lambda chain: ("chain", chain),
-        )
+        event = _make_reply_event()
         data = self._data()
 
-        async def collect():
-            return [item async for item in self.plugin._reply_apod(event, data)]
-
+        asyncio.run(self.plugin._reply_apod(event, data))
         texts = [
             component.text
-            for _, chain in asyncio.run(collect())
-            for component in chain
+            for chain in event.sent
+            for component in chain.chain
             if isinstance(component, _COMP.Plain)
         ]
         self.assertTrue(texts)
@@ -736,6 +762,46 @@ class RenderingTests(unittest.TestCase):
         self.assertEqual(len(chains), 1)
         self.assertEqual(len(chains[0].chain), 1)
         self.assertIsInstance(chains[0].chain[0], _COMP.Plain)
+
+    def test_delivery_failure_matrix(self):
+        image, text = _COMP.Image.fromURL(POSTER), _COMP.Plain("body")
+        # 检查真实发送边界，覆盖 None 成功、False、异常和媒体/正文分别失败。
+        cases = [
+            ("merged fallback", [[image, text]], [False, None], (True, False),
+             [["Image", "Plain"], ["Plain"]]),
+            ("fallback failure", [[image, text]], [RuntimeError("media"), False],
+             (False, False), [["Image", "Plain"], ["Plain"]]),
+            ("split media failure", [[image], [text]], [False, None], (True, False),
+             [["Image"], ["Plain"]]),
+            ("split text failure", [[image], [text]], [None, False], (False, True),
+             [["Image"], ["Plain"]]),
+            ("media only failure", [[image]], [False], (False, False), [["Image"]]),
+            ("empty", [], [], (False, False), []),
+        ]
+        for name, components, outcomes, expected, attempts in cases:
+            with self.subTest(name=name):
+                send = AsyncMock(side_effect=outcomes)
+                chains = [apod_main.MessageChain(chain=c) for c in components]
+                report = asyncio.run(self.plugin._send_chains(chains, send))
+                self.assertEqual(report, expected)
+                self.assertEqual([
+                    [type(item).__name__ for item in call.args[0].chain]
+                    for call in send.await_args_list
+                ], attempts)
+
+    def test_delivery_timeout_and_cancellation(self):
+        chain = apod_main.MessageChain(chain=[_COMP.Plain("body")])
+
+        async def blocked_send(chain):
+            await asyncio.Event().wait()
+
+        with patch.object(apod_main, "SEND_TIMEOUT_SECONDS", 0.001):
+            self.assertFalse(asyncio.run(self.plugin._send_chains([chain], blocked_send)).success)
+        # 卸载取消必须向上传播，不能被当作发送失败吞掉。
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(self.plugin._send_chains(
+                [chain], AsyncMock(side_effect=asyncio.CancelledError)
+            ))
 
 
 class FeedSourceTests(unittest.TestCase):
@@ -1403,51 +1469,133 @@ class ApodCachePolicyTests(unittest.TestCase):
 
 
 class ReplyPathVariableTests(unittest.TestCase):
-    """指令路径的拆分形态：三组场景共用一套插件与事件桩。"""
+    """验证指令传输与引用；媒体拆分矩阵由 RenderingTests 覆盖。"""
 
     def setUp(self):
         self.plugin = _make_plugin()
-        self.event = SimpleNamespace(
-            unified_msg_origin="umo",
-            plain_result=lambda text: ("text", text),
-            image_result=lambda url: ("image", url),
-            chain_result=lambda chain: ("chain", chain),
-        )
+        self.event = _make_reply_event()
 
-        async def translate(apod_data, umo=None):
-            return None, None, None
-
-        self.plugin._translate_fields = translate
+        self.plugin._translate_fields = AsyncMock(return_value=(None, None, None))
 
     def _reply(self, article, *, is_divided):
         self.plugin.is_divided = is_divided
         data = self.plugin._build_apod_data("APOD: t", LINK, article)
+        asyncio.run(self.plugin._reply_apod(self.event, data))
+        return self.event.sent
 
-        async def collect():
-            return [item async for item in self.plugin._reply_apod(self.event, data)]
+    def test_quote_reply_disabled_by_default(self):
+        # 走真实配置初始化，不能让夹具写死的 False 掩盖默认值回归。
+        self.plugin.config["cache_images"] = False
+        with patch.object(self.plugin, "_migrate_config", new=AsyncMock()), \
+             patch.object(self.plugin, "_migrate_cache_limit", new=AsyncMock()), \
+             patch.object(self.plugin, "get_cache", new=AsyncMock(return_value=None)):
+            asyncio.run(self.plugin.initialize())
+        results = self._reply(IMAGE_ARTICLE, is_divided=True)
+        self.assertFalse(any(
+            isinstance(component, _COMP.Reply)
+            for chain in results
+            for component in chain.chain
+        ))
 
-        return asyncio.run(collect())
-
-    def test_video_always_sent_separately(self):
-        results = self._reply(VIDEO_ARTICLE, is_divided=False)
-        self.assertEqual(len(results), 2)
-        self.assertEqual([r[0] for r in results], ["chain", "chain"])
-        self.assertIsInstance(results[0][1][0], _COMP.Video)
-        self.assertEqual(results[0][1][0].file, MP4)
-        self.assertIsInstance(results[1][1][0], _COMP.Plain)
-
-    def test_image_merged_when_not_divided(self):
-        results = self._reply(IMAGE_ARTICLE, is_divided=False)
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0][0], "chain")
-        self.assertIsInstance(results[0][1][0], _COMP.Image)
-        self.assertIsInstance(results[0][1][-1], _COMP.Plain)
-
-    def test_image_split_when_divided(self):
+    def test_quote_reply_only_marks_first_chain(self):
+        self.plugin.quote_reply = True
         results = self._reply(IMAGE_ARTICLE, is_divided=True)
         self.assertEqual(len(results), 2)
-        self.assertIsInstance(results[0][1][0], _COMP.Image)
-        self.assertIsInstance(results[1][1][0], _COMP.Plain)
+        self.assertIsInstance(results[0].chain[0], _COMP.Reply)
+        self.assertEqual(results[0].chain[0].id, "msg-1")
+        self.assertNotIsInstance(results[1].chain[0], _COMP.Reply)
+
+    def test_failed_media_falls_back_to_quoted_text_and_stops_event(self):
+        self.plugin.quote_reply = True
+        self.event.send = AsyncMock(side_effect=[RuntimeError("media failed"), None])
+        self._reply(IMAGE_ARTICLE, is_divided=False)
+        calls = self.event.send.await_args_list
+        self.assertEqual([
+            [type(item).__name__ for item in call.args[0].chain] for call in calls
+        ], [["Reply", "Image", "Plain"], ["Reply", "Plain"]])
+        self.assertTrue(self.event.stopped)
+
+    def test_missing_message_id_does_not_add_quote(self):
+        self.plugin.quote_reply = True
+        self.event.message_obj.message_id = ""
+        results = self._reply(IMAGE_ARTICLE, is_divided=False)
+        self.assertIsInstance(results[0].chain[0], _COMP.Image)
+
+    def test_tool_delivery_uses_active_transport_and_reports_generic_failure(self):
+        data = self.plugin._build_apod_data("APOD: t", LINK, IMAGE_ARTICLE)
+        send = AsyncMock(return_value=None)
+        self.plugin.context = SimpleNamespace(send_message=send)
+        result = asyncio.run(self.plugin._deliver_apod(self.event, data, "今日APOD"))
+        self.assertIn("已向当前会话发送", result)
+        self.assertEqual([c.args[0] for c in send.await_args_list], ["umo", "umo"])
+        self.assertFalse(self.event.sent)
+        send.side_effect = RuntimeError("upload failed")
+        result = asyncio.run(self.plugin._deliver_apod(self.event, data, "今日APOD"))
+        self.assertIn("发送失败", result)
+        self.assertNotIn("未找到可用的消息平台", result)
+
+
+class NasaArticleParsingTests(unittest.TestCase):
+    def setUp(self):
+        self.plugin = _make_plugin()
+
+    @staticmethod
+    def _page(body, *, description="", date="2026-10-30T15:56:26Z"):
+        head = (
+            "<html><head>"
+            '<meta property="og:image" '
+            'content="https://www.nasa.gov/wp-content/uploads/2026/10/x.png"/>'
+            f'<meta property="parsely-pub-date" content="{date}"/>'
+        )
+        if description:
+            head += f'<meta property="og:description" content="{description}"/>'
+        return f"{head}</head><body><article><h1>Test Title</h1>{body}</article></body></html>"
+
+    def test_path_tag_does_not_swallow_body(self):
+        # <p[^>]*> 会把 <path .../> 当段落开头，吞掉后面的正文并因
+        # “Image Article” 前缀被过滤；收紧标签名后必须拿到真正文。
+        page = self._page(
+            '<p class="label">1 min read</p>'
+            '<p class="article-author-name">HQ Web Team</p>'
+            '<div class="icon"><svg><path d="M1 1"/></svg>'
+            '<span>Image Article</span></div>'
+            '<p class="wp-block-paragraph">Real body text.</p>'
+            '<p><em>Image credit: NASA</em></p>'
+        )
+        data = self.plugin._build_nasa_data(page, LINK)
+        self.assertIsNotNone(data)
+        self.assertEqual(data["explanation"], "Real body text.")
+        self.assertEqual(data["credit"], "NASA")
+
+    def test_byline_classes_are_skipped(self):
+        page = self._page(
+            '<p class="article-author-name">HQ Web Team</p>'
+            '<p class="article-author-title">Goddard Space Flight Center</p>'
+            '<p class="wp-block-paragraph">Body.</p>'
+        )
+        data = self.plugin._build_nasa_data(page, LINK)
+        self.assertEqual(data["explanation"], "Body.")
+
+    def test_photo_credit_is_extracted(self):
+        page = self._page(
+            '<p class="wp-block-paragraph">Body.</p>'
+            '<p>Photo credit: NASA/Someone</p>'
+        )
+        data = self.plugin._build_nasa_data(page, LINK)
+        self.assertEqual(data["explanation"], "Body.")
+        self.assertEqual(data["credit"], "NASA/Someone")
+
+    def test_og_description_fallback(self):
+        page = self._page(
+            '<p class="article-author-name">HQ Web Team</p>',
+            description="Fallback summary.",
+        )
+        data = self.plugin._build_nasa_data(page, LINK)
+        self.assertEqual(data["explanation"], "Fallback summary.")
+
+    def test_empty_body_without_summary_is_invalid(self):
+        page = self._page('<p class="label">1 min read</p>')
+        self.assertIsNone(self.plugin._build_nasa_data(page, LINK))
 
 
 class NasaProbeTests(unittest.TestCase):
@@ -1820,117 +1968,65 @@ class ImageCacheTests(unittest.TestCase):
 
 
 class PushPerSessionChainTests(unittest.TestCase):
+    def setUp(self):
+        self.plugin = _make_plugin(_FakeConfig({"push": {"sessions": ["a"]}}))
+        self.plugin.push_mode = "scheduled"
+        self.plugin.is_divided = False
+        self.data = self.plugin._build_apod_data("APOD: t", LINK, VIDEO_ARTICLE)
+        self.store = {}
+
+        async def put(key, value):
+            self.store[key] = value
+
+        self.plugin.get_kv_data = AsyncMock(side_effect=lambda k, default=None: self.store.get(k, default))
+        self.plugin.put_kv_data = AsyncMock(side_effect=put)
+        self.plugin._get_cached_data = AsyncMock(return_value=self.data)
+        self.plugin._translate_fields = AsyncMock(return_value=(None, None, None))
+        self.send = AsyncMock(return_value=None)
+        self.plugin.context = SimpleNamespace(send_message=self.send)
+
     def test_chain_rebuilt_per_session(self):
-        config = _FakeConfig({"push": {"sessions": ["a", "b", "c", "d"]}})
-        plugin = _make_plugin(config)
-        plugin.push_mode = "scheduled"
-        plugin.send_media = True
-        apod_data = {
-            "date": "2026-10-18",
-            "title": "t",
-            "explanation": "e",
-            "media_type": "image",
-            "url": "https://x/a.jpg",
-            "hdurl": "https://x/a.jpg",
-            "link": "https://x/article/",
-        }
-        store = {}
-        calls = {"n": 0}
+        self.plugin.config["push"]["sessions"] = ["a", "b", "c", "d"]
+        with patch.object(self.plugin, "_build_apod_chains", wraps=self.plugin._build_apod_chains) as build:
+            self.assertTrue(asyncio.run(self.plugin._push_check()))
+        self.assertEqual(build.await_count, 4)
+        # 四个会话分别送达视频与正文，且写入各自检查点。
+        self.assertEqual([c.args[0] for c in self.send.await_args_list], list("aabbccdd"))
+        self.assertEqual(self.store["pushed_by_session"], dict.fromkeys("abcd", LINK))
 
-        async def get_cached_data(*args, **kwargs):
-            return apod_data
+    def test_partial_delivery_retries_only_text_without_building_media(self):
+        self.send.side_effect = [None, RuntimeError("text failed"), False, None]
+        self.assertFalse(asyncio.run(self.plugin._push_check()))
+        partial = {"a": {"link": LINK, "media_sent": True}}
+        self.assertEqual(self.store["pushed_by_session"], partial)
+        # 连续两轮正文失败也必须保留媒体进度；重试不能重新构建或下载媒体。
+        with patch.object(self.plugin, "_build_media_chain", side_effect=AssertionError("media rebuilt")):
+            self.assertFalse(asyncio.run(self.plugin._push_check()))
+            self.assertEqual(self.store["pushed_by_session"], partial)
+            self.assertTrue(asyncio.run(self.plugin._push_check()))
+        self.assertEqual([
+            [type(item).__name__ for item in call.args[1].chain]
+            for call in self.send.await_args_list
+        ], [["Video"], ["Plain"], ["Plain"], ["Plain"]])
+        self.assertEqual(self.store["pushed_by_session"], {"a": LINK})
+        # 完整送达的旧格式字符串仍然生效。
+        self.assertTrue(asyncio.run(self.plugin._push_check()))
+        self.assertEqual(self.send.await_count, 4)
 
-        async def load_ck():
-            return {}
+    def test_other_issue_partial_checkpoint_does_not_skip_new_media(self):
+        self.store["pushed_by_session"] = {"a": {"link": "old", "media_sent": True}}
+        self.assertTrue(asyncio.run(self.plugin._push_check()))
+        self.assertIsInstance(self.send.await_args_list[0].args[1].chain[0], _COMP.Video)
 
-        async def save_ck(pushed):
-            return None
-
-        async def translate(*args, **kwargs):
-            return None, None, None
-
-        async def get_cache(key):
-            return store.get(key)
-
-        async def put_cache(key, value):
-            store[key] = value
-
-        async def build(*args, **kwargs):
-            calls["n"] += 1
-            return []
-
-        async def send(umo, chains, label="APOD"):
-            return True
-
-        plugin._get_cached_data = get_cached_data
-        plugin._load_push_checkpoint = load_ck
-        plugin._save_push_checkpoint = save_ck
-        plugin._translate_fields = translate
-        plugin.get_cache = get_cache
-        plugin.put_cache = put_cache
-        plugin._build_apod_chains = build
-        plugin._send_apod_chains = send
-
-        ok = asyncio.run(plugin._push_check())
-        self.assertTrue(ok)
-        # 4 个会话各重建一次，避免复用同一个可能失效的本地路径
-        self.assertEqual(calls["n"], 4)
-
-    def test_video_push_builds_media_and_text_chains(self):
-        config = _FakeConfig({"push": {"sessions": ["a"]}})
-        plugin = _make_plugin(config)
-        plugin.push_mode = "scheduled"
-        plugin.is_divided = False
-        apod_data = {
-            "date": "2026-10-28",
-            "title": "t",
-            "explanation": "e",
-            "media_type": "video",
-            "url": MP4,
-            "hdurl": MP4,
-            "link": "https://x/article/",
-        }
-        store = {}
-        recorded = []
-
-        async def get_cached_data(*args, **kwargs):
-            return apod_data
-
-        async def load_ck():
-            return {}
-
-        async def save_ck(pushed):
-            return None
-
-        async def translate(*args, **kwargs):
-            return None, None, None
-
-        async def get_cache(key):
-            return store.get(key)
-
-        async def put_cache(key, value):
-            store[key] = value
-
-        async def send(umo, chains, label="APOD"):
-            recorded.append(chains)
-            return True
-
-        plugin._get_cached_data = get_cached_data
-        plugin._load_push_checkpoint = load_ck
-        plugin._save_push_checkpoint = save_ck
-        plugin._translate_fields = translate
-        plugin.get_cache = get_cache
-        plugin.put_cache = put_cache
-        plugin._send_apod_chains = send
-
-        self.assertTrue(asyncio.run(plugin._push_check()))
-        self.assertEqual(len(recorded), 1)
-        chains = recorded[0]
-        # 图片期可将 is_divided 关掉，视频期必须恒拆，否则正文被气泡吞掉。
-        self.assertEqual(len(chains), 2)
-        self.assertIsInstance(chains[0].chain[0], _COMP.Video)
-        self.assertEqual(chains[0].chain[0].file, MP4)
-        self.assertIsInstance(chains[1].chain[0], _COMP.Plain)
+    def test_checkpoint_storage_failure_aborts_remaining_sessions(self):
+        self.plugin.config["push"]["sessions"] = ["a", "b"]
+        for fail_read in (True, False):
+            with self.subTest(fail_read=fail_read):
+                self.send.reset_mock()
+                target = "get_kv_data" if fail_read else "put_kv_data"
+                with patch.object(self.plugin, target, side_effect=RuntimeError("storage down")):
+                    self.assertFalse(asyncio.run(self.plugin._push_check()))
+                self.assertEqual(self.send.await_count, 0 if fail_read else 2)
 
 
 if __name__ == "__main__":
