@@ -626,15 +626,34 @@ class TomorrowTitleTests(unittest.TestCase):
         self.assertEqual(data["tomorrow_title"], "")
 
     def test_random_entry_has_no_tomorrow_line(self):
-        html = (
-            f'<h1>Random</h1><a href="{LINK}">x</a>'
-            "<p>Explanation: Some astronomy text."
-            "<br><strong>Tomorrow&#8217;s picture:</strong> eye in the sky</p>"
-        )
-        data = self.plugin._build_random_apod(html)
-        self.assertIsNotNone(data)
-        self.assertEqual(data["tomorrow_title"], "")
-        self.assertIn("Some astronomy text", data["explanation"])
+        # 官网 embed 使用 h2，底部 image-article 链接指向相邻两期而非本期。
+        for heading in ("h1", "h2", "H2"):
+            with self.subTest(heading=heading):
+                html = (
+                    '<article data-smd-embed-post-id="1230624">'
+                    f'<{heading} class="display-48">A <em>Comet</em> &amp; Two Dippers</{heading}>'
+                    '<p>Explanation: Some astronomy text.'
+                    '<br><strong>Tomorrow&#8217;s picture:</strong> eye in the sky</p>'
+                    '<table><tr><th>Date</th><td>February 7, 2023</td></tr></table>'
+                    f'<a class="smd-next-prev__prev" href="{LINK}">Yesterday</a>'
+                    '</article>'
+                )
+                data = self.plugin._build_random_apod(html)
+                self.assertIsNotNone(data)
+                self.assertEqual(data["title"], "A Comet & Two Dippers")
+                self.assertEqual(data["link"], "https://science.nasa.gov/?p=1230624")
+                self.assertEqual(data["date"], "2023-02-07")
+                self.assertEqual(data["tomorrow_title"], "")
+                self.assertEqual(data["explanation"], "Some astronomy text.")
+
+    def test_random_entry_without_post_identity_does_not_use_neighbor_link(self):
+        for post_id in ("", "wrong", "0"):
+            with self.subTest(post_id=post_id):
+                html = (
+                    f'<article data-smd-embed-post-id="{post_id}"><h2>Random</h2>'
+                    f'<p>Explanation: Text.</p><a href="{LINK}">Yesterday</a></article>'
+                )
+                self.assertIsNone(self.plugin._build_random_apod(html))
 
     def test_tomorrow_line_rendered_after_explanation(self):
         text = self.plugin._build_display_text(self._data(), None, None)

@@ -72,10 +72,6 @@ APOD_SLUG_DATE_PATTERN = re.compile(
     r"apod-(\d{4})-(january|february|march|april|may|june|july|august|september|october|november|december)-(\d{1,2})",
     re.IGNORECASE,
 )
-# 随机内容中文档顺序的第一个 image-article 链接即主帖（实测确认）。
-RANDOM_POST_LINK_PATTERN = re.compile(
-    r"https://science\.nasa\.gov/image-article/[^\s\"'<>]+"
-)
 CREDIT_PREFIX_PATTERN = re.compile(
     r"^(?:(?:Image|Video)\s+)?Credit(?:\s*&\s*Copyright)?\s*:\s*", re.IGNORECASE
 )
@@ -132,6 +128,7 @@ class _HTMLAttrParser(HTMLParser):
         self.og_video = ""
         self.og_description = ""
         self.published_meta = ""
+        self.embed_post_id = ""
         self.img_srcs = []
         self.video_srcs = []
         self.iframe_srcs = []
@@ -149,6 +146,8 @@ class _HTMLAttrParser(HTMLParser):
                 self.og_video = attrs_map.get("content", "")
             elif key in PUBLISHED_META_KEYS and not self.published_meta:
                 self.published_meta = attrs_map.get("content", "")
+        elif tag == "article" and not self.embed_post_id:
+            self.embed_post_id = attrs_map.get("data-smd-embed-post-id", "")
         elif tag == "img" and attrs_map.get("src"):
             self.img_srcs.append(attrs_map["src"])
         elif tag in ("video", "source") and attrs_map.get("src"):
@@ -1556,14 +1555,17 @@ class APOD(Star):
         return None
 
     def _build_random_apod(self, content_html: str) -> Optional[dict]:
-        match = RANDOM_POST_LINK_PATTERN.search(content_html or "")
-        if not match:
+        parser = _HTMLAttrParser()
+        parser.feed(content_html or "")
+        # embed 底部链接是前后两期；用本期文章 ID 生成 WordPress 稳定链接，
+        # 官网会重定向到正确的文章地址，避免把相邻条目当成本期。
+        if not re.fullmatch(r"[1-9][0-9]*", parser.embed_post_id):
             return None
-        link = html_lib.unescape(match.group(0))
-        if "apod-" not in link.lower():
+        link = f"https://science.nasa.gov/?p={parser.embed_post_id}"
+        title_match = re.search(r"<h([12])\b[^>]*>(.*?)</h\1>", content_html, re.S | re.I)
+        title = self._strip_html(title_match.group(2)) if title_match else ""
+        if not title:
             return None
-        title_match = re.search(r"<h1[^>]*>(.*?)</h1>", content_html, re.S)
-        title = self._strip_html(title_match.group(1)) if title_match else ""
         data = self._build_apod_data(title, link, content_html)
         if data is not None:
             # 随机模式不展示「明日一图」。
