@@ -4,9 +4,11 @@
 再直接从源码路径加载 main.py，只覆盖纯解析/渲染/编排逻辑。
 """
 import asyncio
+import atexit
 import importlib.util
 import logging
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -147,6 +149,28 @@ class _FakeSP:
         self.removed.append(key)
 
 
+def _use_isolated_plugin_data_dir(case=None):
+    """把插件数据目录指到一个独立临时目录，用例结束（或进程退出）时删除。
+
+    图片缓存、缓存索引等都会写到这里；只注册 mock 清理会把目录和图片留在
+    系统临时目录里（
+    跑一次测试就多几个 apod-* 目录）。
+    """
+    import astrbot.core.utils.astrbot_path as astrbot_path
+
+    directory = tempfile.mkdtemp(prefix="apod-plugin-data-")
+    patcher = patch.object(
+        astrbot_path, "get_astrbot_plugin_data_path", return_value=directory
+    )
+    patcher.start()
+    if case is None:
+        atexit.register(shutil.rmtree, directory, True)
+        return directory
+    case.addCleanup(shutil.rmtree, directory, True)
+    case.addCleanup(patcher.stop)
+    return directory
+
+
 def _install_astrbot_stubs():
     def mod(name):
         module = types.ModuleType(name)
@@ -258,6 +282,7 @@ def _install_astrbot_stubs():
     core.utils = core_utils
     astrbot_path = mod("astrbot.core.utils.astrbot_path")
     _PLUGIN_DATA_DIR = tempfile.mkdtemp(prefix="apod-plugin-data-")
+    atexit.register(shutil.rmtree, _PLUGIN_DATA_DIR, True)
     astrbot_path.get_astrbot_plugin_data_path = lambda: _PLUGIN_DATA_DIR
     core_utils.astrbot_path = astrbot_path
 
@@ -1916,7 +1941,6 @@ class MediaDownloadRetryTests(unittest.TestCase):
     """图片下载边界：走 AstrBot download_file，按 retry_count 退避重试。"""
 
     def setUp(self):
-        import astrbot.core.utils.astrbot_path as astrbot_path
         import astrbot.core.utils.io as io_utils
 
         self.io_utils = io_utils
@@ -1925,15 +1949,8 @@ class MediaDownloadRetryTests(unittest.TestCase):
         self.plugin.retry_count = 3
         self.url = "https://x/retry.jpg"
         self.store = {}
-        # 每个用例独立缓存目录：上一用例写过的文件会让下载直接命中缓存。
-        cache_root = tempfile.mkdtemp(prefix="apod-download-cache-")
-        patcher = patch.object(
-            astrbot_path,
-            "get_astrbot_plugin_data_path",
-            return_value=cache_root,
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # 每个用例独立缓存目录，退出时删除：上一用例写过的文件会让下载直接命中缓存。
+        _use_isolated_plugin_data_dir(self)
 
         async def get_cache(key):
             return self.store.get(key)
@@ -2096,21 +2113,12 @@ class PushMediaPrewarmTests(unittest.TestCase):
     """定时推送的媒体预热：图文都发、丢图只补图，汇总如实统计。"""
 
     def setUp(self):
-        import astrbot.core.utils.astrbot_path as astrbot_path
-
         self.plugin = _make_plugin(_FakeConfig({"push": {"sessions": ["a"]}}))
         self.plugin.push_mode = "scheduled"
         self.plugin.is_divided = False  # 合并链：图片 + 正文一条
         self.plugin.cache_images = True
         # 每个用例独立缓存目录：图片命中缓存会跳过下载，不能跨用例共享。
-        cache_root = tempfile.mkdtemp(prefix="apod-push-cache-")
-        patcher = patch.object(
-            astrbot_path,
-            "get_astrbot_plugin_data_path",
-            return_value=cache_root,
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        _use_isolated_plugin_data_dir(self)
         self.data = self.plugin._build_apod_data("APOD: t", LINK, IMAGE_ARTICLE)
         self.media_url = self.data["hdurl"] or self.data["url"]
         self.store = {}
