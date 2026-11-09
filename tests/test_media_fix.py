@@ -365,11 +365,14 @@ class _LogCapture(logging.Handler):
         self.lines.append(record.getMessage())
 
 
-def _capture_logs(case):
+def _capture_logs(case, level=logging.INFO):
     handler = _LogCapture()
     logger = logging.getLogger("apod-test")
+    previous = logger.level
+    logger.setLevel(level)
     logger.addHandler(handler)
     case.addCleanup(logger.removeHandler, handler)
+    case.addCleanup(logger.setLevel, previous)
     return handler
 
 
@@ -858,20 +861,20 @@ class RenderingTests(unittest.TestCase):
         # 检查真实发送边界，覆盖 None 成功、False、异常和媒体/正文分别失败。
         # 期望值：(text_sent, media_sent, unknown)
         cases = [
-            ("merged fallback", [[image, text]], [False, None], (True, False, False),
-             [["Image", "Plain"], ["Plain"]]),
+            ("merged fallback", [[image, text]], [False, None],
+             (True, False, False, False), [["Image", "Plain"], ["Plain"]]),
             ("fallback failure", [[image, text]],
-             [_pre_submit_error(), False], (False, False, False),
+             [_pre_submit_error(), False], (False, False, False, False),
              [["Image", "Plain"], ["Plain"]]),
             ("split media failure", [[image], [text]], [False, None],
-             (True, False, False), [["Image"], ["Plain"]]),
+             (True, False, False, False), [["Image"], ["Plain"]]),
             ("split text failure", [[image], [text]], [None, False],
-             (False, True, False), [["Image"], ["Plain"]]),
-            ("media only failure", [[image]], [False], (False, False, False),
-             [["Image"]]),
+             (False, True, False, False), [["Image"], ["Plain"]]),
+            ("media only failure", [[image]], [False],
+             (False, False, False, False), [["Image"]]),
             ("timeout is unknown", [[image, text]], [asyncio.TimeoutError()],
-             (True, True, True), [["Image", "Plain"]]),
-            ("empty", [], [], (False, False, False), []),
+             (True, True, True, True), [["Image", "Plain"]]),
+            ("empty", [], [], (False, False, False, False), []),
         ]
         for name, components, outcomes, expected, attempts in cases:
             with self.subTest(name=name):
@@ -894,7 +897,7 @@ class RenderingTests(unittest.TestCase):
             report = asyncio.run(self.plugin._send_chains([chain], blocked_send))
         # 超时是“结果未知”：按已送达记账，避免重发同一条消息。
         self.assertTrue(report.text_sent)
-        self.assertTrue(report.unknown)
+        self.assertTrue(report.text_unknown)
         # 卸载取消必须向上传播，不能被当作发送失败吞掉。
         with self.assertRaises(asyncio.CancelledError):
             asyncio.run(self.plugin._send_chains(
@@ -2155,7 +2158,7 @@ class MediaDownloadRetryTests(unittest.TestCase):
 
         with self.assertLogs("apod-test", level="ERROR") as logs:
             report = asyncio.run(self.plugin._send_chains([chain], leaky_send))
-        self.assertTrue(report.unknown)
+        self.assertTrue(report.text_unknown)
         text = chr(10).join(logs.output)
         self.assertNotIn("TEST_SIGNATURE", text)
         self.assertNotIn("today's.png", text)
@@ -2295,6 +2298,130 @@ class PushMediaPrewarmTests(unittest.TestCase):
         # 不重发：整期只尝试了一次，不再降级正文、也不补图。
         self.assertEqual(sent, [["Image", "Plain"]])
         self.assertEqual(self.store["pushed_by_session"], {"a": LINK})
+
+    def test_unknown_media_does_not_swallow_text_retry(self):
+        # 拆链：图片超时（未知）、正文明确失败 → 正文仍要进入下一轮补试。
+        self.plugin.is_divided = True
+
+        async def ok(url, dest):
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        sent = []
+
+        async def media_timeout_text_fails(umo, chain):
+            kinds = [type(item).__name__ for item in chain.chain]
+            sent.append(kinds)
+            if kinds == ["Image"]:
+                raise asyncio.TimeoutError()
+            raise _pre_submit_error()
+
+        self.plugin.context = SimpleNamespace(send_message=media_timeout_text_fails)
+        logs = _capture_logs(self)
+        with patch.object(self.plugin, "_download_image", ok):
+            self.assertFalse(asyncio.run(self.plugin._push_check()))
+        self.assertEqual(sent, [["Image"], ["Plain"]])
+        # 图片按未知记账、正文仍然待补 → 检查点保留“只缺正文”。
+        self.assertEqual(
+            self.store["pushed_by_session"],
+            {"a": {"link": LINK, "media_sent": True}},
+        )
+        summary = [line for line in logs.lines if "本次推送" in line]
+        self.assertTrue(summary and "待补发" in summary[0], summary)
+
+    def test_known_media_success_is_counted_when_text_is_unknown(self):
+        # 拆链：图片成功、正文超时 → 图片仍应算作已送达（1/1）。
+        self.plugin.is_divided = True
+
+        async def ok(url, dest):
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        async def media_ok_text_timeout(umo, chain):
+            kinds = [type(item).__name__ for item in chain.chain]
+            if kinds == ["Plain"]:
+                raise asyncio.TimeoutError()
+            return None
+
+        self.plugin.context = SimpleNamespace(send_message=media_ok_text_timeout)
+        with patch.object(self.plugin, "_download_image", ok),              self.assertLogs("apod-test", level="INFO") as logs:
+            asyncio.run(self.plugin._push_check())
+        summary = [line for line in logs.output if "本次推送" in line]
+        self.assertEqual(len(summary), 1)
+        self.assertIn("媒体 1/1", summary[0])
+        self.assertIn("正文 0/1", summary[0])
+
+    def test_missing_image_file_is_a_retryable_failure(self):
+        # 组链后、适配器读取前文件被删：AstrBot 转换阶段抛 FileNotFoundError，
+        # 说明还没上传，应判为可重试的明确失败而不是“结果未知”。
+        async def vanish(url, dest):
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        sent = []
+        path = self.plugin._image_cache_path(self.media_url)
+
+        async def delete_then_raise(_umo, chain):
+            kinds = [type(item).__name__ for item in chain.chain]
+            sent.append(kinds)
+            if "Image" in kinds and not sent.count(["Image"]):
+                # 组链之后、适配器读取之前被淘汰：AstrBot 抛 FileNotFoundError。
+                os.remove(path)
+                raise FileNotFoundError("image vanished")
+            return None
+
+        self.plugin.context = SimpleNamespace(send_message=delete_then_raise)
+        with patch.object(self.plugin, "_download_image", vanish),              patch.object(apod_main.asyncio, "sleep", AsyncMock()):
+            self.assertTrue(asyncio.run(self.plugin._push_check()))
+        # 首次图文失败 → 降级正文 → 轮内重新预热并补图。
+        self.assertEqual(sent, [["Image", "Plain"], ["Plain"], ["Image"]])
+        self.assertEqual(self.store["pushed_by_session"], {"a": LINK})
+
+    def test_private_session_connect_error_stays_unknown(self):
+        # QQ 官方私聊的 POST 在适配器内部重试 3 次：最后一次连接失败证明不了
+        # 前面没提交，只能按结果未知处理，不能再发一次。
+        self.plugin.config["push"]["sessions"] = ["qq_official:FriendMessage:abc"]
+        sent = []
+
+        async def ok(url, dest):
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        async def connect_error(umo, chain):
+            sent.append([type(item).__name__ for item in chain.chain])
+            raise _pre_submit_error()
+
+        self.plugin.context = SimpleNamespace(send_message=connect_error)
+        with patch.object(self.plugin, "_download_image", ok),              patch.object(apod_main.asyncio, "sleep", AsyncMock()),              self.assertLogs("apod-test", level="WARNING"):
+            self.assertTrue(asyncio.run(self.plugin._push_check()))
+        # 只有一次尝试，不再降级重发正文。
+        self.assertEqual(sent, [["Image", "Plain"]])
+        self.assertEqual(
+            self.store["pushed_by_session"],
+            {"qq_official:FriendMessage:abc": LINK},
+        )
+
+    def test_group_session_connect_error_is_retried(self):
+        # 群聊没有适配器内部重试：连接失败可以确认没提交，正常降级 + 补图。
+        self.plugin.config["push"]["sessions"] = ["qq_official:GroupMessage:abc"]
+
+        async def ok(url, dest):
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        sent = []
+
+        async def connect_error_then_ok(umo, chain):
+            kinds = [type(item).__name__ for item in chain.chain]
+            sent.append(kinds)
+            if kinds == ["Image", "Plain"]:
+                raise _pre_submit_error()
+            return None
+
+        self.plugin.context = SimpleNamespace(send_message=connect_error_then_ok)
+        with patch.object(self.plugin, "_download_image", ok),              patch.object(apod_main.asyncio, "sleep", AsyncMock()):
+            self.assertTrue(asyncio.run(self.plugin._push_check()))
+        self.assertEqual(sent, [["Image", "Plain"], ["Plain"], ["Image"]])
 
     def test_summary_does_not_report_unknown_as_delivered(self):
         async def ok(url, dest):

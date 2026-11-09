@@ -111,13 +111,19 @@ SEND_TIMEOUT_SECONDS = 60
 SEND_OK = "ok"
 SEND_FAILED = "failed"
 SEND_UNKNOWN = "unknown"
-# 能确认“还没提交给平台”的失败才值得自动补发：连不上、URL 无效、拒绝连接。
+# 能确认“还没提交给平台”的失败才值得自动补发：
+#   连不上 / URL 无效 / 拒绝连接 —— 根本没走到提交；
+#   本地图片不存在 —— AstrBot 转换阶段就读文件，读不到时还没开始上传。
 # 其余（超时、提交后读响应失败、未知异常）都可能已经送达，重发就是刷屏。
 _PRE_SUBMIT_ERRORS = (
     aiohttp.ClientConnectorError,
     aiohttp.InvalidURL,
     ConnectionRefusedError,
+    FileNotFoundError,
 )
+# QQ 官方私聊（FriendMessage）的 POST 在适配器内部重试 3 次：最后一次连接失败
+# 不能证明前几次都没提交，这条路径的“连接失败”只能按结果未知处理。
+_ADAPTER_RETRIED_MESSAGE_TYPES = ("FriendMessage",)
 # 投递检查点状态（每个会话一条）：
 #   done          = 整期送达（旧格式直接存链接字符串）
 #   text_pending  = 媒体已送达、正文待补
@@ -194,17 +200,18 @@ class MediaReady(NamedTuple):
 
 
 class ChainSendReport(NamedTuple):
-    """投递结果：text_sent=正文已送达，media_sent=媒体已送达。
+    """投递结果：正文与媒体分开记账。
 
-    两者独立记录：正文成功而媒体失败时是 (True, False)，推送检查点据此
-    在下一轮只补媒体，而不是把该会话当成“整期送达”从而永久丢图。
-    unknown=True 表示有链超时未拿到结果，已按“已送达”处理（宁可少一条，
-    也不重复刷同一条消息）。
+    text_sent / media_sent = 这一项不用再发（确认送达，或结果未知按送达处理）；
+    text_unknown / media_unknown = 这一项没拿到结果（超时、提交后断连），
+    只影响统计口径，不再触发补发。两项分开记，避免“图片未知”把“正文明确
+    失败”的补试吞掉。
     """
 
     text_sent: bool
     media_sent: bool
-    unknown: bool = False
+    text_unknown: bool = False
+    media_unknown: bool = False
 
 
 # 文章发布时间只认这两种 meta 名，不拿更新时间冒充。
@@ -602,7 +609,9 @@ class APOD(Star):
                 sent_any = True
             return result
 
-        report = await self._send_chains(chains, send, f"{label} 指令回复")
+        report = await self._send_chains(
+            chains, send, f"{label} 指令回复", event.unified_msg_origin
+        )
         return report.text_sent
 
     async def _reply_text(
@@ -778,8 +787,9 @@ class APOD(Star):
             chains,
             partial(self.context.send_message, event.unified_msg_origin),
             label=f"{label}发送",
+            umo=event.unified_msg_origin,
         )
-        if sent.unknown:
+        if sent.text_unknown or sent.media_unknown:
             return (
                 f"{label}发送结果未知（可能已送达，已停止重发）："
                 "请以当前会话的实际消息为准。"
@@ -2422,7 +2432,8 @@ class APOD(Star):
         # 一轮 = 把所有待发会话试一遍；网络抖动是秒级现象，只缺图时本轮内
         # 立即转向下一轮（轮数与退避沿用 retry_count / _retry_delay），
         # 不必等外层那次 6 分钟的补试。
-        unknown_sessions: list[str] = []
+        unknown_text: set[str] = set()
+        unknown_media: set[str] = set()
         work = list(pending)
         for attempt in range(self.retry_count + 1):
             for umo in work:
@@ -2440,13 +2451,21 @@ class APOD(Star):
                         chains,
                         partial(self.context.send_message, umo),
                         f"APOD 推送到 {umo}",
+                        umo,
                     )
-                    if report.unknown:
-                        # 超时/提交后断连：平台可能已收到，重发就是重复图片/文案。
-                        unknown_sessions.append(umo)
+                    if report.text_unknown or report.media_unknown:
+                        # 超时/提交后断连：平台可能已收到，重发就是重复图片/文案；
+                        # 但只把未知的那一项记为已送达，另一项照常走补试。
+                        parts = []
+                        if report.text_unknown:
+                            unknown_text.add(umo)
+                            parts.append("正文")
+                        if report.media_unknown:
+                            unknown_media.add(umo)
+                            parts.append("媒体")
                         logger.warning(
-                            f"APOD 推送到 {umo} 的发送结果未知："
-                            "不再重发，请以群内消息为准。"
+                            f"APOD 推送到 {umo} 的{"/".join(parts)}发送结果未知："
+                            "不再重发该部分，请以群内消息为准。"
                         )
                     done_text = done_text or report.text_sent
                     done_media = done_media or report.media_sent
@@ -2500,28 +2519,25 @@ class APOD(Star):
             await asyncio.sleep(delay)
             work = remaining
 
-        unknown = set(unknown_sessions)
         text_delivered = sum(
-            1 for umo in text_needed if text_ok(umo) and umo not in unknown
+            1 for umo in text_needed if text_ok(umo) and umo not in unknown_text
         )
         media_delivered = sum(
-            1 for umo in media_needed if media_ok(umo) and umo not in unknown
-        )
-        delivered = sum(
-            1
-            for umo in pending
-            if state_of(umo) == CHECKPOINT_DONE and umo not in unknown
+            1 for umo in media_needed if media_ok(umo) and umo not in unknown_media
         )
         await self.put_cache(
             "last_pushed_apod", {"date": date, "link": link, "delivered": True}
         )
-        missed = len(pending) - delivered - len(unknown)
+        # 只要还有会话没到“整期送达”就需要下一轮补试；结果未知的部分已按送达
+        # 记账，不会因为“另一项未知”把明确失败的那一项的补试吞掉。
+        missed = sum(1 for umo in pending if state_of(umo) != CHECKPOINT_DONE)
         notes = []
         if missed:
             notes.append(f"{missed} 个会话待补发")
+        unknown = unknown_text | unknown_media
         if unknown:
             # 结果未知按“可能已送达”记账、不重发，但汇总不能算成已送达。
-            notes.append(f"{len(unknown)} 个会话发送结果未知（未重发）")
+            notes.append(f"{len(unknown)} 个会话有内容发送结果未知（未重发）")
         logger.info(
             f"APOD 本次推送 {date}：正文 {text_delivered}/{len(text_needed)}、"
             f"媒体 {media_delivered}/{len(media_needed)}"
@@ -2633,6 +2649,12 @@ class APOD(Star):
             download_file(url, dest, allow_insecure_ssl_fallback=False),
             timeout=self.timeout,
         )
+
+    @staticmethod
+    def _adapter_retries_send(umo: str) -> bool:
+        """该会话的发送在适配器内部是否还有重试（umo = 平台:类型:会话）。"""
+        parts = str(umo or "").split(":", 2)
+        return len(parts) >= 2 and parts[1] in _ADAPTER_RETRIED_MESSAGE_TYPES
 
     @classmethod
     def _is_fatal_download_error(cls, exc: BaseException) -> bool:
@@ -2848,16 +2870,24 @@ class APOD(Star):
         chain: MessageChain,
         label: str,
         stage: str = "发送",
+        retry_proof: bool = True,
     ) -> str:
         """发一条链，返回 SEND_OK / SEND_FAILED / SEND_UNKNOWN。
 
-        只有能确认未提交的失败（连不上/URL 无效）和接口明确返回 False 才允许
-        自动补发；超时与提交后的异常（如读响应体时断连）都按“结果未知”处理，
-        不重发——QQ 官方适配器先上传再提交，这两种情况平台可能已经收到。
+        只有能确认未提交的失败和接口返回 False 才允许自动补发；超时与提交后的
+        异常（如读响应体时断连）都按“结果未知”处理，不重发。
+        retry_proof=False 表示该会话的发送在适配器内部还有重试（QQ 官方私聊
+        POST 重试 3 次），最后一次的连接失败证明不了前面都没提交，也算未知。
         """
         try:
             sent = await asyncio.wait_for(send(chain), timeout=SEND_TIMEOUT_SECONDS)
         except _PRE_SUBMIT_ERRORS as exc:
+            if not retry_proof:
+                logger.error(
+                    f"{label}失败（阶段={stage}）：适配器内部有重试，"
+                    f"无法确认未提交，按结果未知处理。{_safe_exc_text(exc)}"
+                )
+                return SEND_UNKNOWN
             logger.error(
                 f"{label}失败（阶段={stage}，未提交）：{_safe_exc_text(exc)}"
             )
@@ -2881,6 +2911,7 @@ class APOD(Star):
         chains: list[MessageChain],
         send: Callable[[MessageChain], Awaitable[Any]],
         label: str = "APOD",
+        umo: str = "",
     ) -> ChainSendReport:
         """逐条发送消息链；媒体那条失败时舍媒体保正文（合并链补发纯文字）。
 
@@ -2893,44 +2924,54 @@ class APOD(Star):
         degraded = False
         text_sent = False
         media_sent = False
-        unknown = False
+        text_unknown = False
+        media_unknown = False
+        retry_proof = not self._adapter_retries_send(umo)
         for index, chain in enumerate(chains):
             has_media = any(
                 isinstance(item, (Comp.Image, Comp.Video)) for item in chain.chain
             )
             has_text = any(isinstance(item, Comp.Plain) for item in chain.chain)
             outcome = await self._send_chain(
-                send, chain, label, "上传" if has_media else "发送"
+                send, chain, label, "上传" if has_media else "发送", retry_proof
             )
             if outcome == SEND_UNKNOWN:
-                # 不确定是否已送达：按送达记账，宁可少一条也不重复刷同一条。
-                unknown = True
-                media_sent = media_sent or has_media
-                text_sent = text_sent or has_text
+                # 不确定是否已送达：按送达记账（不再重发），但逐项标记未知。
+                if has_media:
+                    media_unknown = media_sent = True
+                if has_text:
+                    text_unknown = text_sent = True
                 continue
             if outcome == SEND_OK:
                 media_sent = media_sent or has_media
                 text_sent = text_sent or has_text
                 continue
             if not has_media:
-                return ChainSendReport(text_sent, media_sent, unknown)
+                return ChainSendReport(text_sent, media_sent, text_unknown, media_unknown)
             fallback = MessageChain(
                 chain=[item for item in chain.chain if isinstance(item, Comp.Plain)]
             )
             if fallback.chain:
-                outcome = await self._send_chain(send, fallback, label)
+                outcome = await self._send_chain(
+                    send, fallback, label, retry_proof=retry_proof
+                )
                 if outcome == SEND_UNKNOWN:
                     # 降级正文也可能已经被平台接收：按已送达记账，不再重发一次。
-                    unknown = True
+                    text_unknown = text_sent = True
                 elif outcome != SEND_OK:
-                    return ChainSendReport(False, media_sent, unknown)
-                text_sent = True
+                    return ChainSendReport(
+                        False, media_sent, text_unknown, media_unknown
+                    )
+                else:
+                    text_sent = True
             elif index == len(chains) - 1:
-                return ChainSendReport(text_sent, media_sent, unknown)
+                return ChainSendReport(
+                    text_sent, media_sent, text_unknown, media_unknown
+                )
             degraded = True
         if degraded:
             logger.warning(f"{label}已降级为纯文字。")
-        return ChainSendReport(text_sent, media_sent, unknown)
+        return ChainSendReport(text_sent, media_sent, text_unknown, media_unknown)
 
     async def terminate(self):
         logger.info("正在终止 NASA APOD 插件...")
