@@ -781,17 +781,21 @@ class RenderingTests(unittest.TestCase):
     def test_delivery_failure_matrix(self):
         image, text = _COMP.Image.fromURL(POSTER), _COMP.Plain("body")
         # 检查真实发送边界，覆盖 None 成功、False、异常和媒体/正文分别失败。
+        # 期望值：(text_sent, media_sent, unknown)
         cases = [
-            ("merged fallback", [[image, text]], [False, None], (True, False),
+            ("merged fallback", [[image, text]], [False, None], (True, False, False),
              [["Image", "Plain"], ["Plain"]]),
             ("fallback failure", [[image, text]], [RuntimeError("media"), False],
-             (False, False), [["Image", "Plain"], ["Plain"]]),
-            ("split media failure", [[image], [text]], [False, None], (True, False),
-             [["Image"], ["Plain"]]),
-            ("split text failure", [[image], [text]], [None, False], (False, True),
-             [["Image"], ["Plain"]]),
-            ("media only failure", [[image]], [False], (False, False), [["Image"]]),
-            ("empty", [], [], (False, False), []),
+             (False, False, False), [["Image", "Plain"], ["Plain"]]),
+            ("split media failure", [[image], [text]], [False, None],
+             (True, False, False), [["Image"], ["Plain"]]),
+            ("split text failure", [[image], [text]], [None, False],
+             (False, True, False), [["Image"], ["Plain"]]),
+            ("media only failure", [[image]], [False], (False, False, False),
+             [["Image"]]),
+            ("timeout is unknown", [[image, text]], [asyncio.TimeoutError()],
+             (True, True, True), [["Image", "Plain"]]),
+            ("empty", [], [], (False, False, False), []),
         ]
         for name, components, outcomes, expected, attempts in cases:
             with self.subTest(name=name):
@@ -812,7 +816,9 @@ class RenderingTests(unittest.TestCase):
 
         with patch.object(apod_main, "SEND_TIMEOUT_SECONDS", 0.001):
             report = asyncio.run(self.plugin._send_chains([chain], blocked_send))
-            self.assertFalse(report.text_sent)
+        # 超时是“结果未知”：按已送达记账，避免重发同一条消息。
+        self.assertTrue(report.text_sent)
+        self.assertTrue(report.unknown)
         # 卸载取消必须向上传播，不能被当作发送失败吞掉。
         with self.assertRaises(asyncio.CancelledError):
             asyncio.run(self.plugin._send_chains(
@@ -2152,6 +2158,30 @@ class PushMediaPrewarmTests(unittest.TestCase):
             asyncio.run(self.plugin._push_check())
         # 暂时性失败由下载层自己重试 retry_count 次；轮内不再重复请求同一地址。
         self.assertEqual(len(calls), self.plugin.retry_count + 1)
+
+    def test_timed_out_media_send_is_not_retried(self):
+        async def ok(url, dest):
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        sent = []
+
+        async def timeout_on_media(umo, chain):
+            kinds = [type(item).__name__ for item in chain.chain]
+            sent.append(kinds)
+            if "Image" in kinds:
+                # 平台已收下图，只是回执没等到。
+                raise asyncio.TimeoutError()
+            return None
+
+        self.plugin.context = SimpleNamespace(send_message=timeout_on_media)
+        with patch.object(self.plugin, "_download_image", ok), \
+             self.assertLogs("apod-test", level="WARNING") as logs:
+            self.assertTrue(asyncio.run(self.plugin._push_check()))
+        # 超时属于“结果未知”：不重发，避免同一会话收到两张一样的图。
+        self.assertEqual(sent, [["Image", "Plain"]])
+        self.assertEqual(self.store["pushed_by_session"], {"a": LINK})
+        self.assertTrue(any("结果未知" in line for line in logs.output))
 
     def test_media_pending_session_only_resends_media(self):
         self.store["pushed_by_session"] = {

@@ -107,6 +107,10 @@ APOD_PREFETCH_RETRY_ATTEMPTS = 3
 IMAGE_CACHE_MIN_AGE_SECONDS = 120
 # 单条消息发送超时：视频上传慢，给足时间，但不能无限挂住推送循环。
 SEND_TIMEOUT_SECONDS = 60
+# 单条消息的发送结果：成功 / 明确失败（没发出去）/ 结果未知（超时，平台可能已收到）。
+SEND_OK = "ok"
+SEND_FAILED = "failed"
+SEND_UNKNOWN = "unknown"
 # 定时推送未完成时只补试一次（日更任务丢了就永久没有）；6 分钟足够躲过
 # 夜间常见抖动，又不会在凌晨反复打扰。
 PUSH_RETRY_DELAY_SECONDS = 360
@@ -166,10 +170,13 @@ class ChainSendReport(NamedTuple):
 
     两者独立记录：正文成功而媒体失败时是 (True, False)，推送检查点据此
     在下一轮只补媒体，而不是把该会话当成“整期送达”从而永久丢图。
+    unknown=True 表示有链超时未拿到结果，已按“已送达”处理（宁可少一条，
+    也不重复刷同一条消息）。
     """
 
     text_sent: bool
     media_sent: bool
+    unknown: bool = False
 
 
 # 文章发布时间只认这两种 meta 名，不拿更新时间冒充。
@@ -2395,6 +2402,11 @@ class APOD(Star):
                         partial(self.context.send_message, umo),
                         f"APOD 推送到 {umo}",
                     )
+                    if report.unknown:
+                        # 超时未拿到结果：平台可能已收到，重发就是重复图片/重复文案。
+                        logger.warning(
+                            f"APOD 推送到 {umo} 的发送结果未知（已按送达处理，不再重发）。"
+                        )
                     text_done = text_done or report.text_sent
                     media_done = media_done or report.media_sent
                 else:
@@ -2789,16 +2801,24 @@ class APOD(Star):
         chain: MessageChain,
         label: str,
         stage: str = "发送",
-    ) -> bool:
+    ) -> str:
+        """发一条链，返回 SEND_OK / SEND_FAILED / SEND_UNKNOWN。
+
+        超时归为“未知”：平台可能已经收下（只是回执没等到），重发就是重复消息；
+        其它异常与接口返回 False 算明确失败，可以安全重试。
+        """
         try:
             sent = await asyncio.wait_for(send(chain), timeout=SEND_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.error(f"{label}超时未拿到结果（阶段={stage}）：按已送达处理。")
+            return SEND_UNKNOWN
         except Exception as exc:
             logger.error(f"{label}失败（阶段={stage}）：{exc!r}")
-            return False
+            return SEND_FAILED
         if sent is False:
             logger.error(f"{label}失败（阶段={stage}）：发送接口返回 False。")
-            return False
-        return True
+            return SEND_FAILED
+        return SEND_OK
 
     async def _send_chains(
         self,
@@ -2809,39 +2829,48 @@ class APOD(Star):
         """逐条发送消息链；媒体那条失败时舍媒体保正文（合并链补发纯文字）。
 
         正文失败一律视为未送达：宁可下轮补发（媒体已送达时只补正文），
-        也不能让说明文本静默丢掉。带媒体的链失败更可能是上传失败，日志按此区分。
+        也不能让说明文本静默丢掉；但超时属于“结果未知”，按已送达处理，
+        不重发（重发就是重复刷图/刷文案）。带媒体的链失败更可能是上传失败。
         """
         if not chains:
             return ChainSendReport(False, False)
         degraded = False
         text_sent = False
         media_sent = False
+        unknown = False
         for index, chain in enumerate(chains):
             has_media = any(
                 isinstance(item, (Comp.Image, Comp.Video)) for item in chain.chain
             )
             has_text = any(isinstance(item, Comp.Plain) for item in chain.chain)
-            if await self._send_chain(
+            outcome = await self._send_chain(
                 send, chain, label, "上传" if has_media else "发送"
-            ):
+            )
+            if outcome == SEND_UNKNOWN:
+                # 不确定是否已送达：按送达记账，宁可少一条也不重复刷同一条。
+                unknown = True
+                media_sent = media_sent or has_media
+                text_sent = text_sent or has_text
+                continue
+            if outcome == SEND_OK:
                 media_sent = media_sent or has_media
                 text_sent = text_sent or has_text
                 continue
             if not has_media:
-                return ChainSendReport(text_sent, media_sent)
+                return ChainSendReport(text_sent, media_sent, unknown)
             fallback = MessageChain(
                 chain=[item for item in chain.chain if isinstance(item, Comp.Plain)]
             )
             if fallback.chain:
-                if not await self._send_chain(send, fallback, label):
-                    return ChainSendReport(False, media_sent)
+                if await self._send_chain(send, fallback, label) != SEND_OK:
+                    return ChainSendReport(False, media_sent, unknown)
                 text_sent = True
             elif index == len(chains) - 1:
-                return ChainSendReport(text_sent, media_sent)
+                return ChainSendReport(text_sent, media_sent, unknown)
             degraded = True
         if degraded:
             logger.warning(f"{label}已降级为纯文字。")
-        return ChainSendReport(text_sent, media_sent)
+        return ChainSendReport(text_sent, media_sent, unknown)
 
     async def terminate(self):
         logger.info("正在终止 NASA APOD 插件...")
