@@ -127,7 +127,7 @@
         "default": 120
     },
     "retry_count": {
-        "description": "网络获取失败时的重试次数",
+        "description": "网络获取与图片下载失败时的重试次数",
         "hint": "0 表示不重试",
         "type": "int",
         "default": 3

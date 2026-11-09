@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import html as html_lib
 import os
+import random
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -2365,50 +2366,90 @@ class APOD(Star):
         if still_over:
             self._schedule_image_reconcile()
 
+    async def _download_image(self, url: str, dest: str) -> None:
+        """把单个文件下载到 dest，走 AstrBot 的 download_file。
+
+        download_file 内部是 trust_env=True 的会话，会跟随 AstrBot 配置的
+        http_proxy；插件不再自建裸 ClientSession（那样不走代理）。独立成方法
+        也方便测试替身直接注入。
+        """
+        from astrbot.core.utils.io import download_file
+
+        await asyncio.wait_for(download_file(url, dest), timeout=self.timeout)
+
+    @staticmethod
+    def _download_http_status(exc: BaseException) -> Optional[int]:
+        """从下载异常里取出 HTTP 状态码（AstrBot 的 DownloadFileHTTPError 只带文本）。"""
+        status = getattr(exc, "status", None)
+        if isinstance(status, int):
+            return status
+        match = re.search(r"HTTP status code:\s*(\d{3})", str(exc))
+        return int(match.group(1)) if match else None
+
+    async def _download_image_with_retry(self, url: str, dest: str) -> None:
+        """下载单张图片：按 retry_count 指数退避重试（1/2/4 秒起步 + 抖动）。
+
+        4xx（限流 429 与超时 408 除外）重试无意义，直接放弃。
+        """
+        for attempt in range(self.retry_count + 1):
+            try:
+                await self._download_image(url, dest)
+                if not os.path.getsize(dest):
+                    raise RuntimeError("空响应")
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                status = self._download_http_status(exc)
+                fatal = (
+                    status is not None
+                    and 400 <= status < 500
+                    and status not in (408, 429)
+                )
+                if fatal or attempt >= self.retry_count:
+                    raise
+                delay = min(2**attempt, 4) + random.uniform(0, 1)
+                logger.warning(
+                    f"图片下载失败（阶段=下载，第 {attempt + 1}/{self.retry_count} 次），"
+                    f"{delay:.1f} 秒后重试：{exc}"
+                )
+                await asyncio.sleep(delay)
+
     async def _localize_image(self, url: str) -> Optional[str]:
-        """按需把图片下载到本地缓存并返回本地路径；关闭/失败时返回 None（用 URL）。"""
+        """按需把图片下载到本地缓存并返回本地路径；关闭或最终失败时返回 None。
+
+        下载走 AstrBot 的 download_file（自带 trust_env=True），失败按
+        retry_count 重试并退避；最终失败一律打 WARN，不静默降级。
+        """
         if not self.cache_images or not url:
             return None
         path = self._image_cache_path(url)
         epoch = self._cache_epoch
+        if os.path.exists(path):
+            try:
+                # 命中也要刷新 mtime：保护窗口从最近一次使用算起。
+                os.utime(path)
+            except OSError:
+                pass
+            if epoch != self._cache_epoch:
+                # 期间发生过清理：不登记索引，直接用本地文件。
+                return path
+            await self._touch_image_cache(path)
+            return path
         try:
-            if not os.path.exists(path):
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                # 唯一临时名：同一 URL 并发下载不会互写同一个 .part。
-                tmp_path = f"{path}.{os.urandom(6).hex()}.part"
-                timeout = aiohttp.ClientTimeout(total=self.timeout)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            # 唯一临时名：同一 URL 并发下载不会互写同一个 .part。
+            tmp_path = f"{path}.{os.urandom(6).hex()}.part"
+            try:
+                await self._download_image_with_retry(url, tmp_path)
+                if epoch != self._cache_epoch:
+                    # 下载期间发生了清理：丢弃临时文件，绝不覆盖目标路径。
+                    return None
+                os.replace(tmp_path, path)
+            finally:
+                # CancelledError 不走 except Exception；统一在 finally 清理临时文件。
                 try:
-                    async with aiohttp.ClientSession(timeout=timeout) as session:
-                        async with session.get(url) as response:
-                            if response.status != 200:
-                                raise RuntimeError(f"状态码={response.status}")
-                            written = 0
-                            with open(tmp_path, "wb") as handle:
-                                async for chunk in response.content.iter_chunked(
-                                    65536
-                                ):
-                                    handle.write(chunk)
-                                    written += len(chunk)
-                    if not written:
-                        raise RuntimeError("空响应")
-                    if epoch != self._cache_epoch:
-                        # 下载期间发生了清理：丢弃临时文件，绝不覆盖目标路径。
-                        try:
-                            os.remove(tmp_path)
-                        except OSError:
-                            pass
-                        return None
-                    os.replace(tmp_path, path)
-                finally:
-                    # CancelledError 不走 except Exception；统一在 finally 清理临时文件。
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
-            else:
-                try:
-                    # 命中也要刷新 mtime：保护窗口从最近一次使用算起。
-                    os.utime(path)
+                    os.remove(tmp_path)
                 except OSError:
                     pass
             if epoch != self._cache_epoch:
@@ -2417,7 +2458,7 @@ class APOD(Star):
             await self._touch_image_cache(path)
             return path
         except Exception as exc:
-            logger.warning(f"图片缓存失败，改用原始链接：{exc}")
+            logger.warning(f"图片缓存失败（阶段=下载）：{exc}")
             return None
 
     def _split_media(self, media_chain: MessageChain) -> bool:

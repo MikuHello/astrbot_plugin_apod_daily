@@ -261,6 +261,19 @@ def _install_astrbot_stubs():
     astrbot_path.get_astrbot_plugin_data_path = lambda: _PLUGIN_DATA_DIR
     core_utils.astrbot_path = astrbot_path
 
+    # 插件通过 astrbot.core.utils.io.download_file 下载图片（trust_env=True）。
+    io_utils = mod("astrbot.core.utils.io")
+
+    class DownloadFileHTTPError(RuntimeError):
+        """与 AstrBot 同名异类：测试只会用它的文本形式。"""
+
+    async def download_file(url, path, *args, **kwargs):
+        raise AssertionError("测试必须先 patch download_file / _download_image")
+
+    io_utils.DownloadFileHTTPError = DownloadFileHTTPError
+    io_utils.download_file = download_file
+    core_utils.io = io_utils
+
     # aiohttp 只在网络层使用，解析/渲染测试不需要真实实现。
     aiohttp = mod("aiohttp")
 
@@ -319,6 +332,8 @@ def _make_plugin(config=None):
     plugin.is_divided = True
     plugin.quote_reply = False
     plugin.timeout = 30
+    # initialize() 才读取配置，夹具直接给出与默认配置一致的网络重试次数。
+    plugin.retry_count = 3
     return plugin
 
 
@@ -1814,38 +1829,13 @@ class ImageCacheTests(unittest.TestCase):
         path = plugin._image_cache_path(url)
         plugin._cache_epoch = 0
 
-        class _Content:
-            def iter_chunked(self, size):
-                async def gen():
-                    plugin._cache_epoch += 1  # 模拟下载期间发生了清理
-                    yield b"data"
+        async def fake_download(source, dest):
+            # 模拟下载期间发生了清理
+            plugin._cache_epoch += 1
+            with open(dest, "wb") as handle:
+                handle.write(b"data")
 
-                return gen()
-
-        class _Resp:
-            status = 200
-            content = _Content()
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                return False
-
-        class _Session:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                return False
-
-            def get(self, url):
-                return _Resp()
-
-        with mock.patch.object(apod_main.aiohttp, "ClientSession", _Session):
+        with mock.patch.object(plugin, "_download_image", fake_download):
             got = asyncio.run(plugin._localize_image(url))
         self.assertIsNone(got)
         self.assertFalse(os.path.exists(path))
@@ -1858,38 +1848,12 @@ class ImageCacheTests(unittest.TestCase):
         path = plugin._image_cache_path(url)
         directory = plugin._image_cache_dir()
 
-        class _Content:
-            def iter_chunked(self, size):
-                async def gen():
-                    yield b"data"
-                    raise asyncio.CancelledError()
+        async def fake_download(source, dest):
+            with open(dest, "wb") as handle:
+                handle.write(b"data")
+            raise asyncio.CancelledError()
 
-                return gen()
-
-        class _Resp:
-            status = 200
-            content = _Content()
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                return False
-
-        class _Session:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                return False
-
-            def get(self, url):
-                return _Resp()
-
-        with mock.patch.object(apod_main.aiohttp, "ClientSession", _Session):
+        with mock.patch.object(plugin, "_download_image", fake_download):
             with self.assertRaises(asyncio.CancelledError):
                 asyncio.run(plugin._localize_image(url))
         prefix = os.path.basename(path) + "."
@@ -1919,41 +1883,15 @@ class ImageCacheTests(unittest.TestCase):
         path = plugin._image_cache_path(url)
         plugin._cache_epoch = 0
 
-        class _Content:
-            def iter_chunked(self, size):
-                async def gen():
-                    # 模拟：下载期间发生清理，且新请求写出了有效文件
-                    plugin._cache_epoch += 1
-                    with open(path, "wb") as handle:
-                        handle.write(b"new")
-                    yield b"old"
+        async def fake_download(source, dest):
+            # 模拟：下载期间发生清理，且新请求写出了有效文件
+            plugin._cache_epoch += 1
+            with open(path, "wb") as handle:
+                handle.write(b"new")
+            with open(dest, "wb") as handle:
+                handle.write(b"old")
 
-                return gen()
-
-        class _Resp:
-            status = 200
-            content = _Content()
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                return False
-
-        class _Session:
-            def __init__(self, *args, **kwargs):
-                pass
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                return False
-
-            def get(self, url):
-                return _Resp()
-
-        with mock.patch.object(apod_main.aiohttp, "ClientSession", _Session):
+        with mock.patch.object(plugin, "_download_image", fake_download):
             got = asyncio.run(plugin._localize_image(url))
         self.assertIsNone(got)
         self.assertTrue(os.path.exists(path))
@@ -1965,6 +1903,109 @@ class ImageCacheTests(unittest.TestCase):
         self.assertIsNone(
             asyncio.run(self.plugin._localize_image("https://x/a.jpg"))
         )
+
+
+class MediaDownloadRetryTests(unittest.TestCase):
+    """图片下载边界：走 AstrBot download_file，按 retry_count 退避重试。"""
+
+    def setUp(self):
+        import astrbot.core.utils.io as io_utils
+
+        self.io_utils = io_utils
+        self.plugin = _make_plugin()
+        self.plugin.cache_images = True
+        self.plugin.retry_count = 3
+        self.url = "https://x/retry.jpg"
+        self.store = {}
+
+        async def get_cache(key):
+            return self.store.get(key)
+
+        async def put_cache(key, value):
+            self.store[key] = value
+
+        self.plugin.get_cache = get_cache
+        self.plugin.put_cache = put_cache
+
+    def _localize(self, download, sleeps):
+        async def fake_sleep(seconds):
+            sleeps.append(seconds)
+
+        with patch.object(self.io_utils, "download_file", download), \
+             patch.object(apod_main.asyncio, "sleep", fake_sleep):
+            return asyncio.run(self.plugin._localize_image(self.url))
+
+    def test_transient_failure_retries_with_backoff(self):
+        calls, sleeps = [], []
+
+        async def flaky(url, dest, *args, **kwargs):
+            calls.append(url)
+            if len(calls) < 3:
+                raise ConnectionResetError("reset")
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        path = self._localize(flaky, sleeps)
+        self.assertEqual(path, self.plugin._image_cache_path(self.url))
+        self.assertEqual(len(calls), 3)
+        # 退避间隔照 _fetch_text：min(2**attempt, 4) 再加抖动。
+        self.assertEqual(len(sleeps), 2)
+        self.assertTrue(1 <= sleeps[0] <= 2, sleeps)
+        self.assertTrue(2 <= sleeps[1] <= 3, sleeps)
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), b"img")
+
+    def test_client_error_is_not_retried(self):
+        calls, sleeps = [], []
+
+        async def missing(url, dest, *args, **kwargs):
+            calls.append(url)
+            raise self.io_utils.DownloadFileHTTPError(
+                "Failed to download file. HTTP status code: 404"
+            )
+
+        self.assertIsNone(self._localize(missing, sleeps))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sleeps, [])
+
+    def test_server_error_exhausts_retry_count(self):
+        calls, sleeps = [], []
+
+        async def down(url, dest, *args, **kwargs):
+            calls.append(url)
+            raise self.io_utils.DownloadFileHTTPError(
+                "Failed to download file. HTTP status code: 503"
+            )
+
+        self.assertIsNone(self._localize(down, sleeps))
+        self.assertEqual(len(calls), self.plugin.retry_count + 1)
+        self.assertEqual(len(sleeps), self.plugin.retry_count)
+        self.assertFalse(os.path.exists(self.plugin._image_cache_path(self.url)))
+
+    def test_rate_limited_status_is_retried(self):
+        calls, sleeps = [], []
+        self.plugin.retry_count = 1
+
+        async def limited(url, dest, *args, **kwargs):
+            calls.append(url)
+            raise self.io_utils.DownloadFileHTTPError(
+                "Failed to download file. HTTP status code: 429"
+            )
+
+        self.assertIsNone(self._localize(limited, sleeps))
+        self.assertEqual(len(calls), 2)
+
+    def test_empty_response_is_treated_as_failure(self):
+        calls, sleeps = [], []
+        self.plugin.retry_count = 1
+
+        async def empty(url, dest, *args, **kwargs):
+            calls.append(url)
+            with open(dest, "wb"):
+                pass
+
+        self.assertIsNone(self._localize(empty, sleeps))
+        self.assertEqual(len(calls), 2)
 
 
 class PushPerSessionChainTests(unittest.TestCase):
