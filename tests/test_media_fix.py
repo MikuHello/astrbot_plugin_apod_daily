@@ -1731,7 +1731,7 @@ class ImageCacheTests(unittest.TestCase):
         with open(path, "wb") as handle:
             handle.write(b"img")
         got = asyncio.run(self.plugin._localize_image(url))
-        self.assertEqual(got, path)
+        self.assertEqual(got.path, path)
         self.assertEqual(
             self.store.get("image_cache_index"), [os.path.basename(path)]
         )
@@ -1838,7 +1838,7 @@ class ImageCacheTests(unittest.TestCase):
 
         with mock.patch.object(plugin, "_download_image", fake_download):
             got = asyncio.run(plugin._localize_image(url))
-        self.assertIsNone(got)
+        self.assertIsNone(got.path)
         self.assertFalse(os.path.exists(path))
 
     def test_cancel_during_download_removes_partial_file(self):
@@ -1894,16 +1894,16 @@ class ImageCacheTests(unittest.TestCase):
 
         with mock.patch.object(plugin, "_download_image", fake_download):
             got = asyncio.run(plugin._localize_image(url))
-        self.assertIsNone(got)
+        self.assertIsNone(got.path)
         self.assertTrue(os.path.exists(path))
         with open(path, "rb") as handle:
             self.assertEqual(handle.read(), b"new")
 
     def test_localize_disabled_returns_none(self):
         self.plugin.cache_images = False
-        self.assertIsNone(
-            asyncio.run(self.plugin._localize_image("https://x/a.jpg"))
-        )
+        result = asyncio.run(self.plugin._localize_image("https://x/a.jpg"))
+        self.assertIsNone(result.path)
+        self.assertFalse(result.fatal)
 
 
 class MediaDownloadRetryTests(unittest.TestCase):
@@ -1956,7 +1956,8 @@ class MediaDownloadRetryTests(unittest.TestCase):
             with open(dest, "wb") as handle:
                 handle.write(b"img")
 
-        path = self._localize(flaky, sleeps)
+        result = self._localize(flaky, sleeps)
+        path = result.path
         self.assertEqual(path, self.plugin._image_cache_path(self.url))
         self.assertEqual(len(calls), 3)
         # 退避间隔照 _fetch_text：min(2**attempt, 4) 再加抖动。
@@ -1975,7 +1976,9 @@ class MediaDownloadRetryTests(unittest.TestCase):
                 "Failed to download file. HTTP status code: 404"
             )
 
-        self.assertIsNone(self._localize(missing, sleeps))
+        result = self._localize(missing, sleeps)
+        self.assertIsNone(result.path)
+        self.assertTrue(result.fatal)
         self.assertEqual(len(calls), 1)
         self.assertEqual(sleeps, [])
 
@@ -1988,7 +1991,9 @@ class MediaDownloadRetryTests(unittest.TestCase):
                 "Failed to download file. HTTP status code: 503"
             )
 
-        self.assertIsNone(self._localize(down, sleeps))
+        result = self._localize(down, sleeps)
+        self.assertIsNone(result.path)
+        self.assertFalse(result.fatal)
         self.assertEqual(len(calls), self.plugin.retry_count + 1)
         self.assertEqual(len(sleeps), self.plugin.retry_count)
         self.assertFalse(os.path.exists(self.plugin._image_cache_path(self.url)))
@@ -2003,7 +2008,8 @@ class MediaDownloadRetryTests(unittest.TestCase):
                 "Failed to download file. HTTP status code: 429"
             )
 
-        self.assertIsNone(self._localize(limited, sleeps))
+        result = self._localize(limited, sleeps)
+        self.assertIsNone(result.path)
         self.assertEqual(len(calls), 2)
 
     def test_empty_response_is_treated_as_failure(self):
@@ -2015,7 +2021,8 @@ class MediaDownloadRetryTests(unittest.TestCase):
             with open(dest, "wb"):
                 pass
 
-        self.assertIsNone(self._localize(empty, sleeps))
+        result = self._localize(empty, sleeps)
+        self.assertIsNone(result.path)
         self.assertEqual(len(calls), 2)
 
     def test_insecure_ssl_fallback_is_disabled(self):
@@ -2039,7 +2046,7 @@ class MediaDownloadRetryTests(unittest.TestCase):
             raise RuntimeError(f"cannot fetch {secret}")
 
         with self.assertLogs("apod-test", level="WARNING") as logs:
-            self.assertIsNone(self._localize(leaky, sleeps))
+            self.assertIsNone(self._localize(leaky, sleeps).path)
         text = "\n".join(logs.output)
         self.assertNotIn("SECRET123", text)
         self.assertNotIn(secret, text)
@@ -2111,6 +2118,41 @@ class PushMediaPrewarmTests(unittest.TestCase):
             {"a": {"link": LINK, "media_sent": False}},
         )
 
+    def test_fatal_download_error_is_not_retried_in_round(self):
+        import astrbot.core.utils.io as io_utils
+
+        calls = []
+
+        async def not_found(url, dest):
+            calls.append(url)
+            raise io_utils.DownloadFileHTTPError(
+                "Failed to download file. HTTP status code: 404"
+            )
+
+        with patch.object(self.plugin, "_download_image", not_found), \
+             patch.object(apod_main.asyncio, "sleep", AsyncMock()):
+            self.assertFalse(asyncio.run(self.plugin._push_check()))
+        # 4xx 重试无意义：同一地址本轮只请求一次（旧行为会刷 1+retry_count 次）。
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self._sent(), [["Plain"]])
+        self.assertEqual(
+            self.store["pushed_by_session"],
+            {"a": {"link": LINK, "media_sent": False}},
+        )
+
+    def test_transient_download_error_uses_download_retries_only(self):
+        calls = []
+
+        async def reset(url, dest):
+            calls.append(url)
+            raise ConnectionResetError("reset")
+
+        with patch.object(self.plugin, "_download_image", reset), \
+             patch.object(apod_main.asyncio, "sleep", AsyncMock()):
+            asyncio.run(self.plugin._push_check())
+        # 暂时性失败由下载层自己重试 retry_count 次；轮内不再重复请求同一地址。
+        self.assertEqual(len(calls), self.plugin.retry_count + 1)
+
     def test_media_pending_session_only_resends_media(self):
         self.store["pushed_by_session"] = {
             "a": {"link": LINK, "media_sent": False}
@@ -2164,7 +2206,7 @@ class PushMediaPrewarmTests(unittest.TestCase):
             self._sent(), [["Image", "Plain"], ["Plain"], ["Image"]]
         )
         self.assertEqual(self.store["pushed_by_session"], {"a": LINK})
-        # 秒级补发：等待不能是外层那 10 分钟节拍。
+        # 秒级补发：等待不能是外层那次 6 分钟的补试。
         self.assertEqual(len(sleeps), 1)
         self.assertTrue(1 <= sleeps[0] <= 2, sleeps)
 
@@ -2210,24 +2252,26 @@ class PushMediaPrewarmTests(unittest.TestCase):
             {"a": {"link": LINK, "media_sent": False}},
         )
 
-    def test_download_failure_is_recovered_in_same_round(self):
+    def test_download_failure_is_not_retried_in_round(self):
         self.plugin.config["push"]["sessions"] = ["a", "b", "c", "d"]
         attempts = []
 
         async def flaky(url, dest):
             attempts.append(url)
-            if len(attempts) <= 4:  # 首轮四个会话共用的那次下载失败
+            if len(attempts) <= self.plugin.retry_count + 1:
                 raise ConnectionResetError("reset")
             with open(dest, "wb") as handle:
                 handle.write(b"img")
 
         with patch.object(self.plugin, "_download_image", flaky), \
              patch.object(apod_main.asyncio, "sleep", AsyncMock()):
-            self.assertTrue(asyncio.run(self.plugin._push_check()))
-        # 首轮全失败只发正文，随后同一轮内补齐四张图。
-        self.assertEqual(self._sent(), [["Plain"]] * 4 + [["Image"]] * 4)
+            self.assertFalse(asyncio.run(self.plugin._push_check()))
+        # 下载层已用完 retry_count 次，轮内不再叠加一轮下载（否则会有第 5 次请求）。
+        self.assertEqual(len(attempts), self.plugin.retry_count + 1)
+        self.assertEqual(self._sent(), [["Plain"]] * 4)
         self.assertEqual(
-            self.store["pushed_by_session"], dict.fromkeys("abcd", LINK)
+            self.store["pushed_by_session"],
+            {umo: {"link": LINK, "media_sent": False} for umo in "abcd"},
         )
 
     def test_download_failure_is_recovered_for_all_sessions(self):

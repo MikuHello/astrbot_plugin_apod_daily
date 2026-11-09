@@ -130,12 +130,6 @@ def _safe_exc_text(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {_URL_IN_TEXT_PATTERN.sub('<url>', str(exc))}"
 
 
-# 媒体预热结果标记：_MEDIA_AUTO = 未预热，交给组链函数自行本地化；
-# None = 下载失败（本轮不发媒体）；空串 = 无需本地文件（视频直链）；
-# 其它字符串 = 已本地化的缓存路径。
-_MEDIA_AUTO = object()
-
-
 class MediaPlan(NamedTuple):
     """本期媒体的发法：send=是否发送媒体，localize=需要本地缓存的 URL，url=原始地址。
 
@@ -145,6 +139,26 @@ class MediaPlan(NamedTuple):
     send: bool
     localize: str
     url: str
+
+
+class LocalImage(NamedTuple):
+    """一次图片本地化的结果：path 为空表示没有可用的本地文件。"""
+
+    path: Optional[str] = None
+    # True = 4xx 这类重试无意义的失败，本轮不必再请求同一地址。
+    fatal: bool = False
+
+
+class MediaReady(NamedTuple):
+    """一次媒体预热的结果，由推送路径一次下载、多会话共享。
+
+    ok=False 表示本轮没有可发的媒体（下载失败/本就无媒体）；
+    path 为空表示无需本地文件（视频直链）；fatal 含义同 LocalImage。
+    """
+
+    ok: bool
+    path: str = ""
+    fatal: bool = False
 
 
 class ChainSendReport(NamedTuple):
@@ -2317,22 +2331,20 @@ class APOD(Star):
                 "已随新一期覆盖，不再补发。"
             )
         # 媒体预热放在会话循环外：整期只下载一次，所有会话共享结果。
-        # 下载失败时 media_path=None，本轮只发正文，检查点记 media_sent=False，
+        # 下载失败时 ok=False，本轮只发正文，检查点记 media_sent=False，
         # 下一轮再补媒体链（不再让平台二次下载后把整期记成已送达）。
-        media_path: Any = _MEDIA_AUTO
+        media: Optional[MediaReady] = None
         if media_expected and any(
             not self._checkpoint_media_sent(pushed.get(umo), link) for umo in pending
         ):
-            media_path = await self._prewarm_media(apod_data)
+            media = await self._prewarm_media(apod_data)
 
         async def build_chains(
             need_text: bool, need_media: bool
         ) -> list[MessageChain]:
             """按本轮缺的内容组链：只缺媒体时不重发正文，只缺正文时不再碰媒体。"""
             if need_media and not need_text:
-                media_chain = await self._build_media_chain(
-                    apod_data, media_path=media_path
-                )
+                media_chain = await self._build_media_chain(apod_data, media=media)
                 return [media_chain] if media_chain.chain else []
             if not need_media:
                 text = self._build_text_chain(
@@ -2344,7 +2356,7 @@ class APOD(Star):
                 title_zh,
                 explanation_zh,
                 tomorrow_zh,
-                media_path=media_path,
+                media=media,
             )
 
         text_needed = [
@@ -2416,7 +2428,7 @@ class APOD(Star):
             remaining = [umo for umo in pending if pushed.get(umo) != link]
             if not remaining or not media_expected:
                 break
-            # 只有“只剩缺图”才值得秒级重试：正文缺失一律交给外层长节拍，
+            # 只有“只剩缺图”才值得秒级重试：正文缺失一律交给 6 分钟后的补试，
             # 避免在几秒内重复发一整期正文。
             if not all(
                 self._checkpoint_text_sent(pushed.get(umo), link) for umo in remaining
@@ -2424,14 +2436,16 @@ class APOD(Star):
                 break
             if attempt >= self.retry_count:
                 break
+            if media is None or not media.ok:
+                # 媒体没下载下来：下载层已经用尽 retry_count，轮内再请求只是
+                # 把同一个失败地址（尤其 4xx）反复刷进日志。
+                break
             delay = _retry_delay(attempt, jitter=True)
             logger.warning(
                 f"APOD 有 {len(remaining)} 个会话缺图，{delay:.1f} 秒后补发"
                 f"（{attempt + 1}/{self.retry_count}）。"
             )
             await asyncio.sleep(delay)
-            # 重新预热：上次下载失败就再下一次，成功过则直接命中本地文件。
-            media_path = await self._prewarm_media(apod_data)
             work = remaining
 
         def text_ok(umo: str) -> bool:
@@ -2561,6 +2575,12 @@ class APOD(Star):
             timeout=self.timeout,
         )
 
+    @classmethod
+    def _is_fatal_download_error(cls, exc: BaseException) -> bool:
+        """4xx（限流/超时除外）属于重试无意义的失败，本轮不必再请求同一地址。"""
+        status = cls._download_http_status(exc)
+        return status is not None and _is_fatal_client_status(status)
+
     @staticmethod
     def _download_http_status(exc: BaseException) -> Optional[int]:
         """从下载异常里取出 HTTP 状态码（AstrBot 的 DownloadFileHTTPError 只带文本）。"""
@@ -2584,9 +2604,7 @@ class APOD(Star):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                status = self._download_http_status(exc)
-                fatal = status is not None and _is_fatal_client_status(status)
-                if fatal or attempt >= self.retry_count:
+                if self._is_fatal_download_error(exc) or attempt >= self.retry_count:
                     raise
                 delay = _retry_delay(attempt, jitter=True)
                 logger.warning(
@@ -2595,14 +2613,15 @@ class APOD(Star):
                 )
                 await asyncio.sleep(delay)
 
-    async def _localize_image(self, url: str) -> Optional[str]:
-        """按需把图片下载到本地缓存并返回本地路径；关闭或最终失败时返回 None。
+    async def _localize_image(self, url: str) -> LocalImage:
+        """按需把图片下载到本地缓存；返回 LocalImage（path 为空即不可用）。
 
         下载走 AstrBot 的 download_file（自带 trust_env=True），失败按
-        retry_count 重试并退避；最终失败一律打 WARN，不静默降级。
+        retry_count 重试并退避；最终失败一律打 WARN，不静默降级，
+        并把“重试无意义”（4xx）与“暂时失败”区分给调用方。
         """
         if not self.cache_images or not url:
-            return None
+            return LocalImage()
         path = self._image_cache_path(url)
         epoch = self._cache_epoch
         if os.path.exists(path):
@@ -2613,9 +2632,9 @@ class APOD(Star):
                 pass
             if epoch != self._cache_epoch:
                 # 期间发生过清理：不登记索引，直接用本地文件。
-                return path
+                return LocalImage(path)
             await self._touch_image_cache(path)
-            return path
+            return LocalImage(path)
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             # 唯一临时名：同一 URL 并发下载不会互写同一个 .part。
@@ -2624,7 +2643,7 @@ class APOD(Star):
                 await self._download_image_with_retry(url, tmp_path)
                 if epoch != self._cache_epoch:
                     # 下载期间发生了清理：丢弃临时文件，绝不覆盖目标路径。
-                    return None
+                    return LocalImage()
                 os.replace(tmp_path, path)
             finally:
                 # CancelledError 不走 except Exception；统一在 finally 清理临时文件。
@@ -2634,12 +2653,12 @@ class APOD(Star):
                     pass
             if epoch != self._cache_epoch:
                 # 期间发生过清理：不登记索引，直接用本地文件。
-                return path
+                return LocalImage(path)
             await self._touch_image_cache(path)
-            return path
+            return LocalImage(path)
         except Exception as exc:
             logger.warning(f"图片缓存失败（阶段=下载）：{_safe_exc_text(exc)}")
-            return None
+            return LocalImage(fatal=self._is_fatal_download_error(exc))
 
     def _split_media(self, media_chain: MessageChain) -> bool:
         """媒体与正文是否分两条消息：图片跟随 is_divided，视频恒拆。
@@ -2674,46 +2693,45 @@ class APOD(Star):
             else MediaPlan(False, "", url)
         )
 
-    async def _prewarm_media(self, apod_data: Dict[str, Any]) -> Any:
-        """整期只下载一次媒体，返回交给 _build_apod_chains 的 media_path。
+    async def _prewarm_media(self, apod_data: Dict[str, Any]) -> Optional[MediaReady]:
+        """整期只下载一次媒体，返回预热结果（None = 未预热，组链时按老路本地化）。
 
-        关闭图片缓存时不预热（返回 _MEDIA_AUTO），由组链函数回退远端 URL；
-        视频直链无需本地文件（返回空串）；下载失败返回 None（本轮不发媒体）。
+        关闭图片缓存时不预热，交给 _build_media_chain 回退远端 URL；
+        视频直链无需本地文件；下载失败返回 ok=False（本轮不发媒体）。
         """
         if not self.cache_images:
-            return _MEDIA_AUTO
+            return None
         plan = self._media_plan(apod_data)
         if not plan.send:
-            return None
+            return MediaReady(ok=False)
         if not plan.localize:
-            return ""
-        return await self._localize_image(plan.localize)
+            return MediaReady(ok=True)
+        local = await self._localize_image(plan.localize)
+        return MediaReady(ok=bool(local.path), path=local.path or "", fatal=local.fatal)
 
     async def _build_media_chain(
-        self, apod_data: Dict[str, Any], media_path: Any = _MEDIA_AUTO
+        self, apod_data: Dict[str, Any], media: Optional[MediaReady] = None
     ) -> MessageChain:
         """只含媒体组件的消息链；未开启发送媒体或无可用媒体时为空链。
 
-        media_path 决定媒体来源：
-          _MEDIA_AUTO（默认）= 本函数自行本地化，失败回退远端 URL
-              （指令/工具路径保持旧行为）；
-          None = 调用方预热失败，本轮不构造 Image，避免平台二次下载后再报错；
-          空串 = 无需本地文件（视频直链）；其它字符串 = 本地缓存路径。
+        media=None 表示调用方没有预热（指令/工具路径）：自行本地化，失败
+        回退远端 URL。传入 MediaReady 时按预热结果组链，ok=False 就不构造
+        Image，避免平台二次下载后再报错。
         """
         plan = self._media_plan(apod_data)
         if not plan.send:
             return MessageChain(chain=[])
         if not plan.localize:
             return MessageChain(chain=[Comp.Video.fromURL(plan.url)])
-        if media_path is _MEDIA_AUTO:
-            local_path = await self._localize_image(plan.localize)
-            if local_path:
-                return MessageChain(chain=[Comp.Image.fromFileSystem(local_path)])
+        if media is None:
+            local = await self._localize_image(plan.localize)
+            if local.path:
+                return MessageChain(chain=[Comp.Image.fromFileSystem(local.path)])
             return MessageChain(chain=[Comp.Image.fromURL(plan.localize)])
-        if media_path is None or not os.path.exists(str(media_path)):
+        if not media.ok or not media.path or not os.path.exists(media.path):
             # 预热失败或文件已被淘汰：本轮只发正文，下轮再补媒体。
             return MessageChain(chain=[])
-        return MessageChain(chain=[Comp.Image.fromFileSystem(str(media_path))])
+        return MessageChain(chain=[Comp.Image.fromFileSystem(media.path)])
 
     def _build_text_chain(
         self,
@@ -2740,14 +2758,14 @@ class APOD(Star):
         explanation_zh: Optional[str],
         tomorrow_zh: Optional[str] = None,
         display_name: str = PLUGIN_DISPLAY_NAME,
-        media_path: Any = _MEDIA_AUTO,
+        media: Optional[MediaReady] = None,
     ) -> list[MessageChain]:
         """按 _split_media 返回要发送的消息链：1 条=合并，2 条=媒体+正文。
 
-        media_path 默认 _MEDIA_AUTO（自行本地化），推送路径传入预热结果，
-        一次下载供所有会话共享。
+        media 默认 None（自行本地化）；推送路径传入预热结果，一次下载供所有
+        会话共享。
         """
-        media_chain = await self._build_media_chain(apod_data, media_path=media_path)
+        media_chain = await self._build_media_chain(apod_data, media=media)
         text_chain = self._build_text_chain(
             apod_data,
             title_zh,
