@@ -107,10 +107,17 @@ APOD_PREFETCH_RETRY_ATTEMPTS = 3
 IMAGE_CACHE_MIN_AGE_SECONDS = 120
 # 单条消息发送超时：视频上传慢，给足时间，但不能无限挂住推送循环。
 SEND_TIMEOUT_SECONDS = 60
-# 单条消息的发送结果：成功 / 明确失败（没发出去）/ 结果未知（超时，平台可能已收到）。
+# 单条消息的发送结果：成功 / 明确失败（能确认没提交）/ 结果未知（可能已送达）。
 SEND_OK = "ok"
 SEND_FAILED = "failed"
 SEND_UNKNOWN = "unknown"
+# 能确认“还没提交给平台”的失败才值得自动补发：连不上、URL 无效、拒绝连接。
+# 其余（超时、提交后读响应失败、未知异常）都可能已经送达，重发就是刷屏。
+_PRE_SUBMIT_ERRORS = (
+    aiohttp.ClientConnectorError,
+    aiohttp.InvalidURL,
+    ConnectionRefusedError,
+)
 # 投递检查点状态（每个会话一条）：
 #   done          = 整期送达（旧格式直接存链接字符串）
 #   text_pending  = 媒体已送达、正文待补
@@ -772,6 +779,11 @@ class APOD(Star):
             partial(self.context.send_message, event.unified_msg_origin),
             label=f"{label}发送",
         )
+        if sent.unknown:
+            return (
+                f"{label}发送结果未知（可能已送达，已停止重发）："
+                "请以当前会话的实际消息为准。"
+            )
         if not sent.text_sent:
             return f"{label}发送失败：请检查平台连接或发送日志后重试。"
         title = (title_zh or apod_data.get("title") or "").strip()
@@ -2410,6 +2422,7 @@ class APOD(Star):
         # 一轮 = 把所有待发会话试一遍；网络抖动是秒级现象，只缺图时本轮内
         # 立即转向下一轮（轮数与退避沿用 retry_count / _retry_delay），
         # 不必等外层那次 6 分钟的补试。
+        unknown_sessions: list[str] = []
         work = list(pending)
         for attempt in range(self.retry_count + 1):
             for umo in work:
@@ -2429,9 +2442,11 @@ class APOD(Star):
                         f"APOD 推送到 {umo}",
                     )
                     if report.unknown:
-                        # 超时未拿到结果：平台可能已收到，重发就是重复图片/重复文案。
+                        # 超时/提交后断连：平台可能已收到，重发就是重复图片/文案。
+                        unknown_sessions.append(umo)
                         logger.warning(
-                            f"APOD 推送到 {umo} 的发送结果未知（已按送达处理，不再重发）。"
+                            f"APOD 推送到 {umo} 的发送结果未知："
+                            "不再重发，请以群内消息为准。"
                         )
                     done_text = done_text or report.text_sent
                     done_media = done_media or report.media_sent
@@ -2485,17 +2500,32 @@ class APOD(Star):
             await asyncio.sleep(delay)
             work = remaining
 
-        text_delivered = sum(1 for umo in text_needed if text_ok(umo))
-        media_delivered = sum(1 for umo in media_needed if media_ok(umo))
-        delivered = sum(1 for umo in pending if state_of(umo) == CHECKPOINT_DONE)
+        unknown = set(unknown_sessions)
+        text_delivered = sum(
+            1 for umo in text_needed if text_ok(umo) and umo not in unknown
+        )
+        media_delivered = sum(
+            1 for umo in media_needed if media_ok(umo) and umo not in unknown
+        )
+        delivered = sum(
+            1
+            for umo in pending
+            if state_of(umo) == CHECKPOINT_DONE and umo not in unknown
+        )
         await self.put_cache(
             "last_pushed_apod", {"date": date, "link": link, "delivered": True}
         )
-        missed = len(pending) - delivered
+        missed = len(pending) - delivered - len(unknown)
+        notes = []
+        if missed:
+            notes.append(f"{missed} 个会话待补发")
+        if unknown:
+            # 结果未知按“可能已送达”记账、不重发，但汇总不能算成已送达。
+            notes.append(f"{len(unknown)} 个会话发送结果未知（未重发）")
         logger.info(
             f"APOD 本次推送 {date}：正文 {text_delivered}/{len(text_needed)}、"
             f"媒体 {media_delivered}/{len(media_needed)}"
-            + (f"，{missed} 个会话待补发。" if missed else "。")
+            + ("，" + "、".join(notes) + "。" if notes else "。")
         )
         return missed == 0
 
@@ -2821,17 +2851,26 @@ class APOD(Star):
     ) -> str:
         """发一条链，返回 SEND_OK / SEND_FAILED / SEND_UNKNOWN。
 
-        超时归为“未知”：平台可能已经收下（只是回执没等到），重发就是重复消息；
-        其它异常与接口返回 False 算明确失败，可以安全重试。
+        只有能确认未提交的失败（连不上/URL 无效）和接口明确返回 False 才允许
+        自动补发；超时与提交后的异常（如读响应体时断连）都按“结果未知”处理，
+        不重发——QQ 官方适配器先上传再提交，这两种情况平台可能已经收到。
         """
         try:
             sent = await asyncio.wait_for(send(chain), timeout=SEND_TIMEOUT_SECONDS)
+        except _PRE_SUBMIT_ERRORS as exc:
+            logger.error(
+                f"{label}失败（阶段={stage}，未提交）：{_safe_exc_text(exc)}"
+            )
+            return SEND_FAILED
         except asyncio.TimeoutError:
-            logger.error(f"{label}超时未拿到结果（阶段={stage}）：按已送达处理。")
+            logger.error(f"{label}超时（阶段={stage}）：结果未知，不自动重发。")
             return SEND_UNKNOWN
         except Exception as exc:
-            logger.error(f"{label}失败（阶段={stage}）：{_safe_exc_text(exc)}")
-            return SEND_FAILED
+            logger.error(
+                f"{label}异常（阶段={stage}）：结果未知，不自动重发。"
+                f"{_safe_exc_text(exc)}"
+            )
+            return SEND_UNKNOWN
         if sent is False:
             logger.error(f"{label}失败（阶段={stage}）：发送接口返回 False。")
             return SEND_FAILED

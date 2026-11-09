@@ -312,12 +312,30 @@ def _install_astrbot_stubs():
     class ClientError(Exception):
         pass
 
+    class ClientConnectorError(ClientError):
+        """“连不上”属于可确认未提交的失败（与 aiohttp 同名）。"""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__("Cannot connect to host")
+
+    class ClientPayloadError(ClientError):
+        """已提交、读响应体时断连（结果未知）。"""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__("Response payload is not completed")
+
+    class InvalidURL(ClientError):
+        pass
+
     class ClientSession:
         def __init__(self, *args, **kwargs):
             pass
 
     aiohttp.ClientTimeout = ClientTimeout
     aiohttp.ClientError = ClientError
+    aiohttp.ClientConnectorError = ClientConnectorError
+    aiohttp.ClientPayloadError = ClientPayloadError
+    aiohttp.InvalidURL = InvalidURL
     aiohttp.ClientSession = ClientSession
     return comp
 
@@ -362,6 +380,16 @@ class _FakeConfig(dict):
 
     async def save_config_async(self):
         self.saved += 1
+
+
+def _pre_submit_error():
+    """能确认没提交的发送失败（连不上）：只有这种才允许自动补发。"""
+    return apod_main.aiohttp.ClientConnectorError()
+
+
+def _post_submit_error():
+    """已提交、读响应时断连：结果未知，不得自动重发。"""
+    return apod_main.aiohttp.ClientPayloadError()
 
 
 def _make_plugin(config=None):
@@ -832,8 +860,9 @@ class RenderingTests(unittest.TestCase):
         cases = [
             ("merged fallback", [[image, text]], [False, None], (True, False, False),
              [["Image", "Plain"], ["Plain"]]),
-            ("fallback failure", [[image, text]], [RuntimeError("media"), False],
-             (False, False, False), [["Image", "Plain"], ["Plain"]]),
+            ("fallback failure", [[image, text]],
+             [_pre_submit_error(), False], (False, False, False),
+             [["Image", "Plain"], ["Plain"]]),
             ("split media failure", [[image], [text]], [False, None],
              (True, False, False), [["Image"], ["Plain"]]),
             ("split text failure", [[image], [text]], [None, False],
@@ -1576,7 +1605,7 @@ class ReplyPathVariableTests(unittest.TestCase):
 
     def test_failed_media_falls_back_to_quoted_text_and_stops_event(self):
         self.plugin.quote_reply = True
-        self.event.send = AsyncMock(side_effect=[RuntimeError("media failed"), None])
+        self.event.send = AsyncMock(side_effect=[_pre_submit_error(), None])
         self._reply(IMAGE_ARTICLE, is_divided=False)
         calls = self.event.send.await_args_list
         self.assertEqual([
@@ -1598,7 +1627,7 @@ class ReplyPathVariableTests(unittest.TestCase):
         self.assertIn("已向当前会话发送", result)
         self.assertEqual([c.args[0] for c in send.await_args_list], ["umo", "umo"])
         self.assertFalse(self.event.sent)
-        send.side_effect = RuntimeError("upload failed")
+        send.side_effect = _pre_submit_error()
         result = asyncio.run(self.plugin._deliver_apod(self.event, data, "今日APOD"))
         self.assertIn("发送失败", result)
         self.assertNotIn("未找到可用的消息平台", result)
@@ -2121,11 +2150,12 @@ class MediaDownloadRetryTests(unittest.TestCase):
         chain = apod_main.MessageChain(chain=[_COMP.Plain("body")])
 
         async def leaky_send(_chain):
-            raise RuntimeError(f"upload failed for {secret}")
+            # 提交后断连：异常文本里带着签名 URL。
+            raise RuntimeError(f"response payload error for {secret}")
 
         with self.assertLogs("apod-test", level="ERROR") as logs:
             report = asyncio.run(self.plugin._send_chains([chain], leaky_send))
-        self.assertFalse(report.text_sent)
+        self.assertTrue(report.unknown)
         text = chr(10).join(logs.output)
         self.assertNotIn("TEST_SIGNATURE", text)
         self.assertNotIn("today's.png", text)
@@ -2246,6 +2276,60 @@ class PushMediaPrewarmTests(unittest.TestCase):
         self.assertEqual(self.store["pushed_by_session"], {"a": LINK})
         self.assertTrue(any("结果未知" in line for line in logs.output))
 
+    def test_post_submit_failure_is_not_retried(self):
+        async def ok(url, dest):
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        sent = []
+
+        async def submitted_then_broken(umo, chain):
+            kinds = [type(item).__name__ for item in chain.chain]
+            sent.append(kinds)
+            # 消息已经提交，读响应体时断连：不能当成“没发出去”。
+            raise _post_submit_error()
+
+        self.plugin.context = SimpleNamespace(send_message=submitted_then_broken)
+        with patch.object(self.plugin, "_download_image", ok),              patch.object(apod_main.asyncio, "sleep", AsyncMock()),              self.assertLogs("apod-test", level="WARNING"):
+            self.assertTrue(asyncio.run(self.plugin._push_check()))
+        # 不重发：整期只尝试了一次，不再降级正文、也不补图。
+        self.assertEqual(sent, [["Image", "Plain"]])
+        self.assertEqual(self.store["pushed_by_session"], {"a": LINK})
+
+    def test_summary_does_not_report_unknown_as_delivered(self):
+        async def ok(url, dest):
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        async def timeout_on_media(umo, chain):
+            if "Image" in [type(item).__name__ for item in chain.chain]:
+                raise asyncio.TimeoutError()
+            return None
+
+        self.plugin.context = SimpleNamespace(send_message=timeout_on_media)
+        with patch.object(self.plugin, "_download_image", ok),              self.assertLogs("apod-test", level="INFO") as logs:
+            asyncio.run(self.plugin._push_check())
+        summary = [line for line in logs.output if "本次推送" in line]
+        self.assertEqual(len(summary), 1)
+        # 结果未知不能算成“已送达”。
+        self.assertIn("正文 0/1、媒体 0/1", summary[0])
+        self.assertIn("发送结果未知", summary[0])
+
+    def test_tool_reports_unknown_delivery(self):
+        # 关缓存避免工具路径真的去下载（本用例只关心“结果未知”怎么回报）。
+        self.plugin.cache_images = False
+        data = self.plugin._build_apod_data("APOD: t", LINK, IMAGE_ARTICLE)
+        event = SimpleNamespace(unified_msg_origin="umo")
+
+        async def timeout_send(_umo, _chain):
+            raise asyncio.TimeoutError()
+
+        self.plugin.context = SimpleNamespace(send_message=timeout_send)
+        with self.assertLogs("apod-test", level="ERROR"):
+            result = asyncio.run(self.plugin._deliver_apod(event, data, "今日APOD"))
+        self.assertIn("结果未知", result)
+        self.assertNotIn("已向当前会话发送", result)
+
     def test_media_pending_session_only_resends_media(self):
         self.store["pushed_by_session"] = {
             "a": {"link": LINK, "media_sent": False}
@@ -2319,7 +2403,7 @@ class PushMediaPrewarmTests(unittest.TestCase):
             sleeps.append(seconds)
 
         # 事故现场：合并链上传失败 → 降级正文；下一轮只补图，不重发正文。
-        self.send.side_effect = [RuntimeError("upload reset"), None, None]
+        self.send.side_effect = [_pre_submit_error(), None, None]
         with patch.object(self.plugin, "_download_image", ok), \
              patch.object(apod_main.asyncio, "sleep", fake_sleep):
             self.assertTrue(asyncio.run(self.plugin._push_check()))
@@ -2340,8 +2424,8 @@ class PushMediaPrewarmTests(unittest.TestCase):
             pass
 
         # 第一次成功（合并链上传失败、正文降级），之后每次只补图都失败。
-        outcomes = [RuntimeError("upload reset"), None] + [
-            RuntimeError("upload reset")
+        outcomes = [_pre_submit_error(), None] + [
+            _pre_submit_error()
         ] * self.plugin.retry_count
         self.send.side_effect = outcomes
         with patch.object(self.plugin, "_download_image", ok), \
@@ -2364,7 +2448,7 @@ class PushMediaPrewarmTests(unittest.TestCase):
                 handle.write(b"img")
 
         self.plugin.retry_count = 0
-        self.send.side_effect = [RuntimeError("upload reset"), None]
+        self.send.side_effect = [_pre_submit_error(), None]
         with patch.object(self.plugin, "_download_image", ok):
             self.assertFalse(asyncio.run(self.plugin._push_check()))
         self.assertEqual(self._sent(), [["Image", "Plain"], ["Plain"]])
@@ -2454,7 +2538,7 @@ class PushMediaPrewarmTests(unittest.TestCase):
 
     def test_media_off_text_failure_keeps_no_checkpoint(self):
         self.plugin.send_media = False
-        self.send.side_effect = RuntimeError("text failed")
+        self.send.side_effect = _pre_submit_error()
         self.assertFalse(asyncio.run(self.plugin._push_check()))
         # 不能写 media_sent=True：重新开启媒体后会被当成“媒体已送达”而跳过补图。
         self.assertNotIn("pushed_by_session", self.store)
@@ -2470,7 +2554,7 @@ class PushMediaPrewarmTests(unittest.TestCase):
             kinds = [type(item).__name__ for item in chain.chain]
             sent.append(kinds)
             if kinds == ["Image", "Plain"]:
-                raise RuntimeError("upload failed")
+                raise _pre_submit_error()
             if kinds == ["Plain"]:
                 # 降级正文被平台接收，只是回执超时。
                 raise asyncio.TimeoutError()
@@ -2493,7 +2577,7 @@ class PushMediaPrewarmTests(unittest.TestCase):
             kinds = [type(item).__name__ for item in chain.chain]
             sent.append(kinds)
             if kinds == ["Image", "Plain"]:
-                raise RuntimeError("upload failed")
+                raise _pre_submit_error()
             return None
 
         self.plugin.context = SimpleNamespace(send_message=send)
@@ -2683,7 +2767,7 @@ class PushPerSessionChainTests(unittest.TestCase):
         self.assertEqual(self.store["pushed_by_session"], dict.fromkeys("abcd", LINK))
 
     def test_partial_delivery_retries_only_text_without_building_media(self):
-        self.send.side_effect = [None, RuntimeError("text failed"), False, None]
+        self.send.side_effect = [None, _pre_submit_error(), False, None]
         self.assertFalse(asyncio.run(self.plugin._push_check()))
         partial = {"a": {"link": LINK, "media_sent": True}}
         self.assertEqual(self.store["pushed_by_session"], partial)
