@@ -2359,6 +2359,42 @@ class PushLoopTests(unittest.TestCase):
             [("sleep", 3600.0), ("push", None), ("sleep", 3600.0)],
         )
 
+    def test_failed_push_retries_once_then_gives_up(self):
+        plugin = _make_plugin(_FakeConfig({"push": {"enabled": True}}))
+        plugin.push_mode = "scheduled"
+        plugin.push_time = "01:00"
+        plugin._seconds_until = lambda hhmm: 3600.0
+        events = []
+
+        async def fake_sleep(seconds):
+            events.append(("sleep", seconds))
+            if len([e for e in events if e[0] == "sleep"]) >= 3:
+                raise asyncio.CancelledError()
+
+        async def fake_check():
+            events.append(("push", None))
+            return False
+
+        plugin._push_check = fake_check
+        with patch.object(apod_main.asyncio, "sleep", fake_sleep), \
+             self.assertLogs("apod-test", level="WARNING") as logs:
+            asyncio.run(plugin._push_loop())
+        # 到点 → 失败 → 6 分钟后只补试一次 → 放弃 → 等下一次到点。
+        self.assertEqual(
+            events[:5],
+            [
+                ("sleep", 3600.0),
+                ("push", None),
+                ("sleep", 360.0),
+                ("push", None),
+                ("sleep", 3600.0),
+            ],
+        )
+        text = "\n".join(logs.output)
+        self.assertIn("6 分钟后重试一次", text)
+        self.assertIn("已放弃", text)
+        self.assertIn("/apod 今日", text)
+
 
 class CheckpointStateTests(unittest.TestCase):
     """检查点只认显式的 True/False，缺失或 null 一律当“未知”。"""

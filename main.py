@@ -107,6 +107,9 @@ APOD_PREFETCH_RETRY_ATTEMPTS = 3
 IMAGE_CACHE_MIN_AGE_SECONDS = 120
 # 单条消息发送超时：视频上传慢，给足时间，但不能无限挂住推送循环。
 SEND_TIMEOUT_SECONDS = 60
+# 定时推送未完成时只补试一次（日更任务丢了就永久没有）；6 分钟足够躲过
+# 夜间常见抖动，又不会在凌晨反复打扰。
+PUSH_RETRY_DELAY_SECONDS = 360
 # 日志脱敏：部分 aiohttp 异常文本里带完整 URL（query 上可能有签名）。
 _URL_IN_TEXT_PATTERN = re.compile(r"https?://[^\s'\"<>()]+")
 
@@ -2200,16 +2203,21 @@ class APOD(Star):
         )
         await self.config.save_config_async()
 
+    async def _run_push_check(self, label: str) -> bool:
+        """跑一次推送检查；异常按失败处理，不让单次故障打死推送循环。"""
+        try:
+            return await self._push_check()
+        except Exception as exc:
+            logger.error(f"{label}出错：{exc}")
+            return False
+
     async def _push_loop(self) -> None:
         try:
             if self.push_mode == "upstream":
                 # 上游推送：按固定间隔巡检 feed，发现新一期立刻推送。
                 while True:
                     await asyncio.sleep(self.push_interval_minutes * 60)
-                    try:
-                        await self._push_check()
-                    except Exception as exc:
-                        logger.error(f"APOD 推送巡检出错：{exc}")
+                    await self._run_push_check("APOD 推送巡检")
             else:
                 # 定时推送：每天在 push_time 推送最新一期（已推送的不重复）。
                 while True:
@@ -2218,20 +2226,18 @@ class APOD(Star):
                         f"APOD 定时推送：距下次推送约 {delay / 3600:.1f} 小时。"
                     )
                     await asyncio.sleep(delay)
-                    # 这里是“整期抢救”窗口（约 50 分钟），只兜两类慢故障：拉取不到、
-                    # 正文没送达；秒级的缺图补发已在 _push_check 内部完成。
-                    for attempt in range(6):
-                        try:
-                            ok = await self._push_check()
-                        except Exception as exc:
-                            logger.error(f"APOD 定时推送出错：{exc}")
-                            ok = False
-                        if ok:
-                            break
-                        logger.warning(
-                            f"APOD 定时推送本轮未完成，10 分钟后重试（{attempt + 1}/6）。"
+                    # 失败只补试一次：窗口短到不需要配置，也不会在凌晨反复试探。
+                    if await self._run_push_check("APOD 定时推送"):
+                        continue
+                    logger.warning(
+                        "APOD 定时推送未完成，"
+                        f"{PUSH_RETRY_DELAY_SECONDS // 60} 分钟后重试一次。"
+                    )
+                    await asyncio.sleep(PUSH_RETRY_DELAY_SECONDS)
+                    if not await self._run_push_check("APOD 定时推送"):
+                        logger.error(
+                            "APOD 今天的推送已放弃，可执行 /apod 今日 手动补发。"
                         )
-                        await asyncio.sleep(600)
         except asyncio.CancelledError:
             pass
 
