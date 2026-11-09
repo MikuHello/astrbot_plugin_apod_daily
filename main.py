@@ -107,6 +107,26 @@ APOD_PREFETCH_RETRY_ATTEMPTS = 3
 IMAGE_CACHE_MIN_AGE_SECONDS = 120
 # 单条消息发送超时：视频上传慢，给足时间，但不能无限挂住推送循环。
 SEND_TIMEOUT_SECONDS = 60
+# 日志脱敏：部分 aiohttp 异常文本里带完整 URL（query 上可能有签名）。
+_URL_IN_TEXT_PATTERN = re.compile(r"https?://[^\s'\"<>()]+")
+
+
+def _is_fatal_client_status(status: int) -> bool:
+    """4xx 里只有限流 429 与超时 408 值得重试，其余客户端错误重试无意义。"""
+    return 400 <= status < 500 and status not in (408, 429)
+
+
+def _retry_delay(attempt: int, jitter: bool = False) -> float:
+    """指数退避，封顶 4 秒；图片下载额外加抖动，避免多会话同时重连。"""
+    delay = min(2**attempt, 4)
+    return delay + random.uniform(0, 1) if jitter else delay
+
+
+def _safe_exc_text(exc: BaseException) -> str:
+    """异常文本入日志前脱敏：保留异常类型与内容，只把 URL 换成占位符。"""
+    return f"{type(exc).__name__}: {_URL_IN_TEXT_PATTERN.sub('<url>', str(exc))}"
+
+
 # 媒体预热结果标记：_MEDIA_AUTO = 未预热，交给组链函数自行本地化；
 # None = 下载失败（本轮不发媒体）；空串 = 无需本地文件（视频直链）；
 # 其它字符串 = 已本地化的缓存路径。
@@ -1752,7 +1772,7 @@ class APOD(Star):
                     if response.status != 200:
                         logger.error(f"获取{label}失败：状态码={response.status}")
                         self.last_apod_error = f"{label}暂时不可用，请稍后重试。"
-                        if 400 <= response.status < 500 and response.status not in (408, 429):
+                        if _is_fatal_client_status(response.status):
                             # 客户端错误重试无意义，直接结束本次获取。
                             break
                     else:
@@ -1765,7 +1785,7 @@ class APOD(Star):
                 self.last_apod_error = f"连接{label}失败，请稍后重试。"
 
             if attempt < self.retry_count:
-                await asyncio.sleep(min(2**attempt, 4))
+                await asyncio.sleep(_retry_delay(attempt))
         return None
 
     async def _fetch_from_feed(
@@ -2446,7 +2466,12 @@ class APOD(Star):
         """
         from astrbot.core.utils.io import download_file
 
-        await asyncio.wait_for(download_file(url, dest), timeout=self.timeout)
+        # allow_insecure_ssl_fallback=False：AstrBot 默认会在证书失败时改用
+        # CERT_NONE 且不跟随 http_proxy 的裸会话重试，那比原实现放宽了证书校验。
+        await asyncio.wait_for(
+            download_file(url, dest, allow_insecure_ssl_fallback=False),
+            timeout=self.timeout,
+        )
 
     @staticmethod
     def _download_http_status(exc: BaseException) -> Optional[int]:
@@ -2472,17 +2497,13 @@ class APOD(Star):
                 raise
             except Exception as exc:
                 status = self._download_http_status(exc)
-                fatal = (
-                    status is not None
-                    and 400 <= status < 500
-                    and status not in (408, 429)
-                )
+                fatal = status is not None and _is_fatal_client_status(status)
                 if fatal or attempt >= self.retry_count:
                     raise
-                delay = min(2**attempt, 4) + random.uniform(0, 1)
+                delay = _retry_delay(attempt, jitter=True)
                 logger.warning(
                     f"图片下载失败（阶段=下载，第 {attempt + 1}/{self.retry_count} 次），"
-                    f"{delay:.1f} 秒后重试：{exc}"
+                    f"{delay:.1f} 秒后重试：{_safe_exc_text(exc)}"
                 )
                 await asyncio.sleep(delay)
 
@@ -2529,7 +2550,7 @@ class APOD(Star):
             await self._touch_image_cache(path)
             return path
         except Exception as exc:
-            logger.warning(f"图片缓存失败（阶段=下载）：{exc}")
+            logger.warning(f"图片缓存失败（阶段=下载）：{_safe_exc_text(exc)}")
             return None
 
     def _split_media(self, media_chain: MessageChain) -> bool:

@@ -1910,6 +1910,7 @@ class MediaDownloadRetryTests(unittest.TestCase):
     """图片下载边界：走 AstrBot download_file，按 retry_count 退避重试。"""
 
     def setUp(self):
+        import astrbot.core.utils.astrbot_path as astrbot_path
         import astrbot.core.utils.io as io_utils
 
         self.io_utils = io_utils
@@ -1918,6 +1919,25 @@ class MediaDownloadRetryTests(unittest.TestCase):
         self.plugin.retry_count = 3
         self.url = "https://x/retry.jpg"
         self.store = {}
+        # 每个用例独立缓存目录：上一用例写过的文件会让下载直接命中缓存。
+        cache_root = tempfile.mkdtemp(prefix="apod-download-cache-")
+        patcher = patch.object(
+            astrbot_path,
+            "get_astrbot_plugin_data_path",
+            return_value=cache_root,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        async def get_cache(key):
+            return self.store.get(key)
+
+        async def put_cache(key, value):
+            self.store[key] = value
+
+        self.plugin.get_cache = get_cache
+        self.plugin.put_cache = put_cache
+
 
         async def get_cache(key):
             return self.store.get(key)
@@ -2007,6 +2027,43 @@ class MediaDownloadRetryTests(unittest.TestCase):
 
         self.assertIsNone(self._localize(empty, sleeps))
         self.assertEqual(len(calls), 2)
+
+    def test_insecure_ssl_fallback_is_disabled(self):
+        calls, sleeps = [], []
+
+        async def recording(url, dest, *args, **kwargs):
+            calls.append(kwargs)
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        self._localize(recording, sleeps)
+        # AstrBot 默认会在证书失败后改走 CERT_NONE 且不跟随代理的裸会话。
+        self.assertEqual(calls, [{"allow_insecure_ssl_fallback": False}])
+
+    def test_failure_logs_do_not_leak_urls(self):
+        secret = "https://assets.science.nasa.gov/a.jpg?token=SECRET123"
+        calls, sleeps = [], []
+
+        async def leaky(url, dest, *args, **kwargs):
+            calls.append(url)
+            raise RuntimeError(f"cannot fetch {secret}")
+
+        with self.assertLogs("apod-test", level="WARNING") as logs:
+            self.assertIsNone(self._localize(leaky, sleeps))
+        text = "\n".join(logs.output)
+        self.assertNotIn("SECRET123", text)
+        self.assertNotIn(secret, text)
+        self.assertIn("<url>", text)
+        self.assertIn("RuntimeError", text)
+
+    def test_shared_retry_helpers(self):
+        self.assertEqual(
+            [apod_main._retry_delay(attempt) for attempt in range(4)], [1, 2, 4, 4]
+        )
+        self.assertTrue(4 <= apod_main._retry_delay(5, jitter=True) <= 5)
+        fatal = apod_main._is_fatal_client_status
+        self.assertTrue(fatal(400) and fatal(404) and fatal(499))
+        self.assertFalse(fatal(408) or fatal(429) or fatal(200) or fatal(500))
 
 
 class PushMediaPrewarmTests(unittest.TestCase):
