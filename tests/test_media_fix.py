@@ -31,6 +31,9 @@ LINK = (
     "https://science.nasa.gov/image-article/"
     "apod-2026-october-16-chasing-the-international-space-station/"
 )
+OLD_LINK = (
+    "https://science.nasa.gov/image-article/apod-2026-november-06-old/"
+)
 
 VIDEO_ARTICLE = f"""
 <article>
@@ -331,6 +334,25 @@ try:
 except Exception:  # noqa: BLE001 - 本地无 tzdata 时退化为固定 EDT
     _ET = timezone(timedelta(hours=-4))
 apod_main.APOD._et_timezone = staticmethod(lambda: _ET)
+
+
+class _LogCapture(logging.Handler):
+    """收集日志行，供需要断言“什么都没记”的用例使用（assertLogs 做不到）。"""
+
+    def __init__(self):
+        super().__init__()
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+
+def _capture_logs(case):
+    handler = _LogCapture()
+    logger = logging.getLogger("apod-test")
+    logger.addHandler(handler)
+    case.addCleanup(logger.removeHandler, handler)
+    return handler
 
 
 class _FakeConfig(dict):
@@ -2399,12 +2421,67 @@ class PushMediaPrewarmTests(unittest.TestCase):
         # 不能写 media_sent=True：重新开启媒体后会被当成“媒体已送达”而跳过补图。
         self.assertNotIn("pushed_by_session", self.store)
 
-    def test_new_issue_warns_when_pending_media_is_dropped(self):
-        old_link = (
-            "https://science.nasa.gov/image-article/apod-2026-november-06-old/"
+    def test_timed_out_fallback_text_is_not_resent(self):
+        async def ok(url, dest):
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        sent = []
+
+        async def media_fail_then_text_timeout(umo, chain):
+            kinds = [type(item).__name__ for item in chain.chain]
+            sent.append(kinds)
+            if kinds == ["Image", "Plain"]:
+                raise RuntimeError("upload failed")
+            if kinds == ["Plain"]:
+                # 降级正文被平台接收，只是回执超时。
+                raise asyncio.TimeoutError()
+            return None
+
+        self.plugin.context = SimpleNamespace(
+            send_message=media_fail_then_text_timeout
         )
+        with patch.object(self.plugin, "_download_image", ok),              patch.object(apod_main.asyncio, "sleep", AsyncMock()),              self.assertLogs("apod-test", level="WARNING"):
+            self.assertTrue(asyncio.run(self.plugin._push_check()))
+        # 降级正文超时按“可能已送达”处理：本轮只补图，绝不重发正文。
+        self.assertEqual(sent, [["Image", "Plain"], ["Plain"], ["Image"]])
+        self.assertEqual(self.store["pushed_by_session"], {"a": LINK})
+
+    def test_fast_retry_works_without_image_cache(self):
+        self.plugin.cache_images = False
+        sent = []
+
+        async def send(umo, chain):
+            kinds = [type(item).__name__ for item in chain.chain]
+            sent.append(kinds)
+            if kinds == ["Image", "Plain"]:
+                raise RuntimeError("upload failed")
+            return None
+
+        self.plugin.context = SimpleNamespace(send_message=send)
+        with patch.object(apod_main.asyncio, "sleep", AsyncMock()):
+            self.assertTrue(asyncio.run(self.plugin._push_check()))
+        # 关缓存时直接发远端 URL，仍能在本轮补图（media=None 不等于“不可用”）。
+        self.assertEqual(sent, [["Image", "Plain"], ["Plain"], ["Image"]])
+        self.assertEqual(self.store["pushed_by_session"], {"a": LINK})
+
+    def test_delivered_previous_issue_does_not_warn(self):
+        # 上一期整期送达（字符串格式）→ 换刊只是正常发新一期，不是漏发。
+        self.store["pushed_by_session"] = {"a": OLD_LINK}
+
+        async def ok(url, dest):
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        logs = _capture_logs(self)
+        with patch.object(self.plugin, "_download_image", ok):
+            self.assertTrue(asyncio.run(self.plugin._push_check()))
+        self.assertFalse(any("不再补发" in line for line in logs.lines))
+        self.assertEqual(self.store["pushed_by_session"], {"a": LINK})
+
+    def test_new_issue_warns_when_pending_media_is_dropped(self):
         self.store["pushed_by_session"] = {
-            "a": {"link": old_link, "media_sent": False}
+            "a": {"link": OLD_LINK, "media_sent": False}
         }
 
         async def ok(url, dest):

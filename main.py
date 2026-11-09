@@ -2348,7 +2348,10 @@ class APOD(Star):
         stale = []
         for umo in pending:
             state, recorded = self._decode_checkpoint(pushed.get(umo))
-            if state != CHECKPOINT_UNKNOWN and recorded != link:
+            # 上一期已送达（CHECKPOINT_DONE）不算漏发，只是该发新一期了。
+            if state in (CHECKPOINT_TEXT_PENDING, CHECKPOINT_MEDIA_PENDING) and (
+                recorded != link
+            ):
                 stale.append(umo)
         if stale:
             logger.warning(
@@ -2450,9 +2453,10 @@ class APOD(Star):
                 break
             if attempt >= self.retry_count:
                 break
-            if media is None or not media.ok:
+            if media is not None and not media.ok:
                 # 媒体没下载下来：下载层已经用尽 retry_count，轮内再请求只是
                 # 把同一个失败地址（尤其 4xx）反复刷进日志。
+                # media=None 表示没启用图片缓存（直接发远端 URL），仍可轮内补发。
                 break
             delay = _retry_delay(attempt, jitter=True)
             logger.warning(
@@ -2856,7 +2860,11 @@ class APOD(Star):
                 chain=[item for item in chain.chain if isinstance(item, Comp.Plain)]
             )
             if fallback.chain:
-                if await self._send_chain(send, fallback, label) != SEND_OK:
+                outcome = await self._send_chain(send, fallback, label)
+                if outcome == SEND_UNKNOWN:
+                    # 降级正文也可能已经被平台接收：按已送达记账，不再重发一次。
+                    unknown = True
+                elif outcome != SEND_OK:
                     return ChainSendReport(False, media_sent, unknown)
                 text_sent = True
             elif index == len(chains) - 1:
