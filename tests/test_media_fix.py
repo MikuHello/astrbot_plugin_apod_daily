@@ -2505,24 +2505,31 @@ class CheckpointStateTests(unittest.TestCase):
             {"link": self.link},
             {"link": self.link, "media_sent": None},
             {"media_sent": False},
+            "",
+            None,
         ):
             with self.subTest(entry=entry):
-                self.assertFalse(self.plugin._checkpoint_text_sent(entry, self.link))
-                self.assertFalse(self.plugin._checkpoint_media_sent(entry, self.link))
+                self.assertEqual(
+                    self.plugin._decode_checkpoint(entry),
+                    (apod_main.CHECKPOINT_UNKNOWN, ""),
+                )
 
     def test_explicit_states_are_recognised(self):
-        pending_media = {"link": self.link, "media_sent": False}
-        pending_text = {"link": self.link, "media_sent": True}
-        self.assertTrue(self.plugin._checkpoint_text_sent(pending_media, self.link))
-        self.assertFalse(self.plugin._checkpoint_media_sent(pending_media, self.link))
-        self.assertTrue(self.plugin._checkpoint_media_sent(pending_text, self.link))
-        self.assertFalse(self.plugin._checkpoint_text_sent(pending_text, self.link))
+        pending_media = self.plugin._encode_checkpoint(self.link, media_sent=False)
+        pending_text = self.plugin._encode_checkpoint(self.link, media_sent=True)
         self.assertEqual(
-            self.plugin._checkpoint_pending_media_link(pending_media), self.link
+            self.plugin._decode_checkpoint(pending_media),
+            (apod_main.CHECKPOINT_MEDIA_PENDING, self.link),
         )
-        self.assertEqual(self.plugin._checkpoint_pending_media_link(pending_text), "")
-        # 旧格式（字符串）表示整期送达，不再算任何待补状态。
-        self.assertFalse(self.plugin._checkpoint_text_sent(self.link, self.link))
+        self.assertEqual(
+            self.plugin._decode_checkpoint(pending_text),
+            (apod_main.CHECKPOINT_TEXT_PENDING, self.link),
+        )
+        # 旧格式（链接字符串）直接表示整期送达。
+        self.assertEqual(
+            self.plugin._decode_checkpoint(self.link),
+            (apod_main.CHECKPOINT_DONE, self.link),
+        )
 
 
 class PushPerSessionChainTests(unittest.TestCase):

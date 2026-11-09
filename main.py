@@ -111,6 +111,18 @@ SEND_TIMEOUT_SECONDS = 60
 SEND_OK = "ok"
 SEND_FAILED = "failed"
 SEND_UNKNOWN = "unknown"
+# 投递检查点状态（每个会话一条）：
+#   done          = 整期送达（旧格式直接存链接字符串）
+#   text_pending  = 媒体已送达、正文待补
+#   media_pending = 正文已送达、媒体待补
+#   unknown       = 记录缺失/损坏/字段不明确：当作没送过，整条重发
+CHECKPOINT_DONE = "done"
+CHECKPOINT_TEXT_PENDING = "text_pending"
+CHECKPOINT_MEDIA_PENDING = "media_pending"
+CHECKPOINT_UNKNOWN = "unknown"
+# 同一状态的两个方向，避免各处各自拼元组。
+CHECKPOINT_TEXT_SENT = (CHECKPOINT_DONE, CHECKPOINT_MEDIA_PENDING)
+CHECKPOINT_MEDIA_SENT = (CHECKPOINT_DONE, CHECKPOINT_TEXT_PENDING)
 # 定时推送未完成时只补试一次（日更任务丢了就永久没有）；6 分钟足够躲过
 # 夜间常见抖动，又不会在凌晨反复打扰。
 PUSH_RETRY_DELAY_SECONDS = 360
@@ -799,33 +811,29 @@ class APOD(Star):
             raise RuntimeError(f"写入推送检查点失败：{exc}") from exc
 
     @staticmethod
-    def _checkpoint_media_sent(entry: Any, link: str) -> bool:
-        """检查点是否明确记录“该期媒体已送达、正文待补发”。"""
-        return (
-            isinstance(entry, dict)
-            and str(entry.get("link") or "") == link
-            and entry.get("media_sent") is True
-        )
+    def _decode_checkpoint(entry: Any) -> tuple[str, str]:
+        """解码一条检查点记录：返回 (状态, 记录里的链接)。
 
-    @staticmethod
-    def _checkpoint_text_sent(entry: Any, link: str) -> bool:
-        """检查点是否明确记录“该期正文已送达、媒体待补发”。
-
-        只认显式的 False：字段缺失或为 null 时宁可整条重发，
-        不能把未知状态当成“正文已送达”从而静默跳过正文。
+        只认显式的 media_sent True/False：字段缺失或为 null 一律当未知，
+        宁可整条重发，也不把未知状态当成“已送达”而静默跳过。
         """
-        return (
-            isinstance(entry, dict)
-            and str(entry.get("link") or "") == link
-            and entry.get("media_sent") is False
-        )
+        if isinstance(entry, str):
+            return (CHECKPOINT_DONE, entry) if entry else (CHECKPOINT_UNKNOWN, "")
+        if not isinstance(entry, dict):
+            return CHECKPOINT_UNKNOWN, ""
+        link = str(entry.get("link") or "")
+        if not link:
+            return CHECKPOINT_UNKNOWN, ""
+        if entry.get("media_sent") is True:
+            return CHECKPOINT_TEXT_PENDING, link
+        if entry.get("media_sent") is False:
+            return CHECKPOINT_MEDIA_PENDING, link
+        return CHECKPOINT_UNKNOWN, ""
 
     @staticmethod
-    def _checkpoint_pending_media_link(entry: Any) -> str:
-        """检查点里“正文已送达、媒体待补”记录的那期链接；不是该状态时返回空串。"""
-        if isinstance(entry, dict) and entry.get("media_sent") is False:
-            return str(entry.get("link") or "")
-        return ""
+    def _encode_checkpoint(link: str, *, media_sent: bool) -> dict:
+        """编码检查点：媒体已送达（只缺正文）或正文已送达（只缺媒体）。"""
+        return {"link": link, "media_sent": media_sent}
 
     async def _cache_translation(
         self, key: str, value: str, epoch: Optional[int] = None
@@ -2297,10 +2305,19 @@ class APOD(Star):
         except RuntimeError as exc:
             logger.error(f"{exc}：为避免重复群发，本轮跳过推送检查。")
             return False
-        # 检查点值：字符串 = 整期送达；{"link": ..., "media_sent": True} =
-        # 媒体已送达、正文待补发（下轮只补正文，不重发视频）；
-        # {"link": ..., "media_sent": False} = 正文已送达、媒体待补发（下轮只补媒体）。
-        pending = [umo for umo in sessions if pushed.get(umo) != link]
+        # 检查点状态由 _decode_checkpoint 统一解码（见 CHECKPOINT_* 常量）。
+        def state_of(umo: str) -> str:
+            """该会话在当前这一期的状态；别的期或坏记录都算未知。"""
+            state, recorded = self._decode_checkpoint(pushed.get(umo))
+            return state if recorded == link else CHECKPOINT_UNKNOWN
+
+        def text_ok(umo: str) -> bool:
+            return state_of(umo) in CHECKPOINT_TEXT_SENT
+
+        def media_ok(umo: str) -> bool:
+            return state_of(umo) in CHECKPOINT_MEDIA_SENT
+
+        pending = [umo for umo in sessions if state_of(umo) != CHECKPOINT_DONE]
 
         last = await self.get_cache("last_pushed_apod")
         last_link = str(last.get("link") or "") if isinstance(last, dict) else ""
@@ -2327,24 +2344,22 @@ class APOD(Star):
         title_zh, explanation_zh, tomorrow_zh = await self._translate_fields(apod_data)
         plan = self._media_plan(apod_data)
         media_expected = plan.send
-        # 换刊：检查点只存当前一期，上一期的待补媒体跟不到新链接，只能明示放弃。
-        stale_media = [
-            umo
-            for umo in pending
-            if self._checkpoint_pending_media_link(pushed.get(umo)) not in ("", link)
-        ]
-        if stale_media:
+        # 换刊：检查点只存当前一期，上一期没送完的记录跟不到新链接，只能明示放弃。
+        stale = []
+        for umo in pending:
+            state, recorded = self._decode_checkpoint(pushed.get(umo))
+            if state != CHECKPOINT_UNKNOWN and recorded != link:
+                stale.append(umo)
+        if stale:
             logger.warning(
-                f"APOD 有 {len(stale_media)} 个会话的上一期媒体未送达，"
+                f"APOD 有 {len(stale)} 个会话的上一期投递未完成（缺正文或缺媒体），"
                 "已随新一期覆盖，不再补发。"
             )
         # 媒体预热放在会话循环外：整期只下载一次，所有会话共享结果。
         # 下载失败时 ok=False，本轮只发正文，检查点记 media_sent=False，
         # 下一轮再补媒体链（不再让平台二次下载后把整期记成已送达）。
         media: Optional[MediaReady] = None
-        if media_expected and any(
-            not self._checkpoint_media_sent(pushed.get(umo), link) for umo in pending
-        ):
+        if media_expected and any(not media_ok(umo) for umo in pending):
             media = await self._prewarm_media(apod_data)
 
         async def build_chains(
@@ -2367,32 +2382,20 @@ class APOD(Star):
                 media=media,
             )
 
-        text_needed = [
-            umo
-            for umo in pending
-            if not self._checkpoint_text_sent(pushed.get(umo), link)
-        ]
-        media_needed = (
-            [
-                umo
-                for umo in pending
-                if not self._checkpoint_media_sent(pushed.get(umo), link)
-            ]
-            if media_expected
-            else []
-        )
+        text_needed = [umo for umo in pending if not text_ok(umo)]
+        media_needed = [umo for umo in pending if not media_ok(umo)] \
+            if media_expected else []
         # 一轮 = 把所有待发会话试一遍；网络抖动是秒级现象，只缺图时本轮内
         # 立即转向下一轮（轮数与退避沿用 retry_count / _retry_delay），
-        # 不必等外层 10 分钟节拍。
+        # 不必等外层那次 6 分钟的补试。
         work = list(pending)
         for attempt in range(self.retry_count + 1):
             for umo in work:
-                entry = pushed.get(umo)
-                media_done = self._checkpoint_media_sent(entry, link)
-                text_done = self._checkpoint_text_sent(entry, link)
                 # 媒体开关随时可能被改：按“还缺什么”决定，而不是只看检查点。
-                need_text = not text_done
-                need_media = media_expected and not media_done
+                need_text = not text_ok(umo)
+                need_media = media_expected and not media_ok(umo)
+                done_text = text_ok(umo)
+                done_media = media_ok(umo)
                 if need_text or need_media:
                     chains = await build_chains(need_text, need_media)
                     if not chains:
@@ -2408,8 +2411,8 @@ class APOD(Star):
                         logger.warning(
                             f"APOD 推送到 {umo} 的发送结果未知（已按送达处理，不再重发）。"
                         )
-                    text_done = text_done or report.text_sent
-                    media_done = media_done or report.media_sent
+                    done_text = done_text or report.text_sent
+                    done_media = done_media or report.media_sent
                 else:
                     # 只剩“媒体待补”但当前配置不发送媒体：收敛为整期送达，避免永久待补。
                     logger.warning(
@@ -2417,18 +2420,18 @@ class APOD(Star):
                     )
                 # 记账：正文与媒体分开；当前不发送媒体时不写 media_sent，
                 # 否则开启媒体后会被误认为“媒体已送达”而跳过补图。
-                if text_done and (media_done or not media_expected):
+                if done_text and (done_media or not media_expected):
                     pushed[umo] = link
-                elif text_done:
+                elif done_text:
                     logger.warning(
                         f"APOD 推送到 {umo} 正文已送达但媒体未送达，下轮只补媒体。"
                     )
-                    pushed[umo] = {"link": link, "media_sent": False}
-                elif media_done:
+                    pushed[umo] = self._encode_checkpoint(link, media_sent=False)
+                elif done_media:
                     logger.warning(
                         f"APOD 推送到 {umo} 媒体已送达但正文失败，下轮只补正文。"
                     )
-                    pushed[umo] = {"link": link, "media_sent": True}
+                    pushed[umo] = self._encode_checkpoint(link, media_sent=True)
                 else:
                     continue
                 try:
@@ -2438,14 +2441,12 @@ class APOD(Star):
                     logger.error(f"{exc}：本轮推送中止。")
                     return False
 
-            remaining = [umo for umo in pending if pushed.get(umo) != link]
+            remaining = [umo for umo in pending if state_of(umo) != CHECKPOINT_DONE]
             if not remaining or not media_expected:
                 break
             # 只有“只剩缺图”才值得秒级重试：正文缺失一律交给 6 分钟后的补试，
             # 避免在几秒内重复发一整期正文。
-            if not all(
-                self._checkpoint_text_sent(pushed.get(umo), link) for umo in remaining
-            ):
+            if not all(text_ok(umo) for umo in remaining):
                 break
             if attempt >= self.retry_count:
                 break
@@ -2461,17 +2462,9 @@ class APOD(Star):
             await asyncio.sleep(delay)
             work = remaining
 
-        def text_ok(umo: str) -> bool:
-            entry = pushed.get(umo)
-            return entry == link or self._checkpoint_text_sent(entry, link)
-
-        def media_ok(umo: str) -> bool:
-            entry = pushed.get(umo)
-            return entry == link or self._checkpoint_media_sent(entry, link)
-
         text_delivered = sum(1 for umo in text_needed if text_ok(umo))
         media_delivered = sum(1 for umo in media_needed if media_ok(umo))
-        delivered = sum(1 for umo in pending if pushed.get(umo) == link)
+        delivered = sum(1 for umo in pending if state_of(umo) == CHECKPOINT_DONE)
         await self.put_cache(
             "last_pushed_apod", {"date": date, "link": link, "delivered": True}
         )
