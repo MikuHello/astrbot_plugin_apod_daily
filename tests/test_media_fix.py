@@ -1938,16 +1938,6 @@ class MediaDownloadRetryTests(unittest.TestCase):
         self.plugin.get_cache = get_cache
         self.plugin.put_cache = put_cache
 
-
-        async def get_cache(key):
-            return self.store.get(key)
-
-        async def put_cache(key, value):
-            self.store[key] = value
-
-        self.plugin.get_cache = get_cache
-        self.plugin.put_cache = put_cache
-
     def _localize(self, download, sleeps):
         async def fake_sleep(seconds):
             sleeps.append(seconds)
@@ -2221,6 +2211,93 @@ class PushMediaPrewarmTests(unittest.TestCase):
         self.assertEqual(self._sent(), [["Plain"]])
         # 本来就没有媒体可发：不能写成 media_sent=False，否则会永远补媒体。
         self.assertEqual(self.store["pushed_by_session"], {"a": LINK})
+
+    def test_disabling_media_converges_pending_media(self):
+        self.store["pushed_by_session"] = {
+            "a": {"link": LINK, "media_sent": False}
+        }
+        self.plugin.send_media = False
+        with self.assertLogs("apod-test", level="WARNING") as logs:
+            self.assertTrue(asyncio.run(self.plugin._push_check()))
+        # 没有可补的内容：收敛为整期送达，不能每轮空转。
+        self.assertEqual(self.send.await_count, 0)
+        self.assertEqual(self.store["pushed_by_session"], {"a": LINK})
+        self.assertTrue(any("不发送媒体" in line for line in logs.output))
+
+    def test_media_off_text_failure_keeps_no_checkpoint(self):
+        self.plugin.send_media = False
+        self.send.side_effect = RuntimeError("text failed")
+        self.assertFalse(asyncio.run(self.plugin._push_check()))
+        # 不能写 media_sent=True：重新开启媒体后会被当成“媒体已送达”而跳过补图。
+        self.assertNotIn("pushed_by_session", self.store)
+
+    def test_new_issue_warns_when_pending_media_is_dropped(self):
+        old_link = (
+            "https://science.nasa.gov/image-article/apod-2026-november-06-old/"
+        )
+        self.store["pushed_by_session"] = {
+            "a": {"link": old_link, "media_sent": False}
+        }
+
+        async def ok(url, dest):
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        with patch.object(self.plugin, "_download_image", ok), \
+             self.assertLogs("apod-test", level="WARNING") as logs:
+            self.assertTrue(asyncio.run(self.plugin._push_check()))
+        # 检查点只存当前一期：旧图无从补发，但必须看得见。
+        self.assertTrue(any("不再补发" in line for line in logs.output))
+        self.assertEqual(self.store["pushed_by_session"], {"a": LINK})
+
+    def test_summary_counts_only_parts_that_need_sending(self):
+        self.store["pushed_by_session"] = {
+            "a": {"link": LINK, "media_sent": False}
+        }
+
+        async def boom(url, dest):
+            raise ConnectionResetError("reset")
+
+        with patch.object(self.plugin, "_download_image", boom), \
+             patch.object(apod_main.asyncio, "sleep", AsyncMock()), \
+             self.assertLogs("apod-test", level="INFO") as logs:
+            self.assertFalse(asyncio.run(self.plugin._push_check()))
+        summary = [line for line in logs.output if "本次推送" in line]
+        self.assertEqual(len(summary), 1)
+        # 正文已送达、本轮只缺媒体：分母不能算成需发正文。
+        self.assertIn("正文 0/0、媒体 0/1", summary[0])
+
+
+class CheckpointStateTests(unittest.TestCase):
+    """检查点只认显式的 True/False，缺失或 null 一律当“未知”。"""
+
+    def setUp(self):
+        self.plugin = _make_plugin()
+        self.link = "https://x/link"
+
+    def test_missing_or_null_media_state_is_not_trusted(self):
+        for entry in (
+            {"link": self.link},
+            {"link": self.link, "media_sent": None},
+            {"media_sent": False},
+        ):
+            with self.subTest(entry=entry):
+                self.assertFalse(self.plugin._checkpoint_text_sent(entry, self.link))
+                self.assertFalse(self.plugin._checkpoint_media_sent(entry, self.link))
+
+    def test_explicit_states_are_recognised(self):
+        pending_media = {"link": self.link, "media_sent": False}
+        pending_text = {"link": self.link, "media_sent": True}
+        self.assertTrue(self.plugin._checkpoint_text_sent(pending_media, self.link))
+        self.assertFalse(self.plugin._checkpoint_media_sent(pending_media, self.link))
+        self.assertTrue(self.plugin._checkpoint_media_sent(pending_text, self.link))
+        self.assertFalse(self.plugin._checkpoint_text_sent(pending_text, self.link))
+        self.assertEqual(
+            self.plugin._checkpoint_pending_media_link(pending_media), self.link
+        )
+        self.assertEqual(self.plugin._checkpoint_pending_media_link(pending_text), "")
+        # 旧格式（字符串）表示整期送达，不再算任何待补状态。
+        self.assertFalse(self.plugin._checkpoint_text_sent(self.link, self.link))
 
 
 class PushPerSessionChainTests(unittest.TestCase):

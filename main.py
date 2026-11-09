@@ -775,21 +775,32 @@ class APOD(Star):
 
     @staticmethod
     def _checkpoint_media_sent(entry: Any, link: str) -> bool:
-        """检查点是否记录“该期媒体已送达、正文待补发”。"""
+        """检查点是否明确记录“该期媒体已送达、正文待补发”。"""
         return (
             isinstance(entry, dict)
             and str(entry.get("link") or "") == link
-            and bool(entry.get("media_sent"))
+            and entry.get("media_sent") is True
         )
 
     @staticmethod
     def _checkpoint_text_sent(entry: Any, link: str) -> bool:
-        """检查点是否记录“该期正文已送达、媒体待补发”。"""
+        """检查点是否明确记录“该期正文已送达、媒体待补发”。
+
+        只认显式的 False：字段缺失或为 null 时宁可整条重发，
+        不能把未知状态当成“正文已送达”从而静默跳过正文。
+        """
         return (
             isinstance(entry, dict)
             and str(entry.get("link") or "") == link
-            and not bool(entry.get("media_sent"))
+            and entry.get("media_sent") is False
         )
+
+    @staticmethod
+    def _checkpoint_pending_media_link(entry: Any) -> str:
+        """检查点里“正文已送达、媒体待补”记录的那期链接；不是该状态时返回空串。"""
+        if isinstance(entry, dict) and entry.get("media_sent") is False:
+            return str(entry.get("link") or "")
+        return ""
 
     async def _cache_translation(
         self, key: str, value: str, epoch: Optional[int] = None
@@ -2285,7 +2296,19 @@ class APOD(Star):
             return True
 
         title_zh, explanation_zh, tomorrow_zh = await self._translate_fields(apod_data)
-        media_expected = self._media_plan(apod_data).send
+        plan = self._media_plan(apod_data)
+        media_expected = plan.send
+        # 换刊：检查点只存当前一期，上一期的待补媒体跟不到新链接，只能明示放弃。
+        stale_media = [
+            umo
+            for umo in pending
+            if self._checkpoint_pending_media_link(pushed.get(umo)) not in ("", link)
+        ]
+        if stale_media:
+            logger.warning(
+                f"APOD 有 {len(stale_media)} 个会话的上一期媒体未送达，"
+                "已随新一期覆盖，不再补发。"
+            )
         # 媒体预热放在会话循环外：整期只下载一次，所有会话共享结果。
         # 下载失败时 media_path=None，本轮只发正文，检查点记 media_sent=False，
         # 下一轮再补媒体链（不再让平台二次下载后把整期记成已送达）。
@@ -2294,59 +2317,73 @@ class APOD(Star):
             not self._checkpoint_media_sent(pushed.get(umo), link) for umo in pending
         ):
             media_path = await self._prewarm_media(apod_data)
+
+        async def build_chains(
+            need_text: bool, need_media: bool
+        ) -> list[MessageChain]:
+            """按本轮缺的内容组链：只缺媒体时不重发正文，只缺正文时不再碰媒体。"""
+            if need_media and not need_text:
+                media_chain = await self._build_media_chain(
+                    apod_data, media_path=media_path
+                )
+                return [media_chain] if media_chain.chain else []
+            if not need_media:
+                text = self._build_text_chain(
+                    apod_data, title_zh, explanation_zh, tomorrow_zh
+                )
+                return [text] if text.chain else []
+            return await self._build_apod_chains(
+                apod_data,
+                title_zh,
+                explanation_zh,
+                tomorrow_zh,
+                media_path=media_path,
+            )
+
         delivered = 0
         text_delivered = 0
         media_delivered = 0
+        text_total = 0
+        media_total = 0
         for umo in pending:
             entry = pushed.get(umo)
             media_done = self._checkpoint_media_sent(entry, link)
             text_done = self._checkpoint_text_sent(entry, link)
-            if media_done:
-                # 直接构建待补正文，不下载或刷新已经送达的媒体。
-                text = self._build_text_chain(
-                    apod_data, title_zh, explanation_zh, tomorrow_zh
+            # 媒体开关随时可能被改：按“这一轮还缺什么”决定，而不是只看检查点。
+            need_text = not text_done
+            need_media = media_expected and not media_done
+            text_total += 1 if need_text else 0
+            media_total += 1 if need_media else 0
+            if need_text or need_media:
+                chains = await build_chains(need_text, need_media)
+                if not chains:
+                    # 本轮无内容可发（如媒体仍未下载成功）：留待下一轮。
+                    continue
+                report = await self._send_chains(
+                    chains, partial(self.context.send_message, umo), f"APOD 推送到 {umo}"
                 )
-                chains = [text] if text.chain else []
-            elif text_done:
-                # 正文已送达、媒体待补：只发媒体链，不重发正文。
-                media_chain = await self._build_media_chain(
-                    apod_data, media_path=media_path
-                )
-                chains = [media_chain] if media_chain.chain else []
+                text_done = text_done or report.text_sent
+                media_done = media_done or report.media_sent
+                if need_text and report.text_sent:
+                    text_delivered += 1
+                if need_media and report.media_sent:
+                    media_delivered += 1
             else:
-                chains = await self._build_apod_chains(
-                    apod_data,
-                    title_zh,
-                    explanation_zh,
-                    tomorrow_zh,
-                    media_path=media_path,
+                # 只剩“媒体待补”但当前配置不发送媒体：收敛为整期送达，避免永久待补。
+                logger.warning(
+                    f"APOD 推送到 {umo} 的待补媒体已跳过：当前配置不发送媒体。"
                 )
-            if not chains:
-                # 本轮无内容可发（如媒体仍未下载成功）：留待下一轮。
-                continue
-            report = await self._send_chains(
-                chains, partial(self.context.send_message, umo), f"APOD 推送到 {umo}"
-            )
-            if media_done:
-                text_ok, media_ok = report.text_sent, True
-            elif text_done:
-                text_ok, media_ok = True, report.media_sent
-            else:
-                text_ok = report.text_sent
-                media_ok = report.media_sent or not media_expected
-            if text_ok:
-                text_delivered += 1
-            if media_ok:
-                media_delivered += 1
-            if text_ok and media_ok:
+            # 记账：正文与媒体分开；当前不发送媒体时不写 media_sent，
+            # 否则开启媒体后会被误认为“媒体已送达”而跳过补图。
+            if text_done and (media_done or not media_expected):
                 pushed[umo] = link
                 delivered += 1
-            elif text_ok:
+            elif text_done:
                 logger.warning(
                     f"APOD 推送到 {umo} 正文已送达但媒体未送达，下轮只补媒体。"
                 )
                 pushed[umo] = {"link": link, "media_sent": False}
-            elif media_ok:
+            elif media_done:
                 logger.warning(f"APOD 推送到 {umo} 媒体已送达但正文失败，下轮只补正文。")
                 pushed[umo] = {"link": link, "media_sent": True}
             else:
@@ -2362,8 +2399,8 @@ class APOD(Star):
         )
         missed = len(pending) - delivered
         logger.info(
-            f"APOD 本次推送 {date}：正文 {text_delivered}/{len(pending)}、"
-            f"媒体 {media_delivered}/{len(pending)}"
+            f"APOD 本次推送 {date}：正文 {text_delivered}/{text_total}、"
+            f"媒体 {media_delivered}/{media_total}"
             + (f"，{missed} 个会话待补发。" if missed else "。")
         )
         return missed == 0
