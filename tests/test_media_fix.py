@@ -386,7 +386,12 @@ class _FakeConfig(dict):
 
 
 def _pre_submit_error():
-    """能确认没提交的发送失败（连不上）：只有这种才允许自动补发。"""
+    """能证明没提交的发送失败（本地媒体准备阶段）：只有这种才允许自动补发。"""
+    return FileNotFoundError("image cache miss")
+
+
+def _network_error():
+    """网络类失败：适配器/QQ SDK 内部可能已重试甚至已提交，只能算结果未知。"""
     return apod_main.aiohttp.ClientConnectorError()
 
 
@@ -2377,10 +2382,13 @@ class PushMediaPrewarmTests(unittest.TestCase):
         self.assertEqual(sent, [["Image", "Plain"], ["Plain"], ["Image"]])
         self.assertEqual(self.store["pushed_by_session"], {"a": LINK})
 
-    def test_private_session_connect_error_stays_unknown(self):
-        # QQ 官方私聊的 POST 在适配器内部重试 3 次：最后一次连接失败证明不了
-        # 前面没提交，只能按结果未知处理，不能再发一次。
-        self.plugin.config["push"]["sessions"] = ["qq_official:FriendMessage:abc"]
+    def test_network_send_error_is_unknown_for_every_session(self):
+        # 私聊的 POST 在适配器内部重试 3 次，群聊的 POST 也有 botpy 自己的重连：
+        # 最后一次连接失败证明不了前面没提交，两类会话都只能按结果未知处理。
+        self.plugin.config["push"]["sessions"] = [
+            "qq_official:FriendMessage:abc",
+            "qq_official:GroupMessage:g1",
+        ]
         sent = []
 
         async def ok(url, dest):
@@ -2388,40 +2396,27 @@ class PushMediaPrewarmTests(unittest.TestCase):
                 handle.write(b"img")
 
         async def connect_error(umo, chain):
-            sent.append([type(item).__name__ for item in chain.chain])
-            raise _pre_submit_error()
+            sent.append((umo, [type(item).__name__ for item in chain.chain]))
+            raise _network_error()
 
         self.plugin.context = SimpleNamespace(send_message=connect_error)
         with patch.object(self.plugin, "_download_image", ok),              patch.object(apod_main.asyncio, "sleep", AsyncMock()),              self.assertLogs("apod-test", level="WARNING"):
             self.assertTrue(asyncio.run(self.plugin._push_check()))
-        # 只有一次尝试，不再降级重发正文。
-        self.assertEqual(sent, [["Image", "Plain"]])
+        # 每个会话只尝试一次，不再降级重发正文、也不补图。
+        self.assertEqual(
+            sent,
+            [
+                ("qq_official:FriendMessage:abc", ["Image", "Plain"]),
+                ("qq_official:GroupMessage:g1", ["Image", "Plain"]),
+            ],
+        )
         self.assertEqual(
             self.store["pushed_by_session"],
-            {"qq_official:FriendMessage:abc": LINK},
+            dict.fromkeys(
+                ["qq_official:FriendMessage:abc", "qq_official:GroupMessage:g1"],
+                LINK,
+            ),
         )
-
-    def test_group_session_connect_error_is_retried(self):
-        # 群聊没有适配器内部重试：连接失败可以确认没提交，正常降级 + 补图。
-        self.plugin.config["push"]["sessions"] = ["qq_official:GroupMessage:abc"]
-
-        async def ok(url, dest):
-            with open(dest, "wb") as handle:
-                handle.write(b"img")
-
-        sent = []
-
-        async def connect_error_then_ok(umo, chain):
-            kinds = [type(item).__name__ for item in chain.chain]
-            sent.append(kinds)
-            if kinds == ["Image", "Plain"]:
-                raise _pre_submit_error()
-            return None
-
-        self.plugin.context = SimpleNamespace(send_message=connect_error_then_ok)
-        with patch.object(self.plugin, "_download_image", ok),              patch.object(apod_main.asyncio, "sleep", AsyncMock()):
-            self.assertTrue(asyncio.run(self.plugin._push_check()))
-        self.assertEqual(sent, [["Image", "Plain"], ["Plain"], ["Image"]])
 
     def test_summary_does_not_report_unknown_as_delivered(self):
         async def ok(url, dest):

@@ -111,19 +111,17 @@ SEND_TIMEOUT_SECONDS = 60
 SEND_OK = "ok"
 SEND_FAILED = "failed"
 SEND_UNKNOWN = "unknown"
-# 能确认“还没提交给平台”的失败才值得自动补发：
-#   连不上 / URL 无效 / 拒绝连接 —— 根本没走到提交；
-#   本地图片不存在 —— AstrBot 转换阶段就读文件，读不到时还没开始上传。
-# 其余（超时、提交后读响应失败、未知异常）都可能已经送达，重发就是刷屏。
+# 只有“本地媒体/参数准备阶段”的失败能证明消息还没提交过，才值得自动补发：
+#   AstrBot 转换阶段读本地图片失败（FileNotFoundError/PermissionError）、
+#   URL 本身非法（InvalidURL）—— 这时连上传都还没开始。
+# 网络类失败（连接被拒、连接重置、超时、读响应体失败）一律按“结果未知”处理：
+# QQ 官方私聊的 POST 在适配器内部重试 3 次，群聊的 POST 也有 botpy 自己的重连，
+# 最后一次连接失败证明不了前面几次都没提交，重发就是重复刷同一张图/同一段文案。
 _PRE_SUBMIT_ERRORS = (
-    aiohttp.ClientConnectorError,
-    aiohttp.InvalidURL,
-    ConnectionRefusedError,
     FileNotFoundError,
+    PermissionError,
+    aiohttp.InvalidURL,
 )
-# QQ 官方私聊（FriendMessage）的 POST 在适配器内部重试 3 次：最后一次连接失败
-# 不能证明前几次都没提交，这条路径的“连接失败”只能按结果未知处理。
-_ADAPTER_RETRIED_MESSAGE_TYPES = ("FriendMessage",)
 # 投递检查点状态（每个会话一条）：
 #   done          = 整期送达（旧格式直接存链接字符串）
 #   text_pending  = 媒体已送达、正文待补
@@ -609,9 +607,7 @@ class APOD(Star):
                 sent_any = True
             return result
 
-        report = await self._send_chains(
-            chains, send, f"{label} 指令回复", event.unified_msg_origin
-        )
+        report = await self._send_chains(chains, send, f"{label} 指令回复")
         return report.text_sent
 
     async def _reply_text(
@@ -787,7 +783,6 @@ class APOD(Star):
             chains,
             partial(self.context.send_message, event.unified_msg_origin),
             label=f"{label}发送",
-            umo=event.unified_msg_origin,
         )
         if sent.text_unknown or sent.media_unknown:
             return (
@@ -2451,7 +2446,6 @@ class APOD(Star):
                         chains,
                         partial(self.context.send_message, umo),
                         f"APOD 推送到 {umo}",
-                        umo,
                     )
                     if report.text_unknown or report.media_unknown:
                         # 超时/提交后断连：平台可能已收到，重发就是重复图片/文案；
@@ -2649,12 +2643,6 @@ class APOD(Star):
             download_file(url, dest, allow_insecure_ssl_fallback=False),
             timeout=self.timeout,
         )
-
-    @staticmethod
-    def _adapter_retries_send(umo: str) -> bool:
-        """该会话的发送在适配器内部是否还有重试（umo = 平台:类型:会话）。"""
-        parts = str(umo or "").split(":", 2)
-        return len(parts) >= 2 and parts[1] in _ADAPTER_RETRIED_MESSAGE_TYPES
 
     @classmethod
     def _is_fatal_download_error(cls, exc: BaseException) -> bool:
@@ -2870,24 +2858,16 @@ class APOD(Star):
         chain: MessageChain,
         label: str,
         stage: str = "发送",
-        retry_proof: bool = True,
     ) -> str:
         """发一条链，返回 SEND_OK / SEND_FAILED / SEND_UNKNOWN。
 
-        只有能确认未提交的失败和接口返回 False 才允许自动补发；超时与提交后的
-        异常（如读响应体时断连）都按“结果未知”处理，不重发。
-        retry_proof=False 表示该会话的发送在适配器内部还有重试（QQ 官方私聊
-        POST 重试 3 次），最后一次的连接失败证明不了前面都没提交，也算未知。
+        只有本地准备阶段的失败（见 _PRE_SUBMIT_ERRORS）与接口返回 False 能证明
+        消息没提交过，才允许自动补发；网络类失败、超时、提交后断连都可能已经
+        送达，一律按“结果未知”处理，不再重发。
         """
         try:
             sent = await asyncio.wait_for(send(chain), timeout=SEND_TIMEOUT_SECONDS)
         except _PRE_SUBMIT_ERRORS as exc:
-            if not retry_proof:
-                logger.error(
-                    f"{label}失败（阶段={stage}）：适配器内部有重试，"
-                    f"无法确认未提交，按结果未知处理。{_safe_exc_text(exc)}"
-                )
-                return SEND_UNKNOWN
             logger.error(
                 f"{label}失败（阶段={stage}，未提交）：{_safe_exc_text(exc)}"
             )
@@ -2911,7 +2891,6 @@ class APOD(Star):
         chains: list[MessageChain],
         send: Callable[[MessageChain], Awaitable[Any]],
         label: str = "APOD",
-        umo: str = "",
     ) -> ChainSendReport:
         """逐条发送消息链；媒体那条失败时舍媒体保正文（合并链补发纯文字）。
 
@@ -2926,14 +2905,13 @@ class APOD(Star):
         media_sent = False
         text_unknown = False
         media_unknown = False
-        retry_proof = not self._adapter_retries_send(umo)
         for index, chain in enumerate(chains):
             has_media = any(
                 isinstance(item, (Comp.Image, Comp.Video)) for item in chain.chain
             )
             has_text = any(isinstance(item, Comp.Plain) for item in chain.chain)
             outcome = await self._send_chain(
-                send, chain, label, "上传" if has_media else "发送", retry_proof
+                send, chain, label, "上传" if has_media else "发送"
             )
             if outcome == SEND_UNKNOWN:
                 # 不确定是否已送达：按送达记账（不再重发），但逐项标记未知。
@@ -2952,9 +2930,7 @@ class APOD(Star):
                 chain=[item for item in chain.chain if isinstance(item, Comp.Plain)]
             )
             if fallback.chain:
-                outcome = await self._send_chain(
-                    send, fallback, label, retry_proof=retry_proof
-                )
+                outcome = await self._send_chain(send, fallback, label)
                 if outcome == SEND_UNKNOWN:
                     # 降级正文也可能已经被平台接收：按已送达记账，不再重发一次。
                     text_unknown = text_sent = True
