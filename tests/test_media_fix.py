@@ -2331,6 +2331,35 @@ class PushMediaPrewarmTests(unittest.TestCase):
         self.assertIn("正文 0/0、媒体 0/1", summary[0])
 
 
+class PushLoopTests(unittest.TestCase):
+    """定时推送的等待顺序：每次推送前只能有一次“等到点”的 sleep。"""
+
+    def test_scheduled_loop_sleeps_once_per_push(self):
+        plugin = _make_plugin(_FakeConfig({"push": {"enabled": True}}))
+        plugin.push_mode = "scheduled"
+        plugin.push_time = "01:00"
+        plugin._seconds_until = lambda hhmm: 3600.0
+        events = []
+
+        async def fake_sleep(seconds):
+            events.append(("sleep", seconds))
+            if len([e for e in events if e[0] == "sleep"]) >= 2:
+                raise asyncio.CancelledError()
+
+        async def fake_check():
+            events.append(("push", None))
+            return True
+
+        plugin._push_check = fake_check
+        with patch.object(apod_main.asyncio, "sleep", fake_sleep):
+            asyncio.run(plugin._push_loop())
+        # 重复 sleep 会让推送周期从一天变成两天，也会让“距下次推送”日志失真。
+        self.assertEqual(
+            events[:3],
+            [("sleep", 3600.0), ("push", None), ("sleep", 3600.0)],
+        )
+
+
 class CheckpointStateTests(unittest.TestCase):
     """检查点只认显式的 True/False，缺失或 null 一律当“未知”。"""
 

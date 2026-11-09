@@ -2218,7 +2218,6 @@ class APOD(Star):
                         f"APOD 定时推送：距下次推送约 {delay / 3600:.1f} 小时。"
                     )
                     await asyncio.sleep(delay)
-                    await asyncio.sleep(delay)
                     # 这里是“整期抢救”窗口（约 50 分钟），只兜两类慢故障：拉取不到、
                     # 正文没送达；秒级的缺图补发已在 _push_check 内部完成。
                     for attempt in range(6):
