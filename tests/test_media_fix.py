@@ -2145,27 +2145,90 @@ class PushMediaPrewarmTests(unittest.TestCase):
         self.assertEqual(self._sent(), [["Image", "Plain"]] * 3)
         self.assertEqual(self.store["pushed_by_session"], dict.fromkeys("abc", LINK))
 
-    def test_media_upload_failure_keeps_text_and_retries_media(self):
+    def test_media_upload_failure_recovers_in_same_round(self):
         async def ok(url, dest):
             with open(dest, "wb") as handle:
                 handle.write(b"img")
 
+        sleeps = []
+
+        async def fake_sleep(seconds):
+            sleeps.append(seconds)
+
+        # 事故现场：合并链上传失败 → 降级正文；下一轮只补图，不重发正文。
+        self.send.side_effect = [RuntimeError("upload reset"), None, None]
+        with patch.object(self.plugin, "_download_image", ok), \
+             patch.object(apod_main.asyncio, "sleep", fake_sleep):
+            self.assertTrue(asyncio.run(self.plugin._push_check()))
+        self.assertEqual(
+            self._sent(), [["Image", "Plain"], ["Plain"], ["Image"]]
+        )
+        self.assertEqual(self.store["pushed_by_session"], {"a": LINK})
+        # 秒级补发：等待不能是外层那 10 分钟节拍。
+        self.assertEqual(len(sleeps), 1)
+        self.assertTrue(1 <= sleeps[0] <= 2, sleeps)
+
+    def test_media_upload_failure_keeps_pending_after_fast_retries(self):
+        async def ok(url, dest):
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        async def fake_sleep(seconds):
+            pass
+
+        # 第一次成功（合并链上传失败、正文降级），之后每次只补图都失败。
+        outcomes = [RuntimeError("upload reset"), None] + [
+            RuntimeError("upload reset")
+        ] * self.plugin.retry_count
+        self.send.side_effect = outcomes
+        with patch.object(self.plugin, "_download_image", ok), \
+             patch.object(apod_main.asyncio, "sleep", fake_sleep):
+            self.assertFalse(asyncio.run(self.plugin._push_check()))
+        self.assertEqual(self._sent()[0], ["Image", "Plain"])
+        self.assertEqual(self._sent()[1], ["Plain"])
+        # 正文不重复发，只反复补图，直到用完 retry_count 轮。
+        self.assertEqual(
+            self._sent()[2:], [["Image"]] * self.plugin.retry_count
+        )
+        self.assertEqual(
+            self.store["pushed_by_session"],
+            {"a": {"link": LINK, "media_sent": False}},
+        )
+
+    def test_fast_retries_disabled_with_zero_retry_count(self):
+        async def ok(url, dest):
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        self.plugin.retry_count = 0
         self.send.side_effect = [RuntimeError("upload reset"), None]
         with patch.object(self.plugin, "_download_image", ok):
             self.assertFalse(asyncio.run(self.plugin._push_check()))
-        # 事故现场：合并链上传失败 → 降级正文，不能记成整期送达。
         self.assertEqual(self._sent(), [["Image", "Plain"], ["Plain"]])
         self.assertEqual(
             self.store["pushed_by_session"],
             {"a": {"link": LINK, "media_sent": False}},
         )
 
-        self.send.reset_mock()
-        self.send.side_effect = None
-        with patch.object(self.plugin, "_download_image", ok):
+    def test_download_failure_is_recovered_in_same_round(self):
+        self.plugin.config["push"]["sessions"] = ["a", "b", "c", "d"]
+        attempts = []
+
+        async def flaky(url, dest):
+            attempts.append(url)
+            if len(attempts) <= 4:  # 首轮四个会话共用的那次下载失败
+                raise ConnectionResetError("reset")
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        with patch.object(self.plugin, "_download_image", flaky), \
+             patch.object(apod_main.asyncio, "sleep", AsyncMock()):
             self.assertTrue(asyncio.run(self.plugin._push_check()))
-        self.assertEqual(self._sent(), [["Image"]])
-        self.assertEqual(self.store["pushed_by_session"], {"a": LINK})
+        # 首轮全失败只发正文，随后同一轮内补齐四张图。
+        self.assertEqual(self._sent(), [["Plain"]] * 4 + [["Image"]] * 4)
+        self.assertEqual(
+            self.store["pushed_by_session"], dict.fromkeys("abcd", LINK)
+        )
 
     def test_download_failure_is_recovered_for_all_sessions(self):
         self.plugin.config["push"]["sessions"] = ["a", "b", "c", "d"]

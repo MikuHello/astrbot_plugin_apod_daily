@@ -2218,7 +2218,9 @@ class APOD(Star):
                         f"APOD 定时推送：距下次推送约 {delay / 3600:.1f} 小时。"
                     )
                     await asyncio.sleep(delay)
-                    # 拉取失败时退避重试，最多 6 次（约 1 小时），避免整期漏发。
+                    await asyncio.sleep(delay)
+                    # 这里是“整期抢救”窗口（约 50 分钟），只兜两类慢故障：拉取不到、
+                    # 正文没送达；秒级的缺图补发已在 _push_check 内部完成。
                     for attempt in range(6):
                         try:
                             ok = await self._push_check()
@@ -2228,7 +2230,7 @@ class APOD(Star):
                         if ok:
                             break
                         logger.warning(
-                            f"APOD 定时推送拉取失败，10 分钟后重试（{attempt + 1}/6）。"
+                            f"APOD 定时推送本轮未完成，10 分钟后重试（{attempt + 1}/6）。"
                         )
                         await asyncio.sleep(600)
         except asyncio.CancelledError:
@@ -2340,67 +2342,111 @@ class APOD(Star):
                 media_path=media_path,
             )
 
-        delivered = 0
-        text_delivered = 0
-        media_delivered = 0
-        text_total = 0
-        media_total = 0
-        for umo in pending:
-            entry = pushed.get(umo)
-            media_done = self._checkpoint_media_sent(entry, link)
-            text_done = self._checkpoint_text_sent(entry, link)
-            # 媒体开关随时可能被改：按“这一轮还缺什么”决定，而不是只看检查点。
-            need_text = not text_done
-            need_media = media_expected and not media_done
-            text_total += 1 if need_text else 0
-            media_total += 1 if need_media else 0
-            if need_text or need_media:
-                chains = await build_chains(need_text, need_media)
-                if not chains:
-                    # 本轮无内容可发（如媒体仍未下载成功）：留待下一轮。
+        text_needed = [
+            umo
+            for umo in pending
+            if not self._checkpoint_text_sent(pushed.get(umo), link)
+        ]
+        media_needed = (
+            [
+                umo
+                for umo in pending
+                if not self._checkpoint_media_sent(pushed.get(umo), link)
+            ]
+            if media_expected
+            else []
+        )
+        # 一轮 = 把所有待发会话试一遍；网络抖动是秒级现象，只缺图时本轮内
+        # 立即转向下一轮（轮数与退避沿用 retry_count / _retry_delay），
+        # 不必等外层 10 分钟节拍。
+        work = list(pending)
+        for attempt in range(self.retry_count + 1):
+            for umo in work:
+                entry = pushed.get(umo)
+                media_done = self._checkpoint_media_sent(entry, link)
+                text_done = self._checkpoint_text_sent(entry, link)
+                # 媒体开关随时可能被改：按“还缺什么”决定，而不是只看检查点。
+                need_text = not text_done
+                need_media = media_expected and not media_done
+                if need_text or need_media:
+                    chains = await build_chains(need_text, need_media)
+                    if not chains:
+                        # 无内容可发（如媒体仍未下载成功）：留待下一轮。
+                        continue
+                    report = await self._send_chains(
+                        chains,
+                        partial(self.context.send_message, umo),
+                        f"APOD 推送到 {umo}",
+                    )
+                    text_done = text_done or report.text_sent
+                    media_done = media_done or report.media_sent
+                else:
+                    # 只剩“媒体待补”但当前配置不发送媒体：收敛为整期送达，避免永久待补。
+                    logger.warning(
+                        f"APOD 推送到 {umo} 的待补媒体已跳过：当前配置不发送媒体。"
+                    )
+                # 记账：正文与媒体分开；当前不发送媒体时不写 media_sent，
+                # 否则开启媒体后会被误认为“媒体已送达”而跳过补图。
+                if text_done and (media_done or not media_expected):
+                    pushed[umo] = link
+                elif text_done:
+                    logger.warning(
+                        f"APOD 推送到 {umo} 正文已送达但媒体未送达，下轮只补媒体。"
+                    )
+                    pushed[umo] = {"link": link, "media_sent": False}
+                elif media_done:
+                    logger.warning(
+                        f"APOD 推送到 {umo} 媒体已送达但正文失败，下轮只补正文。"
+                    )
+                    pushed[umo] = {"link": link, "media_sent": True}
+                else:
                     continue
-                report = await self._send_chains(
-                    chains, partial(self.context.send_message, umo), f"APOD 推送到 {umo}"
-                )
-                text_done = text_done or report.text_sent
-                media_done = media_done or report.media_sent
-                if need_text and report.text_sent:
-                    text_delivered += 1
-                if need_media and report.media_sent:
-                    media_delivered += 1
-            else:
-                # 只剩“媒体待补”但当前配置不发送媒体：收敛为整期送达，避免永久待补。
-                logger.warning(
-                    f"APOD 推送到 {umo} 的待补媒体已跳过：当前配置不发送媒体。"
-                )
-            # 记账：正文与媒体分开；当前不发送媒体时不写 media_sent，
-            # 否则开启媒体后会被误认为“媒体已送达”而跳过补图。
-            if text_done and (media_done or not media_expected):
-                pushed[umo] = link
-                delivered += 1
-            elif text_done:
-                logger.warning(
-                    f"APOD 推送到 {umo} 正文已送达但媒体未送达，下轮只补媒体。"
-                )
-                pushed[umo] = {"link": link, "media_sent": False}
-            elif media_done:
-                logger.warning(f"APOD 推送到 {umo} 媒体已送达但正文失败，下轮只补正文。")
-                pushed[umo] = {"link": link, "media_sent": True}
-            else:
-                continue
-            try:
-                await self._save_push_checkpoint(pushed)
-            except RuntimeError as exc:
-                # 进度落盘失败立即中止本轮：未确认会话留待下轮补发，避免盲目重发。
-                logger.error(f"{exc}：本轮推送中止。")
-                return False
+                try:
+                    await self._save_push_checkpoint(pushed)
+                except RuntimeError as exc:
+                    # 进度落盘失败立即中止本轮：未确认会话留待下轮补发，避免盲目重发。
+                    logger.error(f"{exc}：本轮推送中止。")
+                    return False
+
+            remaining = [umo for umo in pending if pushed.get(umo) != link]
+            if not remaining or not media_expected:
+                break
+            # 只有“只剩缺图”才值得秒级重试：正文缺失一律交给外层长节拍，
+            # 避免在几秒内重复发一整期正文。
+            if not all(
+                self._checkpoint_text_sent(pushed.get(umo), link) for umo in remaining
+            ):
+                break
+            if attempt >= self.retry_count:
+                break
+            delay = _retry_delay(attempt, jitter=True)
+            logger.warning(
+                f"APOD 有 {len(remaining)} 个会话缺图，{delay:.1f} 秒后补发"
+                f"（{attempt + 1}/{self.retry_count}）。"
+            )
+            await asyncio.sleep(delay)
+            # 重新预热：上次下载失败就再下一次，成功过则直接命中本地文件。
+            media_path = await self._prewarm_media(apod_data)
+            work = remaining
+
+        def text_ok(umo: str) -> bool:
+            entry = pushed.get(umo)
+            return entry == link or self._checkpoint_text_sent(entry, link)
+
+        def media_ok(umo: str) -> bool:
+            entry = pushed.get(umo)
+            return entry == link or self._checkpoint_media_sent(entry, link)
+
+        text_delivered = sum(1 for umo in text_needed if text_ok(umo))
+        media_delivered = sum(1 for umo in media_needed if media_ok(umo))
+        delivered = sum(1 for umo in pending if pushed.get(umo) == link)
         await self.put_cache(
             "last_pushed_apod", {"date": date, "link": link, "delivered": True}
         )
         missed = len(pending) - delivered
         logger.info(
-            f"APOD 本次推送 {date}：正文 {text_delivered}/{text_total}、"
-            f"媒体 {media_delivered}/{media_total}"
+            f"APOD 本次推送 {date}：正文 {text_delivered}/{len(text_needed)}、"
+            f"媒体 {media_delivered}/{len(media_needed)}"
             + (f"，{missed} 个会话待补发。" if missed else "。")
         )
         return missed == 0
