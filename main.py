@@ -114,8 +114,9 @@ SEND_UNKNOWN = "unknown"
 # 定时推送未完成时只补试一次（日更任务丢了就永久没有）；6 分钟足够躲过
 # 夜间常见抖动，又不会在凌晨反复打扰。
 PUSH_RETRY_DELAY_SECONDS = 360
-# 日志脱敏：部分 aiohttp 异常文本里带完整 URL（query 上可能有签名）。
-_URL_IN_TEXT_PATTERN = re.compile(r"https?://[^\s'\"<>()]+")
+# 日志脱敏：异常文本可能带完整 URL（query 上可能有签名）。只排除空白与引号，
+# 宁可多包一层（如路径里的括号、行尾标点）也不能把 ?sig=… 漏在日志里。
+_URL_IN_TEXT_PATTERN = re.compile(r"https?://[^\s'\"<>]+")
 
 
 def _is_fatal_client_status(status: int) -> bool:
@@ -1816,7 +1817,7 @@ class APOD(Star):
                 logger.error(f"获取{label}超时：请求在 {self.timeout} 秒后超时。")
                 self.last_apod_error = f"请求{label}超时，请稍后重试。"
             except aiohttp.ClientError as exc:
-                logger.error(f"获取{label}时发生网络错误：{exc}")
+                logger.error(f"获取{label}时发生网络错误：{_safe_exc_text(exc)}")
                 self.last_apod_error = f"连接{label}失败，请稍后重试。"
 
             if attempt < self.retry_count:
@@ -2813,7 +2814,7 @@ class APOD(Star):
             logger.error(f"{label}超时未拿到结果（阶段={stage}）：按已送达处理。")
             return SEND_UNKNOWN
         except Exception as exc:
-            logger.error(f"{label}失败（阶段={stage}）：{exc!r}")
+            logger.error(f"{label}失败（阶段={stage}）：{_safe_exc_text(exc)}")
             return SEND_FAILED
         if sent is False:
             logger.error(f"{label}失败（阶段={stage}）：发送接口返回 False。")

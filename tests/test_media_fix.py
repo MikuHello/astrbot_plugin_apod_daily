@@ -2059,6 +2059,29 @@ class MediaDownloadRetryTests(unittest.TestCase):
         self.assertIn("<url>", text)
         self.assertIn("RuntimeError", text)
 
+    def test_redaction_covers_paths_with_brackets(self):
+        exc = RuntimeError(
+            "see https://assets.science.nasa.gov/a(b).jpg?sig=SECRET456 now"
+        )
+        text = apod_main._safe_exc_text(exc)
+        # 路径里的括号不能让脱敏在 ?sig= 之前收尾。
+        self.assertNotIn("SECRET456", text)
+        self.assertIn("<url>", text)
+
+    def test_send_logs_do_not_leak_urls(self):
+        secret = "https://qq.example.com/send?token=SECRET789"
+        chain = apod_main.MessageChain(chain=[_COMP.Plain("body")])
+
+        async def leaky_send(_chain):
+            raise RuntimeError(f"upload failed for {secret}")
+
+        with self.assertLogs("apod-test", level="ERROR") as logs:
+            report = asyncio.run(self.plugin._send_chains([chain], leaky_send))
+        self.assertFalse(report.text_sent)
+        text = chr(10).join(logs.output)
+        self.assertNotIn("SECRET789", text)
+        self.assertIn("<url>", text)
+
     def test_shared_retry_helpers(self):
         self.assertEqual(
             [apod_main._retry_delay(attempt) for attempt in range(4)], [1, 2, 4, 4]
