@@ -175,24 +175,15 @@ class MediaPlan(NamedTuple):
     url: str
 
 
-class LocalImage(NamedTuple):
-    """一次图片本地化的结果：path 为空表示没有可用的本地文件。"""
-
-    path: Optional[str] = None
-    # True = 4xx 这类重试无意义的失败，本轮不必再请求同一地址。
-    fatal: bool = False
-
-
 class MediaReady(NamedTuple):
     """一次媒体预热的结果，由推送路径一次下载、多会话共享。
 
     ok=False 表示本轮没有可发的媒体（下载失败/本就无媒体）；
-    path 为空表示无需本地文件（视频直链）；fatal 含义同 LocalImage。
+    path 为空表示无需本地文件（视频直链）。
     """
 
     ok: bool
     path: str = ""
-    fatal: bool = False
 
 
 class ChainSendReport(NamedTuple):
@@ -2386,6 +2377,17 @@ class APOD(Star):
             need_text: bool, need_media: bool
         ) -> list[MessageChain]:
             """按本轮缺的内容组链：只缺媒体时不重发正文，只缺正文时不再碰媒体。"""
+            nonlocal media
+            if (
+                need_media
+                and media is not None
+                and media.ok
+                and media.path
+                and not os.path.exists(media.path)
+            ):
+                # 群发期间共享文件被 FIFO 淘汰：重新预热一次再发，否则后面所有
+                # 会话都只能收到正文（下载层自带 retry_count 与退避）。
+                media = await self._prewarm_media(apod_data)
             if need_media and not need_text:
                 media_chain = await self._build_media_chain(apod_data, media=media)
                 return [media_chain] if media_chain.chain else []
@@ -2640,15 +2642,15 @@ class APOD(Star):
                 )
                 await asyncio.sleep(delay)
 
-    async def _localize_image(self, url: str) -> LocalImage:
-        """按需把图片下载到本地缓存；返回 LocalImage（path 为空即不可用）。
+    async def _localize_image(self, url: str) -> Optional[str]:
+        """按需把图片下载到本地缓存并返回本地路径；关闭或最终失败时返回 None。
 
         下载走 AstrBot 的 download_file（自带 trust_env=True），失败按
-        retry_count 重试并退避；最终失败一律打 WARN，不静默降级，
-        并把“重试无意义”（4xx）与“暂时失败”区分给调用方。
+        retry_count 重试并退避（4xx 由下载层直接放弃）；最终失败打 WARN，
+        不静默降级。
         """
         if not self.cache_images or not url:
-            return LocalImage()
+            return None
         path = self._image_cache_path(url)
         epoch = self._cache_epoch
         if os.path.exists(path):
@@ -2659,9 +2661,9 @@ class APOD(Star):
                 pass
             if epoch != self._cache_epoch:
                 # 期间发生过清理：不登记索引，直接用本地文件。
-                return LocalImage(path)
+                return path
             await self._touch_image_cache(path)
-            return LocalImage(path)
+            return path
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             # 唯一临时名：同一 URL 并发下载不会互写同一个 .part。
@@ -2670,7 +2672,7 @@ class APOD(Star):
                 await self._download_image_with_retry(url, tmp_path)
                 if epoch != self._cache_epoch:
                     # 下载期间发生了清理：丢弃临时文件，绝不覆盖目标路径。
-                    return LocalImage()
+                    return None
                 os.replace(tmp_path, path)
             finally:
                 # CancelledError 不走 except Exception；统一在 finally 清理临时文件。
@@ -2680,12 +2682,12 @@ class APOD(Star):
                     pass
             if epoch != self._cache_epoch:
                 # 期间发生过清理：不登记索引，直接用本地文件。
-                return LocalImage(path)
+                return path
             await self._touch_image_cache(path)
-            return LocalImage(path)
+            return path
         except Exception as exc:
             logger.warning(f"图片缓存失败（阶段=下载）：{_safe_exc_text(exc)}")
-            return LocalImage(fatal=self._is_fatal_download_error(exc))
+            return None
 
     def _split_media(self, media_chain: MessageChain) -> bool:
         """媒体与正文是否分两条消息：图片跟随 is_divided，视频恒拆。
@@ -2733,8 +2735,8 @@ class APOD(Star):
             return MediaReady(ok=False)
         if not plan.localize:
             return MediaReady(ok=True)
-        local = await self._localize_image(plan.localize)
-        return MediaReady(ok=bool(local.path), path=local.path or "", fatal=local.fatal)
+        local_path = await self._localize_image(plan.localize)
+        return MediaReady(ok=bool(local_path), path=local_path or "")
 
     async def _build_media_chain(
         self, apod_data: Dict[str, Any], media: Optional[MediaReady] = None
@@ -2751,9 +2753,9 @@ class APOD(Star):
         if not plan.localize:
             return MessageChain(chain=[Comp.Video.fromURL(plan.url)])
         if media is None:
-            local = await self._localize_image(plan.localize)
-            if local.path:
-                return MessageChain(chain=[Comp.Image.fromFileSystem(local.path)])
+            local_path = await self._localize_image(plan.localize)
+            if local_path:
+                return MessageChain(chain=[Comp.Image.fromFileSystem(local_path)])
             return MessageChain(chain=[Comp.Image.fromURL(plan.localize)])
         if not media.ok or not media.path or not os.path.exists(media.path):
             # 预热失败或文件已被淘汰：本轮只发正文，下轮再补媒体。
