@@ -107,12 +107,31 @@ APOD_PREFETCH_RETRY_ATTEMPTS = 3
 IMAGE_CACHE_MIN_AGE_SECONDS = 120
 # 单条消息发送超时：视频上传慢，给足时间，但不能无限挂住推送循环。
 SEND_TIMEOUT_SECONDS = 60
+# 媒体预热结果标记：_MEDIA_AUTO = 未预热，交给组链函数自行本地化；
+# None = 下载失败（本轮不发媒体）；空串 = 无需本地文件（视频直链）；
+# 其它字符串 = 已本地化的缓存路径。
+_MEDIA_AUTO = object()
+
+
+class MediaPlan(NamedTuple):
+    """本期媒体的发法：send=是否发送媒体，localize=需要本地缓存的 URL，url=原始地址。
+
+    localize 为空串时表示无需本地文件（视频直链交由平台上传）。
+    """
+
+    send: bool
+    localize: str
+    url: str
 
 
 class ChainSendReport(NamedTuple):
-    """success=正文或仅媒体已送达（允许舍弃失败媒体），media_sent=媒体已送达。"""
+    """投递结果：text_sent=正文已送达，media_sent=媒体已送达。
 
-    success: bool
+    两者独立记录：正文成功而媒体失败时是 (True, False)，推送检查点据此
+    在下一轮只补媒体，而不是把该会话当成“整期送达”从而永久丢图。
+    """
+
+    text_sent: bool
     media_sent: bool
 
 
@@ -512,7 +531,7 @@ class APOD(Star):
             return result
 
         report = await self._send_chains(chains, send, f"{label} 指令回复")
-        return report.success
+        return report.text_sent
 
     async def _reply_text(
         self,
@@ -688,7 +707,7 @@ class APOD(Star):
             partial(self.context.send_message, event.unified_msg_origin),
             label=f"{label}发送",
         )
-        if not sent.success:
+        if not sent.text_sent:
             return f"{label}发送失败：请检查平台连接或发送日志后重试。"
         title = (title_zh or apod_data.get("title") or "").strip()
         return (
@@ -741,6 +760,15 @@ class APOD(Star):
             isinstance(entry, dict)
             and str(entry.get("link") or "") == link
             and bool(entry.get("media_sent"))
+        )
+
+    @staticmethod
+    def _checkpoint_text_sent(entry: Any, link: str) -> bool:
+        """检查点是否记录“该期正文已送达、媒体待补发”。"""
+        return (
+            isinstance(entry, dict)
+            and str(entry.get("link") or "") == link
+            and not bool(entry.get("media_sent"))
         )
 
     async def _cache_translation(
@@ -2210,7 +2238,8 @@ class APOD(Star):
             logger.error(f"{exc}：为避免重复群发，本轮跳过推送检查。")
             return False
         # 检查点值：字符串 = 整期送达；{"link": ..., "media_sent": True} =
-        # 媒体已送达、正文待补发（下轮只补正文，不重发视频）。
+        # 媒体已送达、正文待补发（下轮只补正文，不重发视频）；
+        # {"link": ..., "media_sent": False} = 正文已送达、媒体待补发（下轮只补媒体）。
         pending = [umo for umo in sessions if pushed.get(umo) != link]
 
         last = await self.get_cache("last_pushed_apod")
@@ -2236,27 +2265,68 @@ class APOD(Star):
             return True
 
         title_zh, explanation_zh, tomorrow_zh = await self._translate_fields(apod_data)
+        media_expected = self._media_plan(apod_data).send
+        # 媒体预热放在会话循环外：整期只下载一次，所有会话共享结果。
+        # 下载失败时 media_path=None，本轮只发正文，检查点记 media_sent=False，
+        # 下一轮再补媒体链（不再让平台二次下载后把整期记成已送达）。
+        media_path: Any = _MEDIA_AUTO
+        if media_expected and any(
+            not self._checkpoint_media_sent(pushed.get(umo), link) for umo in pending
+        ):
+            media_path = await self._prewarm_media(apod_data)
         delivered = 0
+        text_delivered = 0
+        media_delivered = 0
         for umo in pending:
-            # 每个会话发送前重建消息链：本地图片可能已被其他请求淘汰，
-            # 重建会命中缓存并刷新保护时间（必要时重新下载）。
-            if self._checkpoint_media_sent(pushed.get(umo), link):
+            entry = pushed.get(umo)
+            media_done = self._checkpoint_media_sent(entry, link)
+            text_done = self._checkpoint_text_sent(entry, link)
+            if media_done:
                 # 直接构建待补正文，不下载或刷新已经送达的媒体。
                 text = self._build_text_chain(
                     apod_data, title_zh, explanation_zh, tomorrow_zh
                 )
                 chains = [text] if text.chain else []
+            elif text_done:
+                # 正文已送达、媒体待补：只发媒体链，不重发正文。
+                media_chain = await self._build_media_chain(
+                    apod_data, media_path=media_path
+                )
+                chains = [media_chain] if media_chain.chain else []
             else:
                 chains = await self._build_apod_chains(
-                    apod_data, title_zh, explanation_zh, tomorrow_zh
+                    apod_data,
+                    title_zh,
+                    explanation_zh,
+                    tomorrow_zh,
+                    media_path=media_path,
                 )
+            if not chains:
+                # 本轮无内容可发（如媒体仍未下载成功）：留待下一轮。
+                continue
             report = await self._send_chains(
                 chains, partial(self.context.send_message, umo), f"APOD 推送到 {umo}"
             )
-            if report.success:
+            if media_done:
+                text_ok, media_ok = report.text_sent, True
+            elif text_done:
+                text_ok, media_ok = True, report.media_sent
+            else:
+                text_ok = report.text_sent
+                media_ok = report.media_sent or not media_expected
+            if text_ok:
+                text_delivered += 1
+            if media_ok:
+                media_delivered += 1
+            if text_ok and media_ok:
                 pushed[umo] = link
                 delivered += 1
-            elif report.media_sent:
+            elif text_ok:
+                logger.warning(
+                    f"APOD 推送到 {umo} 正文已送达但媒体未送达，下轮只补媒体。"
+                )
+                pushed[umo] = {"link": link, "media_sent": False}
+            elif media_ok:
                 logger.warning(f"APOD 推送到 {umo} 媒体已送达但正文失败，下轮只补正文。")
                 pushed[umo] = {"link": link, "media_sent": True}
             else:
@@ -2272,8 +2342,9 @@ class APOD(Star):
         )
         missed = len(pending) - delivered
         logger.info(
-            f"APOD 新一期已推送：{date}，本次送达 {delivered}/{len(pending)} 个会话"
-            + (f"，{missed} 个待补发。" if missed else "。")
+            f"APOD 本次推送 {date}：正文 {text_delivered}/{len(pending)}、"
+            f"媒体 {media_delivered}/{len(pending)}"
+            + (f"，{missed} 个会话待补发。" if missed else "。")
         )
         return missed == 0
 
@@ -2476,33 +2547,64 @@ class APOD(Star):
             isinstance(item, Comp.Video) for item in media_chain.chain
         )
 
-    async def _build_media_chain(self, apod_data: Dict[str, Any]) -> MessageChain:
-        """只含媒体组件的消息链；未开启发送媒体或无可用媒体时为空链。"""
-        chain = []
-        url = apod_data.get("hdurl") or apod_data.get("url")
+    def _media_plan(self, apod_data: Dict[str, Any]) -> MediaPlan:
+        """按本期数据决定媒体怎么发：视频直链无需本地文件，YouTube 用封面帧。"""
+        url = str(apod_data.get("hdurl") or apod_data.get("url") or "").strip()
+        if not self.send_media or not url:
+            return MediaPlan(False, "", url)
         media_type = str(apod_data.get("media_type") or "").strip().lower()
+        if media_type != "video":
+            return MediaPlan(True, url, url)
         video_platform = str(apod_data.get("video_platform") or "").strip().lower()
-        if self.send_media and url:
-            if media_type == "video":
-                # YouTube 只有网页地址，交给平台当视频发只会失败；
-                # 观看地址由正文字段展示，封面帧代替视频组件。
-                if video_platform != VIDEO_PLATFORM_YOUTUBE:
-                    chain.append(Comp.Video.fromURL(url))
-                else:
-                    poster_url = str(apod_data.get("poster_url") or "").strip()
-                    if poster_url:
-                        local_path = await self._localize_image(poster_url)
-                        if local_path:
-                            chain.append(Comp.Image.fromFileSystem(local_path))
-                        else:
-                            chain.append(Comp.Image.fromURL(poster_url))
-            else:
-                local_path = await self._localize_image(url)
-                if local_path:
-                    chain.append(Comp.Image.fromFileSystem(local_path))
-                else:
-                    chain.append(Comp.Image.fromURL(url))
-        return MessageChain(chain=chain)
+        if video_platform != VIDEO_PLATFORM_YOUTUBE:
+            return MediaPlan(True, "", url)
+        poster_url = str(apod_data.get("poster_url") or "").strip()
+        return (
+            MediaPlan(True, poster_url, url)
+            if poster_url
+            else MediaPlan(False, "", url)
+        )
+
+    async def _prewarm_media(self, apod_data: Dict[str, Any]) -> Any:
+        """整期只下载一次媒体，返回交给 _build_apod_chains 的 media_path。
+
+        关闭图片缓存时不预热（返回 _MEDIA_AUTO），由组链函数回退远端 URL；
+        视频直链无需本地文件（返回空串）；下载失败返回 None（本轮不发媒体）。
+        """
+        if not self.cache_images:
+            return _MEDIA_AUTO
+        plan = self._media_plan(apod_data)
+        if not plan.send:
+            return None
+        if not plan.localize:
+            return ""
+        return await self._localize_image(plan.localize)
+
+    async def _build_media_chain(
+        self, apod_data: Dict[str, Any], media_path: Any = _MEDIA_AUTO
+    ) -> MessageChain:
+        """只含媒体组件的消息链；未开启发送媒体或无可用媒体时为空链。
+
+        media_path 决定媒体来源：
+          _MEDIA_AUTO（默认）= 本函数自行本地化，失败回退远端 URL
+              （指令/工具路径保持旧行为）；
+          None = 调用方预热失败，本轮不构造 Image，避免平台二次下载后再报错；
+          空串 = 无需本地文件（视频直链）；其它字符串 = 本地缓存路径。
+        """
+        plan = self._media_plan(apod_data)
+        if not plan.send:
+            return MessageChain(chain=[])
+        if not plan.localize:
+            return MessageChain(chain=[Comp.Video.fromURL(plan.url)])
+        if media_path is _MEDIA_AUTO:
+            local_path = await self._localize_image(plan.localize)
+            if local_path:
+                return MessageChain(chain=[Comp.Image.fromFileSystem(local_path)])
+            return MessageChain(chain=[Comp.Image.fromURL(plan.localize)])
+        if media_path is None or not os.path.exists(str(media_path)):
+            # 预热失败或文件已被淘汰：本轮只发正文，下轮再补媒体。
+            return MessageChain(chain=[])
+        return MessageChain(chain=[Comp.Image.fromFileSystem(str(media_path))])
 
     def _build_text_chain(
         self,
@@ -2529,9 +2631,14 @@ class APOD(Star):
         explanation_zh: Optional[str],
         tomorrow_zh: Optional[str] = None,
         display_name: str = PLUGIN_DISPLAY_NAME,
+        media_path: Any = _MEDIA_AUTO,
     ) -> list[MessageChain]:
-        """按 _split_media 返回要发送的消息链：1 条=合并，2 条=媒体+正文。"""
-        media_chain = await self._build_media_chain(apod_data)
+        """按 _split_media 返回要发送的消息链：1 条=合并，2 条=媒体+正文。
+
+        media_path 默认 _MEDIA_AUTO（自行本地化），推送路径传入预热结果，
+        一次下载供所有会话共享。
+        """
+        media_chain = await self._build_media_chain(apod_data, media_path=media_path)
         text_chain = self._build_text_chain(
             apod_data,
             title_zh,
@@ -2551,15 +2658,18 @@ class APOD(Star):
 
     @staticmethod
     async def _send_chain(
-        send: Callable[[MessageChain], Awaitable[Any]], chain: MessageChain, label: str
+        send: Callable[[MessageChain], Awaitable[Any]],
+        chain: MessageChain,
+        label: str,
+        stage: str = "发送",
     ) -> bool:
         try:
             sent = await asyncio.wait_for(send(chain), timeout=SEND_TIMEOUT_SECONDS)
         except Exception as exc:
-            logger.error(f"{label}失败：{exc!r}")
+            logger.error(f"{label}失败（阶段={stage}）：{exc!r}")
             return False
         if sent is False:
-            logger.error(f"{label}失败：发送接口返回 False。")
+            logger.error(f"{label}失败（阶段={stage}）：发送接口返回 False。")
             return False
         return True
 
@@ -2572,33 +2682,39 @@ class APOD(Star):
         """逐条发送消息链；媒体那条失败时舍媒体保正文（合并链补发纯文字）。
 
         正文失败一律视为未送达：宁可下轮补发（媒体已送达时只补正文），
-        也不能让说明文本静默丢掉。
+        也不能让说明文本静默丢掉。带媒体的链失败更可能是上传失败，日志按此区分。
         """
         if not chains:
             return ChainSendReport(False, False)
         degraded = False
+        text_sent = False
         media_sent = False
         for index, chain in enumerate(chains):
             has_media = any(
                 isinstance(item, (Comp.Image, Comp.Video)) for item in chain.chain
             )
-            if await self._send_chain(send, chain, label):
+            has_text = any(isinstance(item, Comp.Plain) for item in chain.chain)
+            if await self._send_chain(
+                send, chain, label, "上传" if has_media else "发送"
+            ):
                 media_sent = media_sent or has_media
+                text_sent = text_sent or has_text
                 continue
             if not has_media:
-                return ChainSendReport(False, media_sent)
+                return ChainSendReport(text_sent, media_sent)
             fallback = MessageChain(
                 chain=[item for item in chain.chain if isinstance(item, Comp.Plain)]
             )
             if fallback.chain:
                 if not await self._send_chain(send, fallback, label):
                     return ChainSendReport(False, media_sent)
+                text_sent = True
             elif index == len(chains) - 1:
-                return ChainSendReport(False, media_sent)
+                return ChainSendReport(text_sent, media_sent)
             degraded = True
         if degraded:
             logger.warning(f"{label}已降级为纯文字。")
-        return ChainSendReport(True, media_sent)
+        return ChainSendReport(text_sent, media_sent)
 
     async def terminate(self):
         logger.info("正在终止 NASA APOD 插件...")
