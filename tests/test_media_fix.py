@@ -2107,8 +2107,24 @@ class MediaDownloadRetryTests(unittest.TestCase):
         self.assertNotIn("SECRET456", text)
         self.assertIn("<url>", text)
 
+    def test_redaction_covers_quotes_and_wrapping_punctuation(self):
+        # 单引号、括号都是合法的 URL 字符（RFC 3986），不能在它们处收尾。
+        cases = [
+            "https://cdn.example.invalid/today's.png?sig=TEST_SIGNATURE",
+            "URL('https://cdn.example.invalid/a.jpg?sig=S2')",
+            "(see https://cdn.example.invalid/b.jpg?sig=S3)",
+            "https://cdn.example.invalid/c.png?sig=S4.",
+            "失败：https://cdn.example.invalid/d.png?sig=S5",
+        ]
+        for raw in cases:
+            with self.subTest(raw=raw):
+                text = apod_main._safe_exc_text(RuntimeError(raw))
+                self.assertNotIn("sig=", text)
+                self.assertIn("<url>", text)
+
     def test_send_logs_do_not_leak_urls(self):
-        secret = "https://qq.example.com/send?token=SECRET789"
+        # 用带单引号的路径走真实发送失败链路（评审给出的原例）。
+        secret = "https://cdn.example.invalid/today's.png?sig=TEST_SIGNATURE"
         chain = apod_main.MessageChain(chain=[_COMP.Plain("body")])
 
         async def leaky_send(_chain):
@@ -2118,7 +2134,8 @@ class MediaDownloadRetryTests(unittest.TestCase):
             report = asyncio.run(self.plugin._send_chains([chain], leaky_send))
         self.assertFalse(report.text_sent)
         text = chr(10).join(logs.output)
-        self.assertNotIn("SECRET789", text)
+        self.assertNotIn("TEST_SIGNATURE", text)
+        self.assertNotIn("today's.png", text)
         self.assertIn("<url>", text)
 
     def test_shared_retry_helpers(self):

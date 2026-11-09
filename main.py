@@ -126,9 +126,26 @@ CHECKPOINT_MEDIA_SENT = (CHECKPOINT_DONE, CHECKPOINT_TEXT_PENDING)
 # 定时推送未完成时只补试一次（日更任务丢了就永久没有）；6 分钟足够躲过
 # 夜间常见抖动，又不会在凌晨反复打扰。
 PUSH_RETRY_DELAY_SECONDS = 360
-# 日志脱敏：异常文本可能带完整 URL（query 上可能有签名）。只排除空白与引号，
-# 宁可多包一层（如路径里的括号、行尾标点）也不能把 ?sig=… 漏在日志里。
-_URL_IN_TEXT_PATTERN = re.compile(r"https?://[^\s'\"<>]+")
+# 日志脱敏：异常文本可能带完整 URL（query 上可能有签名）。单引号、括号都是
+# 合法的 URL 字符（RFC 3986 sub-delims），在这些字符处收尾会把 ?sig=… 漏出去，
+# 因此只按空白切分，再把紧贴 URL 前后的标点还原。
+_URL_IN_TEXT_PATTERN = re.compile(r"https?://\S+")
+_URL_WRAPPING_PUNCT = ")]}>'\",.;:："
+
+
+def _redact_urls(text: str) -> str:
+    """把文本里的 URL 换成 <url>，保留紧贴它的包裹标点。"""
+    parts = []
+    position = 0
+    for match in _URL_IN_TEXT_PATTERN.finditer(text):
+        url = match.group(0)
+        trimmed = url.rstrip(_URL_WRAPPING_PUNCT)
+        parts.append(text[position:match.start()])
+        parts.append("<url>")
+        parts.append(url[len(trimmed):])
+        position = match.end()
+    parts.append(text[position:])
+    return "".join(parts)
 
 
 def _is_fatal_client_status(status: int) -> bool:
@@ -144,7 +161,7 @@ def _retry_delay(attempt: int, jitter: bool = False) -> float:
 
 def _safe_exc_text(exc: BaseException) -> str:
     """异常文本入日志前脱敏：保留异常类型与内容，只把 URL 换成占位符。"""
-    return f"{type(exc).__name__}: {_URL_IN_TEXT_PATTERN.sub('<url>', str(exc))}"
+    return f"{type(exc).__name__}: {_redact_urls(str(exc))}"
 
 
 class MediaPlan(NamedTuple):
