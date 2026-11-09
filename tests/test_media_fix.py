@@ -867,19 +867,23 @@ class RenderingTests(unittest.TestCase):
         # 期望值：(text_sent, media_sent, unknown)
         cases = [
             ("merged fallback", [[image, text]], [False, None],
-             (True, False, False, False), [["Image", "Plain"], ["Plain"]]),
+             (True, False, False, False, False), [["Image", "Plain"], ["Plain"]]),
             ("fallback failure", [[image, text]],
-             [_pre_submit_error(), False], (False, False, False, False),
+             [apod_main.aiohttp.InvalidURL(), False],
+             (False, False, False, False, False),
+             [["Image", "Plain"], ["Plain"]]),
+            ("stale media", [[image, text]], [FileNotFoundError("gone"), None],
+             (True, False, False, False, True),
              [["Image", "Plain"], ["Plain"]]),
             ("split media failure", [[image], [text]], [False, None],
-             (True, False, False, False), [["Image"], ["Plain"]]),
+             (True, False, False, False, False), [["Image"], ["Plain"]]),
             ("split text failure", [[image], [text]], [None, False],
-             (False, True, False, False), [["Image"], ["Plain"]]),
+             (False, True, False, False, False), [["Image"], ["Plain"]]),
             ("media only failure", [[image]], [False],
-             (False, False, False, False), [["Image"]]),
+             (False, False, False, False, False), [["Image"]]),
             ("timeout is unknown", [[image, text]], [asyncio.TimeoutError()],
-             (True, True, True, True), [["Image", "Plain"]]),
-            ("empty", [], [], (False, False, False, False), []),
+             (True, True, True, True, False), [["Image", "Plain"]]),
+            ("empty", [], [], (False, False, False, False, False), []),
         ]
         for name, components, outcomes, expected, attempts in cases:
             with self.subTest(name=name):
@@ -2418,6 +2422,103 @@ class PushMediaPrewarmTests(unittest.TestCase):
             ),
         )
 
+    def test_cache_disabled_prepares_remote_image_before_send(self):
+        # 关缓存时平台会自己去下远图：下载失败会把同一条消息里的正文一起丢掉。
+        # 现在先下到临时文件，失败只发正文并保留媒体待补。
+        self.plugin.cache_images = False
+        sent = []
+
+        async def download_fails(url, dest):
+            raise _network_error()
+
+        async def send(umo, chain):
+            sent.append([type(item).__name__ for item in chain.chain])
+            return None
+
+        self.plugin.context = SimpleNamespace(send_message=send)
+        with patch.object(self.plugin, "_download_image", download_fails),              patch.object(apod_main.asyncio, "sleep", AsyncMock()):
+            self.assertFalse(asyncio.run(self.plugin._push_check()))
+        # 只发纯文字，不把 Image 交给平台去下载。
+        self.assertEqual(sent, [["Plain"]])
+        self.assertEqual(
+            self.store["pushed_by_session"],
+            {"a": {"link": LINK, "media_sent": False}},
+        )
+
+    def test_cache_disabled_uses_temp_file_then_cleans_up(self):
+        self.plugin.cache_images = False
+        created = []
+        sent = []
+
+        async def download(url, dest):
+            created.append(dest)
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        async def send(umo, chain):
+            sent.append([type(item).__name__ for item in chain.chain])
+            return None
+
+        self.plugin.context = SimpleNamespace(send_message=send)
+        with patch.object(self.plugin, "_download_image", download):
+            self.assertTrue(asyncio.run(self.plugin._push_check()))
+        self.assertEqual(sent, [["Image", "Plain"]])
+        self.assertEqual(len(created), 1)
+        self.assertFalse(os.path.exists(created[0]))
+
+    def test_unreadable_cache_file_is_redownloaded(self):
+        # 缓存文件读不出来：不能反复复用同一份坏文件，应作废并重新下载。
+        async def download(url, dest):
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        path = self.plugin._image_cache_path(self.media_url)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(b"broken")
+        downloads = []
+
+        async def counting_download(url, dest):
+            downloads.append(url)
+            await download(url, dest)
+
+        with patch.object(self.plugin, "_is_readable_file", side_effect=lambda p: False):
+            with patch.object(self.plugin, "_download_image", counting_download):
+                self.plugin._remove_file(path)  # 模拟坏文件被删除后重下
+                got = asyncio.run(self.plugin._localize_image(self.media_url))
+        self.assertEqual(len(downloads), 1)
+        self.assertTrue(got and os.path.exists(got))
+
+    def test_stale_media_is_not_resent_forever(self):
+        # 适配器读不了这份文件：第一次失败后本轮只重新准备一次，不再反复刷图。
+        self.plugin.config["push"]["sessions"] = ["a"]
+
+        async def download(url, dest):
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        attempts = []
+
+        async def permission_denied(umo, chain):
+            kinds = [type(item).__name__ for item in chain.chain]
+            attempts.append(kinds)
+            if "Image" in kinds:
+                raise PermissionError("denied")
+            return None
+
+        self.plugin.context = SimpleNamespace(send_message=permission_denied)
+        with patch.object(self.plugin, "_download_image", download),              patch.object(apod_main.asyncio, "sleep", AsyncMock()):
+            self.assertFalse(asyncio.run(self.plugin._push_check()))
+        # 首次图文 + 降级正文 + 重新准备后的再一次补图；不再无限复用坏文件。
+        self.assertEqual(
+            [k for k in attempts if "Image" in k],
+            [["Image", "Plain"], ["Image"]],
+        )
+        self.assertEqual(
+            self.store["pushed_by_session"],
+            {"a": {"link": LINK, "media_sent": False}},
+        )
+
     def test_summary_does_not_report_unknown_as_delivered(self):
         async def ok(url, dest):
             with open(dest, "wb") as handle:
@@ -2546,8 +2647,8 @@ class PushMediaPrewarmTests(unittest.TestCase):
             pass
 
         # 第一次成功（合并链上传失败、正文降级），之后每次只补图都失败。
-        outcomes = [_pre_submit_error(), None] + [
-            _pre_submit_error()
+        outcomes = [apod_main.aiohttp.InvalidURL(), None] + [
+            apod_main.aiohttp.InvalidURL()
         ] * self.plugin.retry_count
         self.send.side_effect = outcomes
         with patch.object(self.plugin, "_download_image", ok), \
@@ -2695,6 +2796,10 @@ class PushMediaPrewarmTests(unittest.TestCase):
         self.plugin.cache_images = False
         sent = []
 
+        async def ok(url, dest):
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
         async def send(umo, chain):
             kinds = [type(item).__name__ for item in chain.chain]
             sent.append(kinds)
@@ -2703,9 +2808,9 @@ class PushMediaPrewarmTests(unittest.TestCase):
             return None
 
         self.plugin.context = SimpleNamespace(send_message=send)
-        with patch.object(apod_main.asyncio, "sleep", AsyncMock()):
+        with patch.object(self.plugin, "_download_image", ok),              patch.object(apod_main.asyncio, "sleep", AsyncMock()):
             self.assertTrue(asyncio.run(self.plugin._push_check()))
-        # 关缓存时直接发远端 URL，仍能在本轮补图（media=None 不等于“不可用”）。
+        # 关缓存时媒体先下到临时文件，仍能在本轮补图。
         self.assertEqual(sent, [["Image", "Plain"], ["Plain"], ["Image"]])
         self.assertEqual(self.store["pushed_by_session"], {"a": LINK})
 
