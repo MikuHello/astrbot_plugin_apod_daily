@@ -2395,6 +2395,9 @@ class APOD(Star):
         # 走过多少次重新预热都不会漏（TemporaryDirectory 自带析构兜底，任务
         # 取消或异常退出时同样不会把文件留在盘上）。
         media = MediaReady(ok=False)
+        # 本轮创建的临时媒体文件（含目录创建失败后落到系统临时目录的），
+        # 统一在 finally 里清理。
+        temp_files: list[str] = []
         needs_media = media_expected and any(not media_ok(umo) for umo in pending)
         media_dir: Optional[tempfile.TemporaryDirectory] = None
         if needs_media and not self.cache_images:
@@ -2427,7 +2430,7 @@ class APOD(Star):
                     stale_recoveries += 1
                     self._remove_file(media.path)
                     media = await self._prewarm_media(
-                        apod_data, media_dir.name if media_dir else None
+                        apod_data, media_dir.name if media_dir else None, temp_files
                     )
                     media_stale = False
             if need_media and not need_text:
@@ -2465,7 +2468,7 @@ class APOD(Star):
             nonlocal media, media_stale, stale_recoveries
             if needs_media:
                 media = await self._prewarm_media(
-                    apod_data, media_dir.name if media_dir else None
+                    apod_data, media_dir.name if media_dir else None, temp_files
                 )
             work = list(pending)
             for attempt in range(self.retry_count + 1):
@@ -2500,7 +2503,10 @@ class APOD(Star):
                                 "不再重发该部分，请以群内消息为准。"
                             )
                         if report.media_stale:
+                            # 已经确认这份文件读不了：当场作废，别让下一次检查
+                            # 再撞上它；是否重新下载由重下预算决定。
                             media_stale = True
+                            self._remove_file(media.path)
                         done_text = done_text or report.text_sent
                         done_media = done_media or report.media_sent
                     else:
@@ -2564,6 +2570,8 @@ class APOD(Star):
         finally:
             if media_dir is not None:
                 media_dir.cleanup()
+            for path in temp_files:
+                self._remove_file(path)
 
         text_delivered = sum(
             1 for umo in text_needed if text_ok(umo) and umo not in unknown_text
@@ -2715,7 +2723,10 @@ class APOD(Star):
             pass
 
     async def _download_to_temp(
-        self, url: str, directory: Optional[str] = None
+        self,
+        url: str,
+        directory: Optional[str] = None,
+        created: Optional[list] = None,
     ) -> Optional[str]:
         """把远图先下到临时文件（不写缓存），让“读图失败”发生在提交之前。
 
@@ -2744,6 +2755,9 @@ class APOD(Star):
             logger.warning(f"图片预下载失败（阶段=下载）：{_safe_exc_text(exc)}")
             self._remove_file(tmp_path)
             return None
+        if created is not None:
+            # 目录创建失败时会退回系统临时目录，这些文件同样要登记由调用方清理。
+            created.append(tmp_path)
         return tmp_path
 
     @classmethod
@@ -2869,7 +2883,10 @@ class APOD(Star):
         )
 
     async def _prewarm_media(
-        self, apod_data: Dict[str, Any], media_dir: Optional[str] = None
+        self,
+        apod_data: Dict[str, Any],
+        media_dir: Optional[str] = None,
+        created: Optional[list] = None,
     ) -> MediaReady:
         """整期只下载一次媒体，返回预热结果。
 
@@ -2885,7 +2902,9 @@ class APOD(Star):
         if self.cache_images:
             local_path = await self._localize_image(plan.localize)
         else:
-            local_path = await self._download_to_temp(plan.localize, media_dir)
+            local_path = await self._download_to_temp(
+                plan.localize, media_dir, created
+            )
         return MediaReady(ok=bool(local_path), path=local_path or "")
 
     async def _build_media_chain(

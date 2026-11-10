@@ -2568,8 +2568,8 @@ class PushMediaPrewarmTests(unittest.TestCase):
                 real = self.plugin._download_to_temp
                 calls = {"n": 0}
 
-                async def spy(url, directory=None):
-                    path = await real(url, directory)
+                async def spy(url, directory=None, tracked=None):
+                    path = await real(url, directory, tracked)
                     created.append(path)
                     return path
 
@@ -2606,13 +2606,25 @@ class PushMediaPrewarmTests(unittest.TestCase):
             sent.append([type(item).__name__ for item in chain.chain])
             return None
 
+        created = []
+        real = self.plugin._download_to_temp
+
+        async def spy(url, directory=None, tracked=None):
+            path = await real(url, directory, tracked)
+            created.append(path)
+            return path
+
         self.plugin.context = SimpleNamespace(send_message=send)
         with patch.object(
             tempfile, "TemporaryDirectory", side_effect=OSError("No space left")
-        ), patch.object(self.plugin, "_download_image", download):
+        ), patch.object(self.plugin, "_download_to_temp", spy),              patch.object(self.plugin, "_download_image", download):
             self.assertTrue(asyncio.run(self.plugin._push_check()))
         self.assertEqual(sent, [["Image", "Plain"]])
         self.assertEqual(self.store["pushed_by_session"], {"a": LINK})
+        # 目录创建失败后退回系统临时目录，这些文件同样要清掉。
+        self.assertTrue(created)
+        for path in created:
+            self.assertFalse(os.path.exists(path), path)
 
     def test_eviction_uses_the_shared_redownload_budget(self):
         # 组链前发现文件被淘汰，也要消耗同一份重下预算，不能每个会话各下一次。
@@ -2643,8 +2655,8 @@ class PushMediaPrewarmTests(unittest.TestCase):
         created = []
         real = self.plugin._download_to_temp
 
-        async def spy(url, directory=None):
-            path = await real(url, directory)
+        async def spy(url, directory=None, tracked=None):
+            path = await real(url, directory, tracked)
             created.append(path)
             return path
 
@@ -2666,6 +2678,29 @@ class PushMediaPrewarmTests(unittest.TestCase):
         self.assertTrue(created)
         for path in created:
             self.assertFalse(os.path.exists(path), path)
+
+    def test_stale_media_is_invalidated_even_without_retries(self):
+        # retry_count=0：本轮不再重下，但坏文件必须当场作废，下次检查不能复用。
+        self.plugin.retry_count = 0
+        downloads = []
+
+        async def download(url, dest):
+            downloads.append(url)
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        async def denied(umo, chain):
+            if any(type(item).__name__ == "Image" for item in chain.chain):
+                raise PermissionError("denied")
+            return None
+
+        self.plugin.context = SimpleNamespace(send_message=denied)
+        with patch.object(self.plugin, "_download_image", download):
+            asyncio.run(self.plugin._push_check())
+            first = len(downloads)
+            asyncio.run(self.plugin._push_check())
+        self.assertEqual(first, 1)
+        self.assertEqual(len(downloads), 2)  # 第二次检查重新下载，而不是复用坏文件
 
     def test_summary_does_not_report_unknown_as_delivered(self):
         async def ok(url, dest):
