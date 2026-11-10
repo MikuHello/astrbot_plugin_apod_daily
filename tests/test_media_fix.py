@@ -2519,6 +2519,80 @@ class PushMediaPrewarmTests(unittest.TestCase):
             {"a": {"link": LINK, "media_sent": False}},
         )
 
+    def test_temp_file_creation_failure_degrades_to_text(self):
+        # 临时盘满：建临时文件失败也要走纯文字降级，不能把整轮推送冲掉。
+        self.plugin.cache_images = False
+        sent = []
+
+        async def send(umo, chain):
+            sent.append([type(item).__name__ for item in chain.chain])
+            return None
+
+        self.plugin.context = SimpleNamespace(send_message=send)
+        with patch.object(
+            tempfile, "mkstemp", side_effect=OSError("No space left on device")
+        ), patch.object(apod_main.asyncio, "sleep", AsyncMock()):
+            self.assertFalse(asyncio.run(self.plugin._push_check()))
+        self.assertEqual(sent, [["Plain"]])
+        self.assertEqual(
+            self.store["pushed_by_session"],
+            {"a": {"link": LINK, "media_sent": False}},
+        )
+
+    def test_stale_recovery_budget_is_shared_across_sessions(self):
+        # 4 个会话持续读失败：重下预算在每次重新预热前检查，整轮最多 1 次恢复。
+        self.plugin.config["push"]["sessions"] = ["a", "b", "c", "d"]
+        downloads = []
+
+        async def download(url, dest):
+            downloads.append(url)
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        async def denied(umo, chain):
+            if any(type(item).__name__ == "Image" for item in chain.chain):
+                raise PermissionError("denied")
+            return None
+
+        self.plugin.context = SimpleNamespace(send_message=denied)
+        with patch.object(self.plugin, "_download_image", download),              patch.object(apod_main.asyncio, "sleep", AsyncMock()):
+            asyncio.run(self.plugin._push_check())
+        self.assertEqual(len(downloads), 1 + apod_main.STALE_MEDIA_RECOVERY_LIMIT)
+
+    def test_temp_files_are_cleaned_on_success_and_cancel(self):
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                self.store.clear()  # 每轮都是“这一期还没推过”
+                self.plugin.cache_images = False
+                created = []
+                real = self.plugin._download_to_temp
+                calls = {"n": 0}
+
+                async def spy(url, directory=None):
+                    path = await real(url, directory)
+                    created.append(path)
+                    return path
+
+                async def download(url, dest):
+                    with open(dest, "wb") as handle:
+                        handle.write(b"img")
+
+                async def send(umo, chain):
+                    calls["n"] += 1
+                    if cancel and calls["n"] == 1:
+                        raise asyncio.CancelledError()
+                    return None
+
+                self.plugin.context = SimpleNamespace(send_message=send)
+                with patch.object(self.plugin, "_download_to_temp", spy),                      patch.object(self.plugin, "_download_image", download):
+                    try:
+                        asyncio.run(self.plugin._push_check())
+                    except asyncio.CancelledError:
+                        pass
+                self.assertTrue(created)
+                for path in created:
+                    self.assertFalse(os.path.exists(path), path)
+
     def test_summary_does_not_report_unknown_as_delivered(self):
         async def ok(url, dest):
             with open(dest, "wb") as handle:

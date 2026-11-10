@@ -123,6 +123,8 @@ SEND_STALE = "stale"
 _PRE_SUBMIT_ERRORS = (aiohttp.InvalidURL,)
 # 本地媒体文件读不出来：说明还没上传，可以补发；但同一份文件不能反复用。
 _STALE_MEDIA_ERRORS = (FileNotFoundError, PermissionError)
+# 一次推送检查里，为“坏文件”重新下载的次数上限（多会话共用一份预算）。
+STALE_MEDIA_RECOVERY_LIMIT = 1
 # 投递检查点状态（每个会话一条）：
 #   done          = 整期送达（旧格式直接存链接字符串）
 #   text_pending  = 媒体已送达、正文待补
@@ -2389,13 +2391,18 @@ class APOD(Star):
         # 媒体预热放在会话循环外：整期只下载一次，所有会话共享结果。
         # 下载失败时 ok=False，本轮只发正文，检查点记 media_sent=False，
         # 下一轮再补媒体链（不再让平台二次下载后把整期记成已送达）。
+        # 关闭图片缓存时的临时媒体统一放这个目录：一个对象持有、一处清理，
+        # 走过多少次重新预热都不会漏（TemporaryDirectory 自带析构兜底，任务
+        # 取消或异常退出时同样不会把文件留在盘上）。
         media = MediaReady(ok=False)
-        temp_media: Optional[str] = None
-        if media_expected and any(not media_ok(umo) for umo in pending):
-            media = await self._prewarm_media(apod_data)
-            if not self.cache_images and media.ok and media.path:
-                # 关闭缓存时媒体是临时文件，本轮结束要删掉。
-                temp_media = media.path
+        media_dir: Optional[tempfile.TemporaryDirectory] = None
+        needs_media = media_expected and any(not media_ok(umo) for umo in pending)
+        if needs_media and not self.cache_images:
+            media_dir = tempfile.TemporaryDirectory(prefix="apod-media-")
+        if needs_media:
+            media = await self._prewarm_media(
+                apod_data, media_dir.name if media_dir else None
+            )
 
         async def build_chains(
             need_text: bool, need_media: bool
@@ -2405,15 +2412,20 @@ class APOD(Star):
             if need_media and (
                 media_stale or (media.path and not self._is_readable_file(media.path))
             ):
-                # 文件被淘汰/读不出来：作废后重新预热一次再发（下载层自带重试），
-                # 否则后面所有会话都只能收到正文，或者反复发送同一个坏文件。
-                if media_stale:
-                    stale_recoveries += 1
-                self._remove_file(media.path)
-                media = await self._prewarm_media(apod_data)
-                media_stale = False
-                if not self.cache_images:
-                    temp_media = media.path or None
+                if media_stale and stale_recoveries >= STALE_MEDIA_RECOVERY_LIMIT:
+                    # 重下预算已用完：不再重下，剩余会话本轮只发正文，留给下次检查。
+                    media = MediaReady(ok=False)
+                    media_stale = False
+                else:
+                    # 文件被淘汰/读不出来：作废后重新预热一次再发（下载层自带重试），
+                    # 否则后面所有会话都只能收到正文，或者反复发送同一个坏文件。
+                    if media_stale:
+                        stale_recoveries += 1
+                    self._remove_file(media.path)
+                    media = await self._prewarm_media(
+                        apod_data, media_dir.name if media_dir else None
+                    )
+                    media_stale = False
             if need_media and not need_text:
                 media_chain = await self._build_media_chain(apod_data, media=media)
                 return [media_chain] if media_chain.chain else []
@@ -2502,7 +2514,8 @@ class APOD(Star):
                 except RuntimeError as exc:
                     # 进度落盘失败立即中止本轮：未确认会话留待下轮补发，避免盲目重发。
                     logger.error(f"{exc}：本轮推送中止。")
-                    self._remove_file(temp_media)
+                    if media_dir is not None:
+                        media_dir.cleanup()
                     return False
 
             remaining = [umo for umo in pending if state_of(umo) != CHECKPOINT_DONE]
@@ -2536,7 +2549,8 @@ class APOD(Star):
         media_delivered = sum(
             1 for umo in media_needed if media_ok(umo) and umo not in unknown_media
         )
-        self._remove_file(temp_media)
+        if media_dir is not None:
+            media_dir.cleanup()
         await self.put_cache(
             "last_pushed_apod", {"date": date, "link": link, "delivered": True}
         )
@@ -2680,16 +2694,27 @@ class APOD(Star):
         except OSError:
             pass
 
-    async def _download_to_temp(self, url: str) -> Optional[str]:
+    async def _download_to_temp(
+        self, url: str, directory: Optional[str] = None
+    ) -> Optional[str]:
         """把远图先下到临时文件（不写缓存），让“读图失败”发生在提交之前。
 
         关闭图片缓存时平台会自己去下载远图：下载失败会把同一条消息里的正文一起
         丢掉，而且事后无法与“已提交但回执丢失”区分。先下好再交给平台，失败只
         降级为纯文字并保留媒体待补。
+
+        建临时文件也算“媒体准备”——失败（如临时盘满）同样只降级为纯文字，
+        不能让异常冲掉整轮推送。
         """
         suffix = os.path.splitext(url.split("?", 1)[0])[1][:8] or ".img"
-        handle, tmp_path = tempfile.mkstemp(prefix="apod-media-", suffix=suffix)
-        os.close(handle)
+        try:
+            handle, tmp_path = tempfile.mkstemp(
+                prefix="apod-media-", suffix=suffix, dir=directory
+            )
+            os.close(handle)
+        except OSError as exc:
+            logger.warning(f"临时媒体文件创建失败（阶段=下载）：{_safe_exc_text(exc)}")
+            return None
         try:
             await self._download_image_with_retry(url, tmp_path)
         except asyncio.CancelledError:
@@ -2823,7 +2848,9 @@ class APOD(Star):
             else MediaPlan(False, "", url)
         )
 
-    async def _prewarm_media(self, apod_data: Dict[str, Any]) -> MediaReady:
+    async def _prewarm_media(
+        self, apod_data: Dict[str, Any], media_dir: Optional[str] = None
+    ) -> MediaReady:
         """整期只下载一次媒体，返回预热结果。
 
         视频直链无需本地文件；下载失败返回 ok=False（本轮不发媒体）。
@@ -2838,7 +2865,7 @@ class APOD(Star):
         if self.cache_images:
             local_path = await self._localize_image(plan.localize)
         else:
-            local_path = await self._download_to_temp(plan.localize)
+            local_path = await self._download_to_temp(plan.localize, media_dir)
         return MediaReady(ok=bool(local_path), path=local_path or "")
 
     async def _build_media_chain(
