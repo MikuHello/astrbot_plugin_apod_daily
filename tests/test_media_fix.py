@@ -2702,6 +2702,31 @@ class PushMediaPrewarmTests(unittest.TestCase):
         self.assertEqual(first, 1)
         self.assertEqual(len(downloads), 2)  # 第二次检查重新下载，而不是复用坏文件
 
+    def test_stale_media_marker_survives_text_failure(self):
+        # 拆链：图片报不可读、正文返回 False（_send_chains 提前返回）。
+        # 失效标记不能丢，否则 6 分钟后的补试还会复用旧图。
+        self.plugin.is_divided = True
+        self.plugin.retry_count = 0
+        downloads = []
+
+        async def download(url, dest):
+            downloads.append(url)
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        async def send(umo, chain):
+            if [type(item).__name__ for item in chain.chain] == ["Image"]:
+                raise PermissionError("denied")
+            return False
+
+        self.plugin.context = SimpleNamespace(send_message=send)
+        with patch.object(self.plugin, "_download_image", download):
+            self.assertFalse(asyncio.run(self.plugin._push_check()))
+            self.assertEqual(len(downloads), 1)
+            asyncio.run(self.plugin._push_check())
+        # 补试重新下载图片，而不是继续用那份坏文件。
+        self.assertEqual(len(downloads), 2)
+
     def test_summary_does_not_report_unknown_as_delivered(self):
         async def ok(url, dest):
             with open(dest, "wb") as handle:

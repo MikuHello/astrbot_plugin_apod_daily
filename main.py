@@ -3040,6 +3040,13 @@ class APOD(Star):
         text_unknown = False
         media_unknown = False
         media_stale = False
+
+        def current_report(text_done: bool) -> ChainSendReport:
+            """按当前累计状态出报告：所有出口共用，避免漏带某个标记。"""
+            return ChainSendReport(
+                text_done, media_sent, text_unknown, media_unknown, media_stale
+            )
+
         for index, chain in enumerate(chains):
             has_media = any(
                 isinstance(item, (Comp.Image, Comp.Video)) for item in chain.chain
@@ -3055,7 +3062,7 @@ class APOD(Star):
                 if has_text:
                     text_unknown = text_sent = True
                 continue
-            if outcome == SEND_STALE:
+            if outcome == SEND_STALE and has_media:
                 # 本地媒体不可用（一定没提交）：记下这笔，让调用方作废文件重来。
                 media_stale = True
             if outcome == SEND_OK:
@@ -3063,9 +3070,7 @@ class APOD(Star):
                 text_sent = text_sent or has_text
                 continue
             if not has_media:
-                return ChainSendReport(
-                    text_sent, media_sent, text_unknown, media_unknown
-                )
+                return current_report(text_sent)
             fallback = MessageChain(
                 chain=[item for item in chain.chain if isinstance(item, Comp.Plain)]
             )
@@ -3075,21 +3080,15 @@ class APOD(Star):
                     # 降级正文也可能已经被平台接收：按已送达记账，不再重发一次。
                     text_unknown = text_sent = True
                 elif outcome != SEND_OK:
-                    return ChainSendReport(
-                        False, media_sent, text_unknown, media_unknown, media_stale
-                    )
+                    return current_report(False)
                 else:
                     text_sent = True
             elif index == len(chains) - 1:
-                return ChainSendReport(
-                    text_sent, media_sent, text_unknown, media_unknown, media_stale
-                )
+                return current_report(text_sent)
             degraded = True
         if degraded:
             logger.warning(f"{label}已降级为纯文字。")
-        return ChainSendReport(
-            text_sent, media_sent, text_unknown, media_unknown, media_stale
-        )
+        return current_report(text_sent)
 
     async def terminate(self):
         logger.info("正在终止 NASA APOD 插件...")
