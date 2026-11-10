@@ -2593,6 +2593,80 @@ class PushMediaPrewarmTests(unittest.TestCase):
                 for path in created:
                     self.assertFalse(os.path.exists(path), path)
 
+    def test_temp_dir_creation_failure_does_not_abort_the_round(self):
+        # 临时目录建不出来（ENOSPC）不能让整轮推送抛异常：退回默认临时目录继续。
+        self.plugin.cache_images = False
+        sent = []
+
+        async def download(url, dest):
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        async def send(umo, chain):
+            sent.append([type(item).__name__ for item in chain.chain])
+            return None
+
+        self.plugin.context = SimpleNamespace(send_message=send)
+        with patch.object(
+            tempfile, "TemporaryDirectory", side_effect=OSError("No space left")
+        ), patch.object(self.plugin, "_download_image", download):
+            self.assertTrue(asyncio.run(self.plugin._push_check()))
+        self.assertEqual(sent, [["Image", "Plain"]])
+        self.assertEqual(self.store["pushed_by_session"], {"a": LINK})
+
+    def test_eviction_uses_the_shared_redownload_budget(self):
+        # 组链前发现文件被淘汰，也要消耗同一份重下预算，不能每个会话各下一次。
+        self.plugin.config["push"]["sessions"] = ["a", "b", "c", "d"]
+        downloads = []
+        path = self.plugin._image_cache_path(self.media_url)
+
+        async def download(url, dest):
+            downloads.append(url)
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        async def evict_after_send(umo, chain):
+            if "Image" in [type(item).__name__ for item in chain.chain]:
+                os.remove(path)
+            return None
+
+        self.plugin.context = SimpleNamespace(send_message=evict_after_send)
+        with patch.object(self.plugin, "_download_image", download),              patch.object(apod_main.asyncio, "sleep", AsyncMock()):
+            asyncio.run(self.plugin._push_check())
+        self.assertLessEqual(
+            len(downloads), 1 + apod_main.STALE_MEDIA_RECOVERY_LIMIT
+        )
+
+    def test_temp_files_cleaned_even_when_cancel_is_held(self):
+        # 取消时不能等异常对象被回收才清理：finally 里当场删。
+        self.plugin.cache_images = False
+        created = []
+        real = self.plugin._download_to_temp
+
+        async def spy(url, directory=None):
+            path = await real(url, directory)
+            created.append(path)
+            return path
+
+        async def download(url, dest):
+            with open(dest, "wb") as handle:
+                handle.write(b"img")
+
+        async def cancel(umo, chain):
+            raise asyncio.CancelledError()
+
+        self.plugin.context = SimpleNamespace(send_message=cancel)
+        held = None
+        with patch.object(self.plugin, "_download_to_temp", spy),              patch.object(self.plugin, "_download_image", download):
+            try:
+                asyncio.run(self.plugin._push_check())
+            except asyncio.CancelledError as exc:
+                held = exc  # 故意保留异常：traceback 会钉住栈帧
+        self.assertIsNotNone(held)
+        self.assertTrue(created)
+        for path in created:
+            self.assertFalse(os.path.exists(path), path)
+
     def test_summary_does_not_report_unknown_as_delivered(self):
         async def ok(url, dest):
             with open(dest, "wb") as handle:

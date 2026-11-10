@@ -2395,14 +2395,17 @@ class APOD(Star):
         # 走过多少次重新预热都不会漏（TemporaryDirectory 自带析构兜底，任务
         # 取消或异常退出时同样不会把文件留在盘上）。
         media = MediaReady(ok=False)
-        media_dir: Optional[tempfile.TemporaryDirectory] = None
         needs_media = media_expected and any(not media_ok(umo) for umo in pending)
+        media_dir: Optional[tempfile.TemporaryDirectory] = None
         if needs_media and not self.cache_images:
-            media_dir = tempfile.TemporaryDirectory(prefix="apod-media-")
-        if needs_media:
-            media = await self._prewarm_media(
-                apod_data, media_dir.name if media_dir else None
-            )
+            try:
+                media_dir = tempfile.TemporaryDirectory(prefix="apod-media-")
+            except OSError as exc:
+                # 目录都建不出来（如临时盘满）：同样只是“媒体准备失败”，
+                # 不能让异常冲掉整轮推送。
+                logger.warning(
+                    f"临时媒体目录创建失败（阶段=下载）：{_safe_exc_text(exc)}"
+                )
 
         async def build_chains(
             need_text: bool, need_media: bool
@@ -2412,15 +2415,16 @@ class APOD(Star):
             if need_media and (
                 media_stale or (media.path and not self._is_readable_file(media.path))
             ):
-                if media_stale and stale_recoveries >= STALE_MEDIA_RECOVERY_LIMIT:
+                if stale_recoveries >= STALE_MEDIA_RECOVERY_LIMIT:
                     # 重下预算已用完：不再重下，剩余会话本轮只发正文，留给下次检查。
                     media = MediaReady(ok=False)
                     media_stale = False
                 else:
                     # 文件被淘汰/读不出来：作废后重新预热一次再发（下载层自带重试），
                     # 否则后面所有会话都只能收到正文，或者反复发送同一个坏文件。
-                    if media_stale:
-                        stale_recoveries += 1
+                    # 两条发现坏文件的路径（适配器报错 / 组链前发现被淘汰）
+                    # 共用同一份预算，避免多会话轮流把同一份坏文件重下多次。
+                    stale_recoveries += 1
                     self._remove_file(media.path)
                     media = await self._prewarm_media(
                         apod_data, media_dir.name if media_dir else None
@@ -2452,96 +2456,114 @@ class APOD(Star):
         unknown_media: set[str] = set()
         media_stale = False
         stale_recoveries = 0
-        work = list(pending)
-        for attempt in range(self.retry_count + 1):
-            for umo in work:
-                # 媒体开关随时可能被改：按“还缺什么”决定，而不是只看检查点。
-                need_text = not text_ok(umo)
-                need_media = media_expected and not media_ok(umo)
-                done_text = text_ok(umo)
-                done_media = media_ok(umo)
-                if need_text or need_media:
-                    chains = await build_chains(need_text, need_media)
-                    if not chains:
-                        # 无内容可发（如媒体仍未下载成功）：留待下一轮。
-                        continue
-                    report = await self._send_chains(
-                        chains,
-                        partial(self.context.send_message, umo),
-                        f"APOD 推送到 {umo}",
-                    )
-                    if report.text_unknown or report.media_unknown:
-                        # 超时/提交后断连：平台可能已收到，重发就是重复图片/文案；
-                        # 但只把未知的那一项记为已送达，另一项照常走补试。
-                        parts = []
-                        if report.text_unknown:
-                            unknown_text.add(umo)
-                            parts.append("正文")
-                        if report.media_unknown:
-                            unknown_media.add(umo)
-                            parts.append("媒体")
-                        logger.warning(
-                            f"APOD 推送到 {umo} 的{"/".join(parts)}发送结果未知："
-                            "不再重发该部分，请以群内消息为准。"
-                        )
-                    if report.media_stale:
-                        media_stale = True
-                    done_text = done_text or report.text_sent
-                    done_media = done_media or report.media_sent
-                else:
-                    # 只剩“媒体待补”但当前配置不发送媒体：收敛为整期送达，避免永久待补。
-                    logger.warning(
-                        f"APOD 推送到 {umo} 的待补媒体已跳过：当前配置不发送媒体。"
-                    )
-                # 记账：正文与媒体分开；当前不发送媒体时不写 media_sent，
-                # 否则开启媒体后会被误认为“媒体已送达”而跳过补图。
-                if done_text and (done_media or not media_expected):
-                    pushed[umo] = link
-                elif done_text:
-                    logger.warning(
-                        f"APOD 推送到 {umo} 正文已送达但媒体未送达，下轮只补媒体。"
-                    )
-                    pushed[umo] = self._encode_checkpoint(link, media_sent=False)
-                elif done_media:
-                    logger.warning(
-                        f"APOD 推送到 {umo} 媒体已送达但正文失败，下轮只补正文。"
-                    )
-                    pushed[umo] = self._encode_checkpoint(link, media_sent=True)
-                else:
-                    continue
-                try:
-                    await self._save_push_checkpoint(pushed)
-                except RuntimeError as exc:
-                    # 进度落盘失败立即中止本轮：未确认会话留待下轮补发，避免盲目重发。
-                    logger.error(f"{exc}：本轮推送中止。")
-                    if media_dir is not None:
-                        media_dir.cleanup()
-                    return False
+        async def run_rounds() -> bool:
+            """把待发会话试一遍；返回 False 表示本轮提前中止（落盘失败）。
 
-            remaining = [umo for umo in pending if state_of(umo) != CHECKPOINT_DONE]
-            if not remaining or not media_expected:
-                break
-            # 只有“只剩缺图”才值得秒级重试：正文缺失一律交给 6 分钟后的补试，
-            # 避免在几秒内重复发一整期正文。
-            if not all(text_ok(umo) for umo in remaining):
-                break
-            if attempt >= self.retry_count:
-                break
-            if media_stale and stale_recoveries >= 1:
-                # 重新准备过一次仍是坏的：别再复用同一份文件，留给下一次检查。
-                self._remove_file(media.path)
-                break
-            if not media.ok:
-                # 媒体没准备好：下载层已经用尽 retry_count，轮内再请求只是
-                # 把同一个失败地址（尤其 4xx）反复刷进日志。
-                break
-            delay = _retry_delay(attempt, jitter=True)
-            logger.warning(
-                f"APOD 有 {len(remaining)} 个会话缺图，{delay:.1f} 秒后补发"
-                f"（{attempt + 1}/{self.retry_count}）。"
-            )
-            await asyncio.sleep(delay)
-            work = remaining
+            媒体预热也放进来，好让它和发送共用同一个 try/finally：
+            任务取消时临时目录必须当场清掉，不能等异常对象被回收。
+            """
+            nonlocal media, media_stale, stale_recoveries
+            if needs_media:
+                media = await self._prewarm_media(
+                    apod_data, media_dir.name if media_dir else None
+                )
+            work = list(pending)
+            for attempt in range(self.retry_count + 1):
+                for umo in work:
+                    # 媒体开关随时可能被改：按“还缺什么”决定，而不是只看检查点。
+                    need_text = not text_ok(umo)
+                    need_media = media_expected and not media_ok(umo)
+                    done_text = text_ok(umo)
+                    done_media = media_ok(umo)
+                    if need_text or need_media:
+                        chains = await build_chains(need_text, need_media)
+                        if not chains:
+                            # 无内容可发（如媒体仍未下载成功）：留待下一轮。
+                            continue
+                        report = await self._send_chains(
+                            chains,
+                            partial(self.context.send_message, umo),
+                            f"APOD 推送到 {umo}",
+                        )
+                        if report.text_unknown or report.media_unknown:
+                            # 超时/提交后断连：平台可能已收到，重发就是重复图片/文案；
+                            # 但只把未知的那一项记为已送达，另一项照常走补试。
+                            parts = []
+                            if report.text_unknown:
+                                unknown_text.add(umo)
+                                parts.append("正文")
+                            if report.media_unknown:
+                                unknown_media.add(umo)
+                                parts.append("媒体")
+                            logger.warning(
+                                f"APOD 推送到 {umo} 的{"/".join(parts)}发送结果未知："
+                                "不再重发该部分，请以群内消息为准。"
+                            )
+                        if report.media_stale:
+                            media_stale = True
+                        done_text = done_text or report.text_sent
+                        done_media = done_media or report.media_sent
+                    else:
+                        # 只剩“媒体待补”但当前配置不发送媒体：收敛为整期送达，避免永久待补。
+                        logger.warning(
+                            f"APOD 推送到 {umo} 的待补媒体已跳过：当前配置不发送媒体。"
+                        )
+                    # 记账：正文与媒体分开；当前不发送媒体时不写 media_sent，
+                    # 否则开启媒体后会被误认为“媒体已送达”而跳过补图。
+                    if done_text and (done_media or not media_expected):
+                        pushed[umo] = link
+                    elif done_text:
+                        logger.warning(
+                            f"APOD 推送到 {umo} 正文已送达但媒体未送达，下轮只补媒体。"
+                        )
+                        pushed[umo] = self._encode_checkpoint(link, media_sent=False)
+                    elif done_media:
+                        logger.warning(
+                            f"APOD 推送到 {umo} 媒体已送达但正文失败，下轮只补正文。"
+                        )
+                        pushed[umo] = self._encode_checkpoint(link, media_sent=True)
+                    else:
+                        continue
+                    try:
+                        await self._save_push_checkpoint(pushed)
+                    except RuntimeError as exc:
+                        # 进度落盘失败立即中止本轮：未确认会话留待下轮补发，避免盲目重发。
+                        logger.error(f"{exc}：本轮推送中止。")
+                        return False
+
+                remaining = [umo for umo in pending if state_of(umo) != CHECKPOINT_DONE]
+                if not remaining or not media_expected:
+                    break
+                # 只有“只剩缺图”才值得秒级重试：正文缺失一律交给 6 分钟后的补试，
+                # 避免在几秒内重复发一整期正文。
+                if not all(text_ok(umo) for umo in remaining):
+                    break
+                if attempt >= self.retry_count:
+                    break
+                if media_stale and stale_recoveries >= STALE_MEDIA_RECOVERY_LIMIT:
+                    # 重新准备过一次仍是坏的：别再复用同一份文件，留给下一次检查。
+                    self._remove_file(media.path)
+                    break
+                if not media.ok:
+                    # 媒体没准备好：下载层已经用尽 retry_count，轮内再请求只是
+                    # 把同一个失败地址（尤其 4xx）反复刷进日志。
+                    break
+                delay = _retry_delay(attempt, jitter=True)
+                logger.warning(
+                    f"APOD 有 {len(remaining)} 个会话缺图，{delay:.1f} 秒后补发"
+                    f"（{attempt + 1}/{self.retry_count}）。"
+                )
+                await asyncio.sleep(delay)
+                work = remaining
+
+            return True
+
+        try:
+            if not await run_rounds():
+                return False
+        finally:
+            if media_dir is not None:
+                media_dir.cleanup()
 
         text_delivered = sum(
             1 for umo in text_needed if text_ok(umo) and umo not in unknown_text
@@ -2549,8 +2571,6 @@ class APOD(Star):
         media_delivered = sum(
             1 for umo in media_needed if media_ok(umo) and umo not in unknown_media
         )
-        if media_dir is not None:
-            media_dir.cleanup()
         await self.put_cache(
             "last_pushed_apod", {"date": date, "link": link, "delivered": True}
         )
