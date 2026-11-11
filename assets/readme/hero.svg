@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="420" viewBox="0 0 1200 420" role="img" aria-labelledby="title description">
+  <title id="title">天文每日一图 · AstrBot 插件</title>
+  <desc id="description">APOD 与 NASA 每日一图，支持随机浏览、订阅推送和 LLM 翻译。深蓝夜空中的望远镜延续项目 logo 的观星意象。常用指令为 /apod 今日、/apod 随机和 /nasa。</desc>
+
+  <defs>
+    <linearGradient id="night" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0a1230"/>
+      <stop offset="1" stop-color="#25366b"/>
+    </linearGradient>
+    <linearGradient id="horizon" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9e91dd" stop-opacity="0.25"/>
+      <stop offset="1" stop-color="#9e91dd" stop-opacity="0"/>
+    </linearGradient>
+    <clipPath id="canvas">
+      <rect width="1200" height="420" rx="24"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#canvas)">
+    <rect width="1200" height="420" fill="url(#night)"/>
+
+    <!-- A quiet observing field, derived from the repository's telescope logo. -->
+    <g id="observatory" fill="none">
+      <circle cx="1010" cy="131" r="128" stroke="#9e91dd" stroke-opacity="0.24" stroke-width="1.5"/>
+      <path d="M908 54A128 128 0 0 1 1135 155" stroke="#9e91dd" stroke-opacity="0.55" stroke-width="2"/>
+      <circle cx="1112" cy="54" r="4" fill="#f6f4ef"/>
+      <path d="M1010 57C1010 77 1007 80 987 80C1007 80 1010 83 1010 103C1010 83 1013 80 1033 80C1013 80 1010 77 1010 57Z" fill="#f6f4ef"/>
+      <circle cx="850" cy="79" r="2" fill="#9e91dd"/>
+      <circle cx="1160" cy="209" r="2" fill="#f6f4ef" opacity="0.6"/>
+      <circle cx="908" cy="159" r="2.5" fill="#f6f4ef" opacity="0.65"/>
+      <path d="M740 362C850 310 997 313 1200 344V420H740Z" fill="url(#horizon)"/>
+      <path d="M745 384L825 348L878 365L935 342L1005 359L1080 337L1200 367V420H745Z" fill="#18254f"/>
+      <path d="M745 412L833 387L906 401L990 373L1075 396L1141 371L1200 382V420H745Z" fill="#0a1230"/>
+
+      <g id="telescope">
+        <path d="M900 262L994 190L1020 226L925 297Z" fill="#0a1230" stroke="#9e91dd" stroke-width="2.5" stroke-linejoin="round"/>
+        <path d="M994 190L1007 180L1034 217L1020 227Z" fill="#9e91dd"/>
+        <path d="M900 262L887 272L907 299L921 289" fill="#0a1230" stroke="#9e91dd" stroke-width="2.5"/>
+        <path d="M888 282L875 292L882 302L895 292" fill="#9e91dd"/>
+        <path d="M939 275L954 294L934 310" stroke="#9e91dd" stroke-width="9" stroke-linecap="round"/>
+        <circle cx="934" cy="310" r="10" fill="#0a1230" stroke="#9e91dd" stroke-width="3"/>
+        <path d="M934 320L901 389M934 320L967 389M934 320V390" stroke="#9e91dd" stroke-width="5" stroke-linecap="round"/>
+      </g>
+    </g>
+
+    <g id="project" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif">
+      <text x="64" y="76" fill="#9e91dd" font-size="24" font-weight="600" letter-spacing="2">ASTRBOT / ASTRONOMY</text>
+      <text x="58" y="180" fill="#f6f4ef" font-size="78" font-weight="700" letter-spacing="2">天文每日一图</text>
+      <text x="64" y="237" fill="#f6f4ef" font-size="30">APOD · NASA 每日一图</text>
+      <text x="64" y="283" fill="#9e91dd" font-size="26">随机浏览 · 订阅推送 · LLM 翻译</text>
+    </g>
+
+    <g id="commands" font-family="'Microsoft YaHei', 'PingFang SC', ui-monospace, monospace" font-size="26">
+      <path d="M64 326H690" stroke="#9e91dd" stroke-opacity="0.3"/>
+      <text x="64" y="371" fill="#f6f4ef">/apod 今日</text>
+      <text x="283" y="371" fill="#f6f4ef">/apod 随机</text>
+      <text x="515" y="371" fill="#f6f4ef">/nasa</text>
+    </g>
+  </g>
+</svg>

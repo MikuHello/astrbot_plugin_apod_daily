@@ -3,7 +3,9 @@ import asyncio
 import hashlib
 import html as html_lib
 import os
+import random
 import re
+import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
@@ -106,13 +108,113 @@ APOD_PREFETCH_RETRY_ATTEMPTS = 3
 IMAGE_CACHE_MIN_AGE_SECONDS = 120
 # 单条消息发送超时：视频上传慢，给足时间，但不能无限挂住推送循环。
 SEND_TIMEOUT_SECONDS = 60
+# 单条消息的发送结果：成功 / 明确失败（能确认没提交）/ 结果未知（可能已送达）。
+SEND_OK = "ok"
+SEND_FAILED = "failed"
+SEND_UNKNOWN = "unknown"
+# 本地媒体读不出来（文件没了/权限坏）：可以补发，但这份文件不能再用。
+SEND_STALE = "stale"
+# 只有“本地媒体/参数准备阶段”的失败能证明消息还没提交过，才值得自动补发：
+#   本地图片读不出来（FileNotFoundError / PermissionError，单独归为 SEND_STALE）、
+#   URL 本身非法（InvalidURL）—— 这时连上传都还没开始。
+# 网络类失败（连接被拒、连接重置、超时、读响应体失败）一律按“结果未知”处理：
+# QQ 官方私聊的 POST 在适配器内部重试 3 次，群聊的 POST 也有 botpy 自己的重连，
+# 最后一次连接失败证明不了前面几次都没提交，重发就是重复刷同一张图/同一段文案。
+_PRE_SUBMIT_ERRORS = (aiohttp.InvalidURL,)
+# 本地媒体文件读不出来：说明还没上传，可以补发；但同一份文件不能反复用。
+_STALE_MEDIA_ERRORS = (FileNotFoundError, PermissionError)
+# 一次推送检查里，为“坏文件”重新下载的次数上限（多会话共用一份预算）。
+STALE_MEDIA_RECOVERY_LIMIT = 1
+# 投递检查点状态（每个会话一条）：
+#   done          = 整期送达（旧格式直接存链接字符串）
+#   text_pending  = 媒体已送达、正文待补
+#   media_pending = 正文已送达、媒体待补
+#   unknown       = 记录缺失/损坏/字段不明确：当作没送过，整条重发
+CHECKPOINT_DONE = "done"
+CHECKPOINT_TEXT_PENDING = "text_pending"
+CHECKPOINT_MEDIA_PENDING = "media_pending"
+CHECKPOINT_UNKNOWN = "unknown"
+# 同一状态的两个方向，避免各处各自拼元组。
+CHECKPOINT_TEXT_SENT = (CHECKPOINT_DONE, CHECKPOINT_MEDIA_PENDING)
+CHECKPOINT_MEDIA_SENT = (CHECKPOINT_DONE, CHECKPOINT_TEXT_PENDING)
+# 定时推送未完成时只补试一次（日更任务丢了就永久没有）；6 分钟足够躲过
+# 夜间常见抖动，又不会在凌晨反复打扰。
+PUSH_RETRY_DELAY_SECONDS = 360
+# 日志脱敏：异常文本可能带完整 URL（query 上可能有签名）。单引号、括号都是
+# 合法的 URL 字符（RFC 3986 sub-delims），在这些字符处收尾会把 ?sig=… 漏出去，
+# 因此只按空白切分，再把紧贴 URL 前后的标点还原。
+_URL_IN_TEXT_PATTERN = re.compile(r"https?://\S+")
+_URL_WRAPPING_PUNCT = ")]}>'\",.;:："
+
+
+def _redact_urls(text: str) -> str:
+    """把文本里的 URL 换成 <url>，保留紧贴它的包裹标点。"""
+    parts = []
+    position = 0
+    for match in _URL_IN_TEXT_PATTERN.finditer(text):
+        url = match.group(0)
+        trimmed = url.rstrip(_URL_WRAPPING_PUNCT)
+        parts.append(text[position:match.start()])
+        parts.append("<url>")
+        parts.append(url[len(trimmed):])
+        position = match.end()
+    parts.append(text[position:])
+    return "".join(parts)
+
+
+def _is_fatal_client_status(status: int) -> bool:
+    """4xx 里只有限流 429 与超时 408 值得重试，其余客户端错误重试无意义。"""
+    return 400 <= status < 500 and status not in (408, 429)
+
+
+def _retry_delay(attempt: int, jitter: bool = False) -> float:
+    """指数退避，封顶 4 秒；图片下载额外加抖动，避免多会话同时重连。"""
+    delay = min(2**attempt, 4)
+    return delay + random.uniform(0, 1) if jitter else delay
+
+
+def _safe_exc_text(exc: BaseException) -> str:
+    """异常文本入日志前脱敏：保留异常类型与内容，只把 URL 换成占位符。"""
+    return f"{type(exc).__name__}: {_redact_urls(str(exc))}"
+
+
+class MediaPlan(NamedTuple):
+    """本期媒体的发法：send=是否发送媒体，localize=需要本地缓存的 URL，url=原始地址。
+
+    localize 为空串时表示无需本地文件（视频直链交由平台上传）。
+    """
+
+    send: bool
+    localize: str
+    url: str
+
+
+class MediaReady(NamedTuple):
+    """一次媒体预热的结果，由推送路径一次下载、多会话共享。
+
+    ok=False 表示本轮没有可发的媒体（下载失败/本就无媒体）；
+    path 为空表示无需本地文件（视频直链）。
+    """
+
+    ok: bool
+    path: str = ""
 
 
 class ChainSendReport(NamedTuple):
-    """success=正文或仅媒体已送达（允许舍弃失败媒体），media_sent=媒体已送达。"""
+    """投递结果：正文与媒体分开记账。
 
-    success: bool
+    text_sent / media_sent = 这一项不用再发（确认送达，或结果未知按送达处理）；
+    text_unknown / media_unknown = 这一项没拿到结果（超时、提交后断连），
+    只影响统计口径，不再触发补发。两项分开记，避免“图片未知”把“正文明确
+    失败”的补试吞掉。
+    """
+
+    text_sent: bool
     media_sent: bool
+    text_unknown: bool = False
+    media_unknown: bool = False
+    # 媒体失败的原因是本地文件读不出来：文件必须作废后重新准备。
+    media_stale: bool = False
 
 
 # 文章发布时间只认这两种 meta 名，不拿更新时间冒充。
@@ -218,7 +320,7 @@ APOD_HELP = chr(10).join(
 )
 
 
-@register("apod", "Cysheper", "天文每日一图插件：APOD + NASA 每日一图，订阅推送、随机、LLM 翻译与函数工具。", "1.2.2")
+@register("apod", "Cysheper", "天文每日一图插件：APOD + NASA 每日一图，订阅推送、随机、LLM 翻译与函数工具。", "1.2.3")
 class APOD(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context, config)
@@ -511,7 +613,7 @@ class APOD(Star):
             return result
 
         report = await self._send_chains(chains, send, f"{label} 指令回复")
-        return report.success
+        return report.text_sent
 
     async def _reply_text(
         self,
@@ -687,7 +789,12 @@ class APOD(Star):
             partial(self.context.send_message, event.unified_msg_origin),
             label=f"{label}发送",
         )
-        if not sent.success:
+        if sent.text_unknown or sent.media_unknown:
+            return (
+                f"{label}发送结果未知（可能已送达，已停止重发）："
+                "请以当前会话的实际消息为准。"
+            )
+        if not sent.text_sent:
             return f"{label}发送失败：请检查平台连接或发送日志后重试。"
         title = (title_zh or apod_data.get("title") or "").strip()
         return (
@@ -734,13 +841,29 @@ class APOD(Star):
             raise RuntimeError(f"写入推送检查点失败：{exc}") from exc
 
     @staticmethod
-    def _checkpoint_media_sent(entry: Any, link: str) -> bool:
-        """检查点是否记录“该期媒体已送达、正文待补发”。"""
-        return (
-            isinstance(entry, dict)
-            and str(entry.get("link") or "") == link
-            and bool(entry.get("media_sent"))
-        )
+    def _decode_checkpoint(entry: Any) -> tuple[str, str]:
+        """解码一条检查点记录：返回 (状态, 记录里的链接)。
+
+        只认显式的 media_sent True/False：字段缺失或为 null 一律当未知，
+        宁可整条重发，也不把未知状态当成“已送达”而静默跳过。
+        """
+        if isinstance(entry, str):
+            return (CHECKPOINT_DONE, entry) if entry else (CHECKPOINT_UNKNOWN, "")
+        if not isinstance(entry, dict):
+            return CHECKPOINT_UNKNOWN, ""
+        link = str(entry.get("link") or "")
+        if not link:
+            return CHECKPOINT_UNKNOWN, ""
+        if entry.get("media_sent") is True:
+            return CHECKPOINT_TEXT_PENDING, link
+        if entry.get("media_sent") is False:
+            return CHECKPOINT_MEDIA_PENDING, link
+        return CHECKPOINT_UNKNOWN, ""
+
+    @staticmethod
+    def _encode_checkpoint(link: str, *, media_sent: bool) -> dict:
+        """编码检查点：媒体已送达（只缺正文）或正文已送达（只缺媒体）。"""
+        return {"link": link, "media_sent": media_sent}
 
     async def _cache_translation(
         self, key: str, value: str, epoch: Optional[int] = None
@@ -1723,7 +1846,7 @@ class APOD(Star):
                     if response.status != 200:
                         logger.error(f"获取{label}失败：状态码={response.status}")
                         self.last_apod_error = f"{label}暂时不可用，请稍后重试。"
-                        if 400 <= response.status < 500 and response.status not in (408, 429):
+                        if _is_fatal_client_status(response.status):
                             # 客户端错误重试无意义，直接结束本次获取。
                             break
                     else:
@@ -1732,11 +1855,11 @@ class APOD(Star):
                 logger.error(f"获取{label}超时：请求在 {self.timeout} 秒后超时。")
                 self.last_apod_error = f"请求{label}超时，请稍后重试。"
             except aiohttp.ClientError as exc:
-                logger.error(f"获取{label}时发生网络错误：{exc}")
+                logger.error(f"获取{label}时发生网络错误：{_safe_exc_text(exc)}")
                 self.last_apod_error = f"连接{label}失败，请稍后重试。"
 
             if attempt < self.retry_count:
-                await asyncio.sleep(min(2**attempt, 4))
+                await asyncio.sleep(_retry_delay(attempt))
         return None
 
     async def _fetch_from_feed(
@@ -2140,16 +2263,21 @@ class APOD(Star):
         )
         await self.config.save_config_async()
 
+    async def _run_push_check(self, label: str) -> bool:
+        """跑一次推送检查；异常按失败处理，不让单次故障打死推送循环。"""
+        try:
+            return await self._push_check()
+        except Exception as exc:
+            logger.error(f"{label}出错：{exc}")
+            return False
+
     async def _push_loop(self) -> None:
         try:
             if self.push_mode == "upstream":
                 # 上游推送：按固定间隔巡检 feed，发现新一期立刻推送。
                 while True:
                     await asyncio.sleep(self.push_interval_minutes * 60)
-                    try:
-                        await self._push_check()
-                    except Exception as exc:
-                        logger.error(f"APOD 推送巡检出错：{exc}")
+                    await self._run_push_check("APOD 推送巡检")
             else:
                 # 定时推送：每天在 push_time 推送最新一期（已推送的不重复）。
                 while True:
@@ -2158,19 +2286,18 @@ class APOD(Star):
                         f"APOD 定时推送：距下次推送约 {delay / 3600:.1f} 小时。"
                     )
                     await asyncio.sleep(delay)
-                    # 拉取失败时退避重试，最多 6 次（约 1 小时），避免整期漏发。
-                    for attempt in range(6):
-                        try:
-                            ok = await self._push_check()
-                        except Exception as exc:
-                            logger.error(f"APOD 定时推送出错：{exc}")
-                            ok = False
-                        if ok:
-                            break
-                        logger.warning(
-                            f"APOD 定时推送拉取失败，10 分钟后重试（{attempt + 1}/6）。"
+                    # 失败只补试一次：窗口短到不需要配置，也不会在凌晨反复试探。
+                    if await self._run_push_check("APOD 定时推送"):
+                        continue
+                    logger.warning(
+                        "APOD 定时推送未完成，"
+                        f"{PUSH_RETRY_DELAY_SECONDS // 60} 分钟后重试一次。"
+                    )
+                    await asyncio.sleep(PUSH_RETRY_DELAY_SECONDS)
+                    if not await self._run_push_check("APOD 定时推送"):
+                        logger.error(
+                            "APOD 今天的推送已放弃，可执行 /apod 今日 手动补发。"
                         )
-                        await asyncio.sleep(600)
         except asyncio.CancelledError:
             pass
 
@@ -2208,9 +2335,19 @@ class APOD(Star):
         except RuntimeError as exc:
             logger.error(f"{exc}：为避免重复群发，本轮跳过推送检查。")
             return False
-        # 检查点值：字符串 = 整期送达；{"link": ..., "media_sent": True} =
-        # 媒体已送达、正文待补发（下轮只补正文，不重发视频）。
-        pending = [umo for umo in sessions if pushed.get(umo) != link]
+        # 检查点状态由 _decode_checkpoint 统一解码（见 CHECKPOINT_* 常量）。
+        def state_of(umo: str) -> str:
+            """该会话在当前这一期的状态；别的期或坏记录都算未知。"""
+            state, recorded = self._decode_checkpoint(pushed.get(umo))
+            return state if recorded == link else CHECKPOINT_UNKNOWN
+
+        def text_ok(umo: str) -> bool:
+            return state_of(umo) in CHECKPOINT_TEXT_SENT
+
+        def media_ok(umo: str) -> bool:
+            return state_of(umo) in CHECKPOINT_MEDIA_SENT
+
+        pending = [umo for umo in sessions if state_of(umo) != CHECKPOINT_DONE]
 
         last = await self.get_cache("last_pushed_apod")
         last_link = str(last.get("link") or "") if isinstance(last, dict) else ""
@@ -2235,44 +2372,230 @@ class APOD(Star):
             return True
 
         title_zh, explanation_zh, tomorrow_zh = await self._translate_fields(apod_data)
-        delivered = 0
+        plan = self._media_plan(apod_data)
+        media_expected = plan.send
+        # 换刊：检查点只存当前一期，上一期没送完的记录跟不到新链接，只能明示放弃。
+        stale = []
         for umo in pending:
-            # 每个会话发送前重建消息链：本地图片可能已被其他请求淘汰，
-            # 重建会命中缓存并刷新保护时间（必要时重新下载）。
-            if self._checkpoint_media_sent(pushed.get(umo), link):
-                # 直接构建待补正文，不下载或刷新已经送达的媒体。
+            state, recorded = self._decode_checkpoint(pushed.get(umo))
+            # 上一期已送达（CHECKPOINT_DONE）不算漏发，只是该发新一期了。
+            if state in (CHECKPOINT_TEXT_PENDING, CHECKPOINT_MEDIA_PENDING) and (
+                recorded != link
+            ):
+                stale.append(umo)
+        if stale:
+            logger.warning(
+                f"APOD 有 {len(stale)} 个会话的上一期投递未完成（缺正文或缺媒体），"
+                "已随新一期覆盖，不再补发。"
+            )
+        # 媒体预热放在会话循环外：整期只下载一次，所有会话共享结果。
+        # 下载失败时 ok=False，本轮只发正文，检查点记 media_sent=False，
+        # 下一轮再补媒体链（不再让平台二次下载后把整期记成已送达）。
+        # 关闭图片缓存时的临时媒体统一放这个目录：一个对象持有、一处清理，
+        # 走过多少次重新预热都不会漏（TemporaryDirectory 自带析构兜底，任务
+        # 取消或异常退出时同样不会把文件留在盘上）。
+        media = MediaReady(ok=False)
+        # 本轮创建的临时媒体文件（含目录创建失败后落到系统临时目录的），
+        # 统一在 finally 里清理。
+        temp_files: list[str] = []
+        needs_media = media_expected and any(not media_ok(umo) for umo in pending)
+        media_dir: Optional[tempfile.TemporaryDirectory] = None
+        if needs_media and not self.cache_images:
+            try:
+                media_dir = tempfile.TemporaryDirectory(prefix="apod-media-")
+            except OSError as exc:
+                # 目录都建不出来（如临时盘满）：同样只是“媒体准备失败”，
+                # 不能让异常冲掉整轮推送。
+                logger.warning(
+                    f"临时媒体目录创建失败（阶段=下载）：{_safe_exc_text(exc)}"
+                )
+
+        async def build_chains(
+            need_text: bool, need_media: bool
+        ) -> list[MessageChain]:
+            """按本轮缺的内容组链：只缺媒体时不重发正文，只缺正文时不再碰媒体。"""
+            nonlocal media, media_stale, stale_recoveries
+            if need_media and (
+                media_stale or (media.path and not self._is_readable_file(media.path))
+            ):
+                if stale_recoveries >= STALE_MEDIA_RECOVERY_LIMIT:
+                    # 重下预算已用完：不再重下，剩余会话本轮只发正文，留给下次检查。
+                    media = MediaReady(ok=False)
+                    media_stale = False
+                else:
+                    # 文件被淘汰/读不出来：作废后重新预热一次再发（下载层自带重试），
+                    # 否则后面所有会话都只能收到正文，或者反复发送同一个坏文件。
+                    # 两条发现坏文件的路径（适配器报错 / 组链前发现被淘汰）
+                    # 共用同一份预算，避免多会话轮流把同一份坏文件重下多次。
+                    stale_recoveries += 1
+                    self._remove_file(media.path)
+                    media = await self._prewarm_media(
+                        apod_data, media_dir.name if media_dir else None, temp_files
+                    )
+                    media_stale = False
+            if need_media and not need_text:
+                media_chain = await self._build_media_chain(apod_data, media=media)
+                return [media_chain] if media_chain.chain else []
+            if not need_media:
                 text = self._build_text_chain(
                     apod_data, title_zh, explanation_zh, tomorrow_zh
                 )
-                chains = [text] if text.chain else []
-            else:
-                chains = await self._build_apod_chains(
-                    apod_data, title_zh, explanation_zh, tomorrow_zh
-                )
-            report = await self._send_chains(
-                chains, partial(self.context.send_message, umo), f"APOD 推送到 {umo}"
+                return [text] if text.chain else []
+            return await self._build_apod_chains(
+                apod_data,
+                title_zh,
+                explanation_zh,
+                tomorrow_zh,
+                media=media,
             )
-            if report.success:
-                pushed[umo] = link
-                delivered += 1
-            elif report.media_sent:
-                logger.warning(f"APOD 推送到 {umo} 媒体已送达但正文失败，下轮只补正文。")
-                pushed[umo] = {"link": link, "media_sent": True}
-            else:
-                continue
-            try:
-                await self._save_push_checkpoint(pushed)
-            except RuntimeError as exc:
-                # 进度落盘失败立即中止本轮：未确认会话留待下轮补发，避免盲目重发。
-                logger.error(f"{exc}：本轮推送中止。")
+
+        text_needed = [umo for umo in pending if not text_ok(umo)]
+        media_needed = [umo for umo in pending if not media_ok(umo)] \
+            if media_expected else []
+        # 一轮 = 把所有待发会话试一遍；网络抖动是秒级现象，只缺图时本轮内
+        # 立即转向下一轮（轮数与退避沿用 retry_count / _retry_delay），
+        # 不必等外层那次 6 分钟的补试。
+        unknown_text: set[str] = set()
+        unknown_media: set[str] = set()
+        media_stale = False
+        stale_recoveries = 0
+        async def run_rounds() -> bool:
+            """把待发会话试一遍；返回 False 表示本轮提前中止（落盘失败）。
+
+            媒体预热也放进来，好让它和发送共用同一个 try/finally：
+            任务取消时临时目录必须当场清掉，不能等异常对象被回收。
+            """
+            nonlocal media, media_stale, stale_recoveries
+            if needs_media:
+                media = await self._prewarm_media(
+                    apod_data, media_dir.name if media_dir else None, temp_files
+                )
+            work = list(pending)
+            for attempt in range(self.retry_count + 1):
+                for umo in work:
+                    # 媒体开关随时可能被改：按“还缺什么”决定，而不是只看检查点。
+                    need_text = not text_ok(umo)
+                    need_media = media_expected and not media_ok(umo)
+                    done_text = text_ok(umo)
+                    done_media = media_ok(umo)
+                    if need_text or need_media:
+                        chains = await build_chains(need_text, need_media)
+                        if not chains:
+                            # 无内容可发（如媒体仍未下载成功）：留待下一轮。
+                            continue
+                        report = await self._send_chains(
+                            chains,
+                            partial(self.context.send_message, umo),
+                            f"APOD 推送到 {umo}",
+                        )
+                        if report.text_unknown or report.media_unknown:
+                            # 超时/提交后断连：平台可能已收到，重发就是重复图片/文案；
+                            # 但只把未知的那一项记为已送达，另一项照常走补试。
+                            parts = []
+                            if report.text_unknown:
+                                unknown_text.add(umo)
+                                parts.append("正文")
+                            if report.media_unknown:
+                                unknown_media.add(umo)
+                                parts.append("媒体")
+                            logger.warning(
+                                f"APOD 推送到 {umo} 的{"/".join(parts)}发送结果未知："
+                                "不再重发该部分，请以群内消息为准。"
+                            )
+                        if report.media_stale:
+                            # 已经确认这份文件读不了：当场作废，别让下一次检查
+                            # 再撞上它；是否重新下载由重下预算决定。
+                            media_stale = True
+                            self._remove_file(media.path)
+                        done_text = done_text or report.text_sent
+                        done_media = done_media or report.media_sent
+                    else:
+                        # 只剩“媒体待补”但当前配置不发送媒体：收敛为整期送达，避免永久待补。
+                        logger.warning(
+                            f"APOD 推送到 {umo} 的待补媒体已跳过：当前配置不发送媒体。"
+                        )
+                    # 记账：正文与媒体分开；当前不发送媒体时不写 media_sent，
+                    # 否则开启媒体后会被误认为“媒体已送达”而跳过补图。
+                    if done_text and (done_media or not media_expected):
+                        pushed[umo] = link
+                    elif done_text:
+                        logger.warning(
+                            f"APOD 推送到 {umo} 正文已送达但媒体未送达，下轮只补媒体。"
+                        )
+                        pushed[umo] = self._encode_checkpoint(link, media_sent=False)
+                    elif done_media:
+                        logger.warning(
+                            f"APOD 推送到 {umo} 媒体已送达但正文失败，下轮只补正文。"
+                        )
+                        pushed[umo] = self._encode_checkpoint(link, media_sent=True)
+                    else:
+                        continue
+                    try:
+                        await self._save_push_checkpoint(pushed)
+                    except RuntimeError as exc:
+                        # 进度落盘失败立即中止本轮：未确认会话留待下轮补发，避免盲目重发。
+                        logger.error(f"{exc}：本轮推送中止。")
+                        return False
+
+                remaining = [umo for umo in pending if state_of(umo) != CHECKPOINT_DONE]
+                if not remaining or not media_expected:
+                    break
+                # 只有“只剩缺图”才值得秒级重试：正文缺失一律交给 6 分钟后的补试，
+                # 避免在几秒内重复发一整期正文。
+                if not all(text_ok(umo) for umo in remaining):
+                    break
+                if attempt >= self.retry_count:
+                    break
+                if media_stale and stale_recoveries >= STALE_MEDIA_RECOVERY_LIMIT:
+                    # 重新准备过一次仍是坏的：别再复用同一份文件，留给下一次检查。
+                    self._remove_file(media.path)
+                    break
+                if not media.ok:
+                    # 媒体没准备好：下载层已经用尽 retry_count，轮内再请求只是
+                    # 把同一个失败地址（尤其 4xx）反复刷进日志。
+                    break
+                delay = _retry_delay(attempt, jitter=True)
+                logger.warning(
+                    f"APOD 有 {len(remaining)} 个会话缺图，{delay:.1f} 秒后补发"
+                    f"（{attempt + 1}/{self.retry_count}）。"
+                )
+                await asyncio.sleep(delay)
+                work = remaining
+
+            return True
+
+        try:
+            if not await run_rounds():
                 return False
+        finally:
+            if media_dir is not None:
+                media_dir.cleanup()
+            for path in temp_files:
+                self._remove_file(path)
+
+        text_delivered = sum(
+            1 for umo in text_needed if text_ok(umo) and umo not in unknown_text
+        )
+        media_delivered = sum(
+            1 for umo in media_needed if media_ok(umo) and umo not in unknown_media
+        )
         await self.put_cache(
             "last_pushed_apod", {"date": date, "link": link, "delivered": True}
         )
-        missed = len(pending) - delivered
+        # 只要还有会话没到“整期送达”就需要下一轮补试；结果未知的部分已按送达
+        # 记账，不会因为“另一项未知”把明确失败的那一项的补试吞掉。
+        missed = sum(1 for umo in pending if state_of(umo) != CHECKPOINT_DONE)
+        notes = []
+        if missed:
+            notes.append(f"{missed} 个会话待补发")
+        unknown = unknown_text | unknown_media
+        if unknown:
+            # 结果未知按“可能已送达”记账、不重发，但汇总不能算成已送达。
+            notes.append(f"{len(unknown)} 个会话有内容发送结果未知（未重发）")
         logger.info(
-            f"APOD 新一期已推送：{date}，本次送达 {delivered}/{len(pending)} 个会话"
-            + (f"，{missed} 个待补发。" if missed else "。")
+            f"APOD 本次推送 {date}：正文 {text_delivered}/{len(text_needed)}、"
+            f"媒体 {media_delivered}/{len(media_needed)}"
+            + ("，" + "、".join(notes) + "。" if notes else "。")
         )
         return missed == 0
 
@@ -2365,50 +2688,156 @@ class APOD(Star):
         if still_over:
             self._schedule_image_reconcile()
 
+    async def _download_image(self, url: str, dest: str) -> None:
+        """把单个文件下载到 dest，走 AstrBot 的 download_file。
+
+        download_file 内部是 trust_env=True 的会话，会跟随 AstrBot 配置的
+        http_proxy；插件不再自建裸 ClientSession（那样不走代理）。独立成方法
+        也方便测试替身直接注入。
+        """
+        from astrbot.core.utils.io import download_file
+
+        # allow_insecure_ssl_fallback=False：AstrBot 默认会在证书失败时改用
+        # CERT_NONE 且不跟随 http_proxy 的裸会话重试，那比原实现放宽了证书校验。
+        await asyncio.wait_for(
+            download_file(url, dest, allow_insecure_ssl_fallback=False),
+            timeout=self.timeout,
+        )
+
+    @staticmethod
+    def _is_readable_file(path: str) -> bool:
+        """能打开才算可读：FIFO 淘汰与权限损坏都能在发出去之前发现。"""
+        try:
+            with open(path, "rb"):
+                return True
+        except OSError:
+            return False
+
+    @staticmethod
+    def _remove_file(path: Optional[str]) -> None:
+        if not path:
+            return
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    async def _download_to_temp(
+        self,
+        url: str,
+        directory: Optional[str] = None,
+        created: Optional[list] = None,
+    ) -> Optional[str]:
+        """把远图先下到临时文件（不写缓存），让“读图失败”发生在提交之前。
+
+        关闭图片缓存时平台会自己去下载远图：下载失败会把同一条消息里的正文一起
+        丢掉，而且事后无法与“已提交但回执丢失”区分。先下好再交给平台，失败只
+        降级为纯文字并保留媒体待补。
+
+        建临时文件也算“媒体准备”——失败（如临时盘满）同样只降级为纯文字，
+        不能让异常冲掉整轮推送。
+        """
+        suffix = os.path.splitext(url.split("?", 1)[0])[1][:8] or ".img"
+        try:
+            handle, tmp_path = tempfile.mkstemp(
+                prefix="apod-media-", suffix=suffix, dir=directory
+            )
+            os.close(handle)
+        except OSError as exc:
+            logger.warning(f"临时媒体文件创建失败（阶段=下载）：{_safe_exc_text(exc)}")
+            return None
+        try:
+            await self._download_image_with_retry(url, tmp_path)
+        except asyncio.CancelledError:
+            self._remove_file(tmp_path)
+            raise
+        except Exception as exc:
+            logger.warning(f"图片预下载失败（阶段=下载）：{_safe_exc_text(exc)}")
+            self._remove_file(tmp_path)
+            return None
+        if created is not None:
+            # 目录创建失败时会退回系统临时目录，这些文件同样要登记由调用方清理。
+            created.append(tmp_path)
+        return tmp_path
+
+    @classmethod
+    def _is_fatal_download_error(cls, exc: BaseException) -> bool:
+        """4xx（限流/超时除外）属于重试无意义的失败，本轮不必再请求同一地址。"""
+        status = cls._download_http_status(exc)
+        return status is not None and _is_fatal_client_status(status)
+
+    @staticmethod
+    def _download_http_status(exc: BaseException) -> Optional[int]:
+        """从下载异常里取出 HTTP 状态码（AstrBot 的 DownloadFileHTTPError 只带文本）。"""
+        status = getattr(exc, "status", None)
+        if isinstance(status, int):
+            return status
+        match = re.search(r"HTTP status code:\s*(\d{3})", str(exc))
+        return int(match.group(1)) if match else None
+
+    async def _download_image_with_retry(self, url: str, dest: str) -> None:
+        """下载单张图片：按 retry_count 指数退避重试（1/2/4 秒起步 + 抖动）。
+
+        4xx（限流 429 与超时 408 除外）重试无意义，直接放弃。
+        """
+        for attempt in range(self.retry_count + 1):
+            try:
+                await self._download_image(url, dest)
+                if not os.path.getsize(dest):
+                    raise RuntimeError("空响应")
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if self._is_fatal_download_error(exc) or attempt >= self.retry_count:
+                    raise
+                delay = _retry_delay(attempt, jitter=True)
+                logger.warning(
+                    f"图片下载失败（阶段=下载，第 {attempt + 1}/{self.retry_count} 次），"
+                    f"{delay:.1f} 秒后重试：{_safe_exc_text(exc)}"
+                )
+                await asyncio.sleep(delay)
+
     async def _localize_image(self, url: str) -> Optional[str]:
-        """按需把图片下载到本地缓存并返回本地路径；关闭/失败时返回 None（用 URL）。"""
+        """按需把图片下载到本地缓存并返回本地路径；关闭或最终失败时返回 None。
+
+        下载走 AstrBot 的 download_file（自带 trust_env=True），失败按
+        retry_count 重试并退避（4xx 由下载层直接放弃）；最终失败打 WARN，
+        不静默降级。
+        """
         if not self.cache_images or not url:
             return None
         path = self._image_cache_path(url)
         epoch = self._cache_epoch
+        if os.path.exists(path) and not self._is_readable_file(path):
+            # 缓存文件坏了（权限/内容损坏）：留着只会反复失败，删掉重下。
+            logger.warning("图片缓存文件不可读，重新下载。")
+            self._remove_file(path)
+        if os.path.exists(path):
+            try:
+                # 命中也要刷新 mtime：保护窗口从最近一次使用算起。
+                os.utime(path)
+            except OSError:
+                pass
+            if epoch != self._cache_epoch:
+                # 期间发生过清理：不登记索引，直接用本地文件。
+                return path
+            await self._touch_image_cache(path)
+            return path
         try:
-            if not os.path.exists(path):
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                # 唯一临时名：同一 URL 并发下载不会互写同一个 .part。
-                tmp_path = f"{path}.{os.urandom(6).hex()}.part"
-                timeout = aiohttp.ClientTimeout(total=self.timeout)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            # 唯一临时名：同一 URL 并发下载不会互写同一个 .part。
+            tmp_path = f"{path}.{os.urandom(6).hex()}.part"
+            try:
+                await self._download_image_with_retry(url, tmp_path)
+                if epoch != self._cache_epoch:
+                    # 下载期间发生了清理：丢弃临时文件，绝不覆盖目标路径。
+                    return None
+                os.replace(tmp_path, path)
+            finally:
+                # CancelledError 不走 except Exception；统一在 finally 清理临时文件。
                 try:
-                    async with aiohttp.ClientSession(timeout=timeout) as session:
-                        async with session.get(url) as response:
-                            if response.status != 200:
-                                raise RuntimeError(f"状态码={response.status}")
-                            written = 0
-                            with open(tmp_path, "wb") as handle:
-                                async for chunk in response.content.iter_chunked(
-                                    65536
-                                ):
-                                    handle.write(chunk)
-                                    written += len(chunk)
-                    if not written:
-                        raise RuntimeError("空响应")
-                    if epoch != self._cache_epoch:
-                        # 下载期间发生了清理：丢弃临时文件，绝不覆盖目标路径。
-                        try:
-                            os.remove(tmp_path)
-                        except OSError:
-                            pass
-                        return None
-                    os.replace(tmp_path, path)
-                finally:
-                    # CancelledError 不走 except Exception；统一在 finally 清理临时文件。
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
-            else:
-                try:
-                    # 命中也要刷新 mtime：保护窗口从最近一次使用算起。
-                    os.utime(path)
+                    os.remove(tmp_path)
                 except OSError:
                     pass
             if epoch != self._cache_epoch:
@@ -2417,7 +2846,7 @@ class APOD(Star):
             await self._touch_image_cache(path)
             return path
         except Exception as exc:
-            logger.warning(f"图片缓存失败，改用原始链接：{exc}")
+            logger.warning(f"图片缓存失败（阶段=下载）：{_safe_exc_text(exc)}")
             return None
 
     def _split_media(self, media_chain: MessageChain) -> bool:
@@ -2435,33 +2864,72 @@ class APOD(Star):
             isinstance(item, Comp.Video) for item in media_chain.chain
         )
 
-    async def _build_media_chain(self, apod_data: Dict[str, Any]) -> MessageChain:
-        """只含媒体组件的消息链；未开启发送媒体或无可用媒体时为空链。"""
-        chain = []
-        url = apod_data.get("hdurl") or apod_data.get("url")
+    def _media_plan(self, apod_data: Dict[str, Any]) -> MediaPlan:
+        """按本期数据决定媒体怎么发：视频直链无需本地文件，YouTube 用封面帧。"""
+        url = str(apod_data.get("hdurl") or apod_data.get("url") or "").strip()
+        if not self.send_media or not url:
+            return MediaPlan(False, "", url)
         media_type = str(apod_data.get("media_type") or "").strip().lower()
+        if media_type != "video":
+            return MediaPlan(True, url, url)
         video_platform = str(apod_data.get("video_platform") or "").strip().lower()
-        if self.send_media and url:
-            if media_type == "video":
-                # YouTube 只有网页地址，交给平台当视频发只会失败；
-                # 观看地址由正文字段展示，封面帧代替视频组件。
-                if video_platform != VIDEO_PLATFORM_YOUTUBE:
-                    chain.append(Comp.Video.fromURL(url))
-                else:
-                    poster_url = str(apod_data.get("poster_url") or "").strip()
-                    if poster_url:
-                        local_path = await self._localize_image(poster_url)
-                        if local_path:
-                            chain.append(Comp.Image.fromFileSystem(local_path))
-                        else:
-                            chain.append(Comp.Image.fromURL(poster_url))
-            else:
-                local_path = await self._localize_image(url)
-                if local_path:
-                    chain.append(Comp.Image.fromFileSystem(local_path))
-                else:
-                    chain.append(Comp.Image.fromURL(url))
-        return MessageChain(chain=chain)
+        if video_platform != VIDEO_PLATFORM_YOUTUBE:
+            return MediaPlan(True, "", url)
+        poster_url = str(apod_data.get("poster_url") or "").strip()
+        return (
+            MediaPlan(True, poster_url, url)
+            if poster_url
+            else MediaPlan(False, "", url)
+        )
+
+    async def _prewarm_media(
+        self,
+        apod_data: Dict[str, Any],
+        media_dir: Optional[str] = None,
+        created: Optional[list] = None,
+    ) -> MediaReady:
+        """整期只下载一次媒体，返回预热结果。
+
+        视频直链无需本地文件；下载失败返回 ok=False（本轮不发媒体）。
+        关闭图片缓存时也先把远图下到临时文件（不写缓存）：平台在提交前读图，
+        让它自己去下载，失败会把同一条消息里的正文一起丢掉。
+        """
+        plan = self._media_plan(apod_data)
+        if not plan.send:
+            return MediaReady(ok=False)
+        if not plan.localize:
+            return MediaReady(ok=True)
+        if self.cache_images:
+            local_path = await self._localize_image(plan.localize)
+        else:
+            local_path = await self._download_to_temp(
+                plan.localize, media_dir, created
+            )
+        return MediaReady(ok=bool(local_path), path=local_path or "")
+
+    async def _build_media_chain(
+        self, apod_data: Dict[str, Any], media: Optional[MediaReady] = None
+    ) -> MessageChain:
+        """只含媒体组件的消息链；未开启发送媒体或无可用媒体时为空链。
+
+        media=None 表示调用方没有预热（指令/工具路径）：自行本地化，失败
+        回退远端 URL。传入 MediaReady 时按预热结果组链，ok=False 就不构造
+        Image，避免平台二次下载后再报错。
+        """
+        plan = self._media_plan(apod_data)
+        if not plan.send:
+            return MessageChain(chain=[])
+        if not plan.localize:
+            return MessageChain(chain=[Comp.Video.fromURL(plan.url)])
+        if media is None:
+            local_path = await self._localize_image(plan.localize)
+            if local_path:
+                return MessageChain(chain=[Comp.Image.fromFileSystem(local_path)])
+            return MessageChain(chain=[Comp.Image.fromURL(plan.localize)])
+        if not media.ok or not media.path or not os.path.exists(media.path):
+            # 预热失败或文件已被淘汰：本轮只发正文，下轮再补媒体。
+            return MessageChain(chain=[])
+        return MessageChain(chain=[Comp.Image.fromFileSystem(media.path)])
 
     def _build_text_chain(
         self,
@@ -2488,9 +2956,14 @@ class APOD(Star):
         explanation_zh: Optional[str],
         tomorrow_zh: Optional[str] = None,
         display_name: str = PLUGIN_DISPLAY_NAME,
+        media: Optional[MediaReady] = None,
     ) -> list[MessageChain]:
-        """按 _split_media 返回要发送的消息链：1 条=合并，2 条=媒体+正文。"""
-        media_chain = await self._build_media_chain(apod_data)
+        """按 _split_media 返回要发送的消息链：1 条=合并，2 条=媒体+正文。
+
+        media 默认 None（自行本地化）；推送路径传入预热结果，一次下载供所有
+        会话共享。
+        """
+        media_chain = await self._build_media_chain(apod_data, media=media)
         text_chain = self._build_text_chain(
             apod_data,
             title_zh,
@@ -2510,17 +2983,42 @@ class APOD(Star):
 
     @staticmethod
     async def _send_chain(
-        send: Callable[[MessageChain], Awaitable[Any]], chain: MessageChain, label: str
-    ) -> bool:
+        send: Callable[[MessageChain], Awaitable[Any]],
+        chain: MessageChain,
+        label: str,
+        stage: str = "发送",
+    ) -> str:
+        """发一条链，返回 SEND_OK / SEND_FAILED / SEND_UNKNOWN。
+
+        只有本地准备阶段的失败（见 _PRE_SUBMIT_ERRORS）与接口返回 False 能证明
+        消息没提交过，才允许自动补发；网络类失败、超时、提交后断连都可能已经
+        送达，一律按“结果未知”处理，不再重发。
+        """
         try:
             sent = await asyncio.wait_for(send(chain), timeout=SEND_TIMEOUT_SECONDS)
+        except _STALE_MEDIA_ERRORS as exc:
+            logger.error(
+                f"{label}失败（阶段={stage}，本地媒体不可用）：{_safe_exc_text(exc)}"
+            )
+            return SEND_STALE
+        except _PRE_SUBMIT_ERRORS as exc:
+            logger.error(
+                f"{label}失败（阶段={stage}，未提交）：{_safe_exc_text(exc)}"
+            )
+            return SEND_FAILED
+        except asyncio.TimeoutError:
+            logger.error(f"{label}超时（阶段={stage}）：结果未知，不自动重发。")
+            return SEND_UNKNOWN
         except Exception as exc:
-            logger.error(f"{label}失败：{exc!r}")
-            return False
+            logger.error(
+                f"{label}异常（阶段={stage}）：结果未知，不自动重发。"
+                f"{_safe_exc_text(exc)}"
+            )
+            return SEND_UNKNOWN
         if sent is False:
-            logger.error(f"{label}失败：发送接口返回 False。")
-            return False
-        return True
+            logger.error(f"{label}失败（阶段={stage}）：发送接口返回 False。")
+            return SEND_FAILED
+        return SEND_OK
 
     async def _send_chains(
         self,
@@ -2531,33 +3029,66 @@ class APOD(Star):
         """逐条发送消息链；媒体那条失败时舍媒体保正文（合并链补发纯文字）。
 
         正文失败一律视为未送达：宁可下轮补发（媒体已送达时只补正文），
-        也不能让说明文本静默丢掉。
+        也不能让说明文本静默丢掉；但超时属于“结果未知”，按已送达处理，
+        不重发（重发就是重复刷图/刷文案）。带媒体的链失败更可能是上传失败。
         """
         if not chains:
             return ChainSendReport(False, False)
         degraded = False
+        text_sent = False
         media_sent = False
+        text_unknown = False
+        media_unknown = False
+        media_stale = False
+
+        def current_report(text_done: bool) -> ChainSendReport:
+            """按当前累计状态出报告：所有出口共用，避免漏带某个标记。"""
+            return ChainSendReport(
+                text_done, media_sent, text_unknown, media_unknown, media_stale
+            )
+
         for index, chain in enumerate(chains):
             has_media = any(
                 isinstance(item, (Comp.Image, Comp.Video)) for item in chain.chain
             )
-            if await self._send_chain(send, chain, label):
+            has_text = any(isinstance(item, Comp.Plain) for item in chain.chain)
+            outcome = await self._send_chain(
+                send, chain, label, "上传" if has_media else "发送"
+            )
+            if outcome == SEND_UNKNOWN:
+                # 不确定是否已送达：按送达记账（不再重发），但逐项标记未知。
+                if has_media:
+                    media_unknown = media_sent = True
+                if has_text:
+                    text_unknown = text_sent = True
+                continue
+            if outcome == SEND_STALE and has_media:
+                # 本地媒体不可用（一定没提交）：记下这笔，让调用方作废文件重来。
+                media_stale = True
+            if outcome == SEND_OK:
                 media_sent = media_sent or has_media
+                text_sent = text_sent or has_text
                 continue
             if not has_media:
-                return ChainSendReport(False, media_sent)
+                return current_report(text_sent)
             fallback = MessageChain(
                 chain=[item for item in chain.chain if isinstance(item, Comp.Plain)]
             )
             if fallback.chain:
-                if not await self._send_chain(send, fallback, label):
-                    return ChainSendReport(False, media_sent)
+                outcome = await self._send_chain(send, fallback, label)
+                if outcome == SEND_UNKNOWN:
+                    # 降级正文也可能已经被平台接收：按已送达记账，不再重发一次。
+                    text_unknown = text_sent = True
+                elif outcome != SEND_OK:
+                    return current_report(False)
+                else:
+                    text_sent = True
             elif index == len(chains) - 1:
-                return ChainSendReport(False, media_sent)
+                return current_report(text_sent)
             degraded = True
         if degraded:
             logger.warning(f"{label}已降级为纯文字。")
-        return ChainSendReport(True, media_sent)
+        return current_report(text_sent)
 
     async def terminate(self):
         logger.info("正在终止 NASA APOD 插件...")
