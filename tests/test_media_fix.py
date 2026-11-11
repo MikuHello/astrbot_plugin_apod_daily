@@ -2274,6 +2274,14 @@ class PushMediaPrewarmTests(unittest.TestCase):
                 (summary,) = [line for line in logs.output if "本次推送" in line]
                 self.assertIn("正文 0/2、媒体 0/2", summary)
                 self.assertIn("2 个会话有内容发送结果未知（未重发）", summary)
+                self.assertTrue(
+                    any(
+                        record.levelno >= logging.WARNING
+                        and "结果未知" in record.getMessage()
+                        for record in logs.records
+                    ),
+                    logs.output,
+                )
 
     def test_unknown_media_does_not_swallow_text_retry(self):
         self.plugin.is_divided = True
@@ -2486,20 +2494,35 @@ class PushMediaPrewarmTests(unittest.TestCase):
         self.assertEqual(self.download.await_count, 2)
         self.assertEqual(self.store["pushed_by_session"], dict.fromkeys("ab", LINK))
 
-    def test_media_downloaded_once_for_all_sessions(self):
+    def test_media_delivered_to_all_sessions(self):
         sessions = ["a", "b", "c", "d"]
         self.plugin.config["push"]["sessions"] = sessions
-        with patch.object(
-            self.plugin, "_build_apod_chains", wraps=self.plugin._build_apod_chains
-        ) as build:
-            self.assertTrue(self._push())
-        self.download.assert_awaited_once()
-        self.assertEqual(build.await_count, len(sessions))
-        self.assertEqual(self._sent(), [["Image", "Plain"]] * len(sessions))
-        self.assertEqual(
-            [call.args[0] for call in self.send.await_args_list], sessions
-        )
-        self.assertEqual(self.store["pushed_by_session"], dict.fromkeys(sessions, LINK))
+        video = self.plugin._build_apod_data("APOD: t", LINK, VIDEO_ARTICLE)
+        cases = [
+            ("image", self.data, [["Image", "Plain"]], 1),
+            ("direct video", video, [["Video"], ["Plain"]], 0),
+        ]
+        for media, data, chains, download_count in cases:
+            with self.subTest(media=media):
+                self.store.clear()
+                self.send.reset_mock()
+                self.download.reset_mock()
+                self.plugin._get_cached_data.return_value = data
+
+                with patch.object(
+                    self.plugin, "_build_apod_chains", wraps=self.plugin._build_apod_chains
+                ) as build:
+                    self.assertTrue(self._push())
+                self.assertEqual(self.download.await_count, download_count)
+                self.assertEqual(build.await_count, len(sessions))
+                self.assertEqual(self._sent(), chains * len(sessions))
+                self.assertEqual(
+                    [call.args[0] for call in self.send.await_args_list],
+                    [session for session in sessions for _ in chains],
+                )
+                self.assertEqual(
+                    self.store["pushed_by_session"], dict.fromkeys(sessions, LINK)
+                )
 
     def test_media_upload_retry_outcomes_in_same_round(self):
         retry_count = self.plugin.retry_count
