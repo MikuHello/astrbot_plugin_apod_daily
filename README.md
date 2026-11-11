@@ -1,5 +1,9 @@
 # 天文每日一图
 
+<p align="center">
+  <img src="./assets/readme/hero.svg" width="100%" alt="天文每日一图 AstrBot 插件，支持 APOD、NASA 每日一图、随机浏览、订阅推送与 LLM 翻译">
+</p>
+
 AstrBot 插件，支持查看和订阅天文图片、视频及说明，并可用 LLM 翻译标题和正文。
 
 - **天文每日一图（APOD）**提供最新一期、随机历史条目和订阅推送。最新一期来自 NASA 官方 APOD RSS，读取失败时回退到官方文章 feed。随机条目来自官网 Random APOD 接口。
